@@ -1,0 +1,45 @@
+# Build outputs
+build/
+build2/
+cmake-build-*/
+out/
+bin/
+obj/
+
+# Local deps fetched by CMake
+_deps/
+**/_deps/
+
+# IDEs
+.vscode/
+.idea/
+*.user
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake/api-v1/*
+compile_commands.json
+
+# Shaders and assets cache
+*.spv
+*.cache
+*.pak
+
+# Captures / telemetry
+captures/
+tracy/*.tracy
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# CLion/JetBrains
+.idea/
+.run/
+

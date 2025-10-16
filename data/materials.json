@@ -1,0 +1,6 @@
+{
+  "materials": [
+    { "id": 0, "name": "default", "baseColor": [0.8, 0.8, 0.8], "emission": 0.0, "roughness": 0.6, "metalness": 0.0, "absorption": [0.0, 0.0, 0.0] }
+  ]
+}
+

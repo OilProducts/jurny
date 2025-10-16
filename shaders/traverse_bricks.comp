@@ -1,0 +1,5 @@
+#version 460
+// traverse_bricks.comp — K1 brick DDA with sphere-shell clamp (placeholder)
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+void main() {}
+// Performs macro skipping, brick hash lookup, micro-DDA, and optional F(p) refinement.

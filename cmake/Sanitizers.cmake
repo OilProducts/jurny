@@ -1,0 +1,11 @@
+function(voxel_enable_sanitizers target)
+  if (CMAKE_BUILD_TYPE STREQUAL "Debug" AND VOXEL_ENABLE_SANITIZERS)
+    if (MSVC)
+      message(STATUS "Sanitizers: not enabled on MSVC in this skeleton")
+    else()
+      target_compile_options(${target} PRIVATE -fsanitize=address,undefined)
+      target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+    endif()
+  endif()
+endfunction()
+

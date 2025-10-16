@@ -1,0 +1,12 @@
+# Normalize line endings
+* text=auto eol=lf
+
+# Treat SPIR-V as binary
+*.spv binary
+
+# Keep images/envmaps as binary
+*.hdr binary
+*.exr binary
+*.png binary
+*.jpg binary
+
