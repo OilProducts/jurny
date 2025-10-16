@@ -16,9 +16,18 @@ bool Window::create(int w, int h, const char* title) {
     if (!glfwInit()) return false;
     glfwSetErrorCallback(glfwErrorCallback);
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    glfwWindowHint(GLFW_DECORATED, GLFW_TRUE);
     window_ = glfwCreateWindow(w, h, title, nullptr, nullptr);
     if (!window_) return false;
     width_ = w; height_ = h;
+
+    // Simple key handler: ESC to close
+    glfwSetKeyCallback(window_, [](GLFWwindow* win, int key, int sc, int action, int mods){
+        (void)sc; (void)mods;
+        if (action == GLFW_PRESS && (key == GLFW_KEY_ESCAPE)) {
+            glfwSetWindowShouldClose(win, GLFW_TRUE);
+        }
+    });
     return true;
 }
 
@@ -46,5 +55,7 @@ void Window::getRequiredInstanceExtensions(std::vector<const char*>& outExts) {
         for (uint32_t i=0;i<count;++i) outExts.push_back(names[i]);
     }
 }
+
+bool Window::shouldClose() const { return window_ && glfwWindowShouldClose(window_); }
 
 } // namespace platform

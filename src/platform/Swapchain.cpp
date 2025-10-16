@@ -57,14 +57,16 @@ bool Swapchain::create(const SwapchainCreateInfo& info) {
     sci.clipped = VK_TRUE;
 
     if (vkCreateSwapchainKHR(info.device, &sci, nullptr, &swapchain_) != VK_SUCCESS) return false;
+    format_ = fmt.format;
+    extent_ = extent;
 
     // Retrieve images and create views
     uint32_t count=0; vkGetSwapchainImagesKHR(info.device, swapchain_, &count, nullptr);
-    std::vector<VkImage> images(count); vkGetSwapchainImagesKHR(info.device, swapchain_, &count, images.data());
+    images_.resize(count); vkGetSwapchainImagesKHR(info.device, swapchain_, &count, images_.data());
     imageViews_ = new VkImageView[count]; imageCount_ = count;
     for (uint32_t i=0;i<count;++i) {
         VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        vci.image = images[i];
+        vci.image = images_[i];
         vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
         vci.format = fmt.format;
         vci.components = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };

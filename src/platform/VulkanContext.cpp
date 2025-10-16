@@ -208,7 +208,8 @@ bool VulkanContext::createDevice(bool enableValidation, VkSurfaceKHR surface) {
 
 void VulkanContext::createCommandPool() {
     VkCommandPoolCreateInfo ci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-    ci.queueFamilyIndex = queueFamilies_.compute.value();
+    // Use graphics family so command buffers can be submitted to graphics (present-capable) queue.
+    ci.queueFamilyIndex = queueFamilies_.graphics.value_or(queueFamilies_.compute.value());
     ci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     vkCreateCommandPool(device_, &ci, nullptr, &commandPool_);
 }

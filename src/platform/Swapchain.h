@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
+#include <volk.h>
 typedef struct VkDevice_T* VkDevice;
 typedef struct VkSurfaceKHR_T* VkSurfaceKHR;
 typedef struct VkSwapchainKHR_T* VkSwapchainKHR;
@@ -32,11 +34,17 @@ public:
     VkSwapchainKHR handle() const { return swapchain_; }
     VkImageView* imageViews() { return imageViews_; }
     uint32_t imageCount() const { return imageCount_; }
+    VkFormat format() const { return format_; }
+    VkExtent2D extent() const { return extent_; }
+    VkImage image(uint32_t i) const { return images_[i]; }
 
 private:
     VkSwapchainKHR swapchain_{};
     VkImageView* imageViews_{};
     uint32_t imageCount_{};
+    VkFormat format_{};
+    VkExtent2D extent_{};
+    std::vector<VkImage> images_{};
 };
 
 } // namespace platform

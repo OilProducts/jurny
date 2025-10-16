@@ -24,6 +24,7 @@ public:
     int width() const { return width_; }
     int height() const { return height_; }
     GLFWwindow* handle() const { return window_; }
+    bool shouldClose() const;
 
 private:
     GLFWwindow* window_ = nullptr;
