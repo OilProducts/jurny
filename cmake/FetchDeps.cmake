@@ -63,21 +63,35 @@ if(tracy_SOURCE_DIR)
   target_include_directories(ext_tracy INTERFACE "${tracy_SOURCE_DIR}/public")
 endif()
 
-## stb (headers)
-if(EXISTS "${CMAKE_SOURCE_DIR}/extern/stb/CMakeLists.txt" OR EXISTS "${CMAKE_SOURCE_DIR}/extern/stb/stb_image.h")
-  set(FETCHCONTENT_SOURCE_DIR_stb "${CMAKE_SOURCE_DIR}/extern/stb")
+## stb (headers) — favor vendored or generate a tiny stub to avoid network
+set(_stb_used FALSE)
+if(EXISTS "${CMAKE_SOURCE_DIR}/extern/stb/stb_image.h")
+  # Vendored headers present
+  target_include_directories(ext_stb INTERFACE "${CMAKE_SOURCE_DIR}/extern/stb")
+  set(_stb_used TRUE)
 endif()
-## stb has no official releases; pin to a known-good commit used by distros for reproducibility.
-FetchContent_Declare(stb
-  GIT_REPOSITORY https://github.com/nothings/stb.git
-  # Pin to a real commit on master: Create SECURITY.md (2025-05-12)
-  # https://github.com/nothings/stb/commit/802cd454f25469d3123e678af41364153c132c2a
-  GIT_TAG        802cd454f25469d3123e678af41364153c132c2a
-  GIT_SHALLOW    TRUE
-  GIT_PROGRESS   TRUE)
-FetchContent_MakeAvailable(stb)
-if(stb_SOURCE_DIR)
-  target_include_directories(ext_stb INTERFACE "${stb_SOURCE_DIR}")
+if(NOT _stb_used AND NOT VOXEL_USE_FETCHCONTENT)
+  # Offline or fetch disabled: generate minimal stub so targets that include stb_image.h still compile
+  set(stb_GEN_DIR "${CMAKE_BINARY_DIR}/generated/stb")
+  file(MAKE_DIRECTORY "${stb_GEN_DIR}")
+  file(WRITE "${stb_GEN_DIR}/stb_image.h" "/* stubbed stb_image.h for offline build */\n#ifndef STB_IMAGE_H\n#define STB_IMAGE_H\n#ifdef __cplusplus\nextern \"C\" {\n#endif\nstatic inline unsigned char* stbi_load(const char*, int*, int*, int*, int){return (unsigned char*)0;}\nstatic inline void stbi_image_free(void*){}\n#ifdef __cplusplus\n}\n#endif\n#endif\n")
+  target_include_directories(ext_stb INTERFACE "${stb_GEN_DIR}")
+  set(_stb_used TRUE)
+endif()
+if(NOT _stb_used)
+  # As a last resort, allow FetchContent (user must have network)
+  if(EXISTS "${CMAKE_SOURCE_DIR}/extern/stb/CMakeLists.txt")
+    set(FETCHCONTENT_SOURCE_DIR_stb "${CMAKE_SOURCE_DIR}/extern/stb")
+  endif()
+  FetchContent_Declare(stb
+    GIT_REPOSITORY https://github.com/nothings/stb.git
+    GIT_TAG        master
+    GIT_SHALLOW    TRUE
+    GIT_PROGRESS   TRUE)
+  FetchContent_MakeAvailable(stb)
+  if(stb_SOURCE_DIR)
+    target_include_directories(ext_stb INTERFACE "${stb_SOURCE_DIR}")
+  endif()
 endif()
 
 ## xxhash (headers + optional C library)
@@ -108,31 +122,60 @@ if(vma_SOURCE_DIR)
   target_include_directories(ext_vma INTERFACE "${vma_SOURCE_DIR}/include" "${vma_SOURCE_DIR}")
 endif()
 
-## GLFW
-if(EXISTS "${CMAKE_SOURCE_DIR}/extern/glfw/CMakeLists.txt" OR EXISTS "${CMAKE_SOURCE_DIR}/extern/glfw/include/GLFW/glfw3.h")
-  set(FETCHCONTENT_SOURCE_DIR_glfw "${CMAKE_SOURCE_DIR}/extern/glfw")
+## GLFW — prefer system install; fallback to vendored; last resort FetchContent
+set(_glfw_done FALSE)
+find_package(glfw3 QUIET)
+if(glfw3_FOUND)
+  if(TARGET glfw)
+    target_link_libraries(ext_glfw INTERFACE glfw)
+  elseif(TARGET glfw3)
+    target_link_libraries(ext_glfw INTERFACE glfw3)
+  elseif(DEFINED glfw3_LIBRARIES)
+    target_link_libraries(ext_glfw INTERFACE ${glfw3_LIBRARIES})
+    if(DEFINED glfw3_INCLUDE_DIRS)
+      target_include_directories(ext_glfw INTERFACE ${glfw3_INCLUDE_DIRS})
+    endif()
+  endif()
+  set(_glfw_done TRUE)
 endif()
-# Clean up legacy cache var that conflicts with GLFW >= 3.4
-unset(GLFW_USE_WAYLAND CACHE)
-set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-# GLFW 3.4+: select backend via GLFW_BUILD_WAYLAND / GLFW_BUILD_X11
-if(VOXEL_GLFW_WAYLAND)
-  set(GLFW_BUILD_WAYLAND ON  CACHE BOOL "" FORCE)
-  set(GLFW_BUILD_X11     OFF CACHE BOOL "" FORCE)
-else()
-  set(GLFW_BUILD_WAYLAND OFF CACHE BOOL "" FORCE)
-  set(GLFW_BUILD_X11     ON  CACHE BOOL "" FORCE)
+if(NOT _glfw_done AND EXISTS "${CMAKE_SOURCE_DIR}/extern/glfw/include/GLFW/glfw3.h")
+  target_include_directories(ext_glfw INTERFACE "${CMAKE_SOURCE_DIR}/extern/glfw/include")
+  find_library(GLFW_LIB glfw3 PATHS "${CMAKE_SOURCE_DIR}/extern/glfw/lib" NO_DEFAULT_PATH)
+  if(GLFW_LIB)
+    target_link_libraries(ext_glfw INTERFACE ${GLFW_LIB})
+  endif()
+  set(_glfw_done TRUE)
 endif()
-FetchContent_Declare(glfw
-  GIT_REPOSITORY https://github.com/glfw/glfw.git
-  GIT_TAG        3.4
-  GIT_SHALLOW    TRUE
-  GIT_PROGRESS   TRUE)
-FetchContent_MakeAvailable(glfw)
-if(TARGET glfw)
-  target_link_libraries(ext_glfw INTERFACE glfw)
-elseif(TARGET glfw3)
-  target_link_libraries(ext_glfw INTERFACE glfw3)
+if(NOT _glfw_done)
+  if(EXISTS "${CMAKE_SOURCE_DIR}/extern/glfw/CMakeLists.txt")
+    set(FETCHCONTENT_SOURCE_DIR_glfw "${CMAKE_SOURCE_DIR}/extern/glfw")
+  endif()
+  # Clean up legacy cache var that conflicts with GLFW >= 3.4
+  unset(GLFW_USE_WAYLAND CACHE)
+  set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+  # GLFW 3.4+: select backend via GLFW_BUILD_WAYLAND / GLFW_BUILD_X11
+  if(VOXEL_GLFW_WAYLAND)
+    set(GLFW_BUILD_WAYLAND ON  CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_X11     OFF CACHE BOOL "" FORCE)
+  else()
+    set(GLFW_BUILD_WAYLAND OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_X11     ON  CACHE BOOL "" FORCE)
+  endif()
+  if(VOXEL_USE_FETCHCONTENT)
+    FetchContent_Declare(glfw
+      GIT_REPOSITORY https://github.com/glfw/glfw.git
+      GIT_TAG        3.4
+      GIT_SHALLOW    TRUE
+      GIT_PROGRESS   TRUE)
+    FetchContent_MakeAvailable(glfw)
+    if(TARGET glfw)
+      target_link_libraries(ext_glfw INTERFACE glfw)
+    elseif(TARGET glfw3)
+      target_link_libraries(ext_glfw INTERFACE glfw3)
+    endif()
+  else()
+    message(FATAL_ERROR "GLFW not found on system and VOXEL_USE_FETCHCONTENT=OFF. Install glfw3-dev or provide extern/glfw.")
+  endif()
 endif()

@@ -6,328 +6,572 @@
 #include "spherical.glsl"
 #include "include/brick_formats.glsl"
 
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+// =================================================================================================
+// traverse_bricks.comp — primary/secondary ray traversal over sparse bricks with spherical clamp.
+// Produces hit/miss payloads for the shading stage using wavefront queues.
+// =================================================================================================
 
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Globals -----------------------------------------------------------------------------
 layout(set = 0, binding = 0) uniform GlobalsUBO { GlobalsUBO_t g; };
+
+// Retained for compatibility (debug skim); traversal does not write directly to the accum image.
 layout(set = 0, binding = 1, rgba8) uniform writeonly image2D accumImage;
+
 layout(set = 0, binding = 3, std430) readonly buffer BrickHeadersBuf { BrickHeader headers[]; } BH;
-layout(set = 0, binding = 4, std430) readonly buffer OccupancyBuf   { uint64_t  occWords[]; } OCC;
-layout(set = 0, binding = 5, std430) readonly buffer HashKeysBuf    { uint64_t  keys[];     } HK;
-layout(set = 0, binding = 6, std430) readonly buffer HashValsBuf    { uint      vals[];     } HV;
-layout(set = 0, binding = 7, std430) readonly buffer MacroKeysBuf   { uint64_t  mkeys[];    } MK;
-layout(set = 0, binding = 8, std430) readonly buffer MacroValsBuf   { uint      mvals[];    } MV;
+layout(set = 0, binding = 4, std430) readonly buffer OccupancyBuf   { uint64_t occWords[];    } OCC;
+layout(set = 0, binding = 5, std430) readonly buffer WorldHashKeys  { uint64_t worldKeys[];   };
+layout(set = 0, binding = 6, std430) readonly buffer WorldHashVals  { uint      worldVals[];  };
+layout(set = 0, binding = 7, std430) readonly buffer MacroHashKeys  { uint64_t macroKeys[];   };
+layout(set = 0, binding = 8, std430) readonly buffer MacroHashVals  { uint      macroVals[];  };
+
+// Debug buffer is optional; untouched unless enabled on the CPU.
 layout(set = 0, binding = 9, std430) buffer DebugOut { uint dbg[]; } DBG;
 
-// Simple hash find (linear probe), capacity from UBO
+// Queue plumbing ----------------------------------------------------------------------
+struct QueueHeader {
+  uint head;      // dequeue index
+  uint tail;      // enqueue index
+  uint capacity;  // power-of-two ring capacity
+  uint dropped;   // overflow counter
+};
+
+struct RayPayload {
+  vec3  origin;
+  float tMin;
+  vec3  direction;
+  float tMax;
+  uint  rng;
+  uint  pixelIndex;
+  uint  pathDepth;
+  uint  flags;
+};
+
+struct HitPayload {
+  vec3  position;
+  float t;
+  vec3  normal;
+  uint  material;
+  vec3  direction;
+  uint  rng;
+  uint  pixelIndex;
+  uint  pathDepth;
+};
+
+struct MissPayload {
+  vec3  origin;
+  float tMin;
+  vec3  direction;
+  float tMax;
+  uint  rng;
+  uint  pixelIndex;
+  uint  pathDepth;
+  uint  reason;
+};
+
+layout(set = 0, binding = 10, std430) buffer RayQueueInBuf {
+  QueueHeader header;
+  RayPayload  rays[];
+} RayQueueIn;
+
+layout(set = 0, binding = 11, std430) buffer HitQueueBuf {
+  QueueHeader header;
+  HitPayload  hits[];
+} HitQueue;
+
+layout(set = 0, binding = 12, std430) buffer MissQueueBuf {
+  QueueHeader header;
+  MissPayload misses[];
+} MissQueue;
+
+layout(set = 0, binding = 13, std430) buffer SecondaryQueueBuf {
+  QueueHeader header;
+  RayPayload  rays[];
+} SecondaryQueue;
+
+// Constants ----------------------------------------------------------------------------
+const float INF_T              = 1e30;
+const float BRICK_NUDGE        = 1e-5;
+const float MACRO_STEP_EPS     = 1e-5;
+const float REFINE_EPS         = 0.5;      // gradient epsilon (in voxel units)
+const int   BRICK_MAX_STEPS    = 4096;
+const int   MACRO_MAX_STEPS    = 2048;
+const int   MICRO_MAX_STEPS    = 128;
+const int   REFINE_MAX_ITERS   = 6;
+const uint  FLAG_ENABLE_MACRO  = 8u;       // matches CPU/debug flag bit
+const uint  MISS_REASON_ENV    = 0u;
+const uint  MISS_REASON_SHELL  = 1u;
+const uint  MISS_REASON_BAND   = 2u;
+
+// Shared state for chunked queue fetch.
+// -------------------------------------------------------------------------------------------------
+// Utility helpers
+// -------------------------------------------------------------------------------------------------
+
+int floorDiv(int a, int b) {
+  int q = a / b;
+  int r = a - q * b;
+  if (((a ^ b) < 0) && (r != 0)) q -= 1;
+  return q;
+}
+
+float safeReciprocal(float v) {
+  return (abs(v) > 1e-20) ? 1.0 / v : 0.0;
+}
+
+float safeNextBoundary(float pos, float mn, float mx, float dir) {
+  if (dir > 0.0) return (mx - pos) / dir;
+  if (dir < 0.0) return (pos - mn) / -dir;
+  return INF_T;
+}
+
+uint64_t packKey(ivec3 c) {
+  const int B = 1 << 20;
+  return ((uint64_t(c.x + B) << 42) |
+          (uint64_t(c.y + B) << 21) |
+           uint64_t(c.z + B));
+}
+
 bool findBrick(ivec3 bc, out uint brickIdx) {
-  const uint B = 1u<<20; // bias
-  uint64_t key = (uint64_t(bc.x + int(B)) << 42) | (uint64_t(bc.y + int(B)) << 21) | uint64_t(bc.z + int(B));
-  uint cap = g.worldHashCapacity; if (cap == 0u) return false;
+  uint cap = g.worldHashCapacity;
+  if (cap == 0u) return false;
+  uint64_t key = packKey(bc);
   uint mask = cap - 1u;
-  // Use the same 64->32 mix as CPU builder: h = ((key ^ (key>>33)) * 0xff51afd7ed558ccd) >> 32
   uint64_t kx = key ^ (key >> 33u);
   const uint64_t A = (uint64_t(0xff51afd7u) << 32) | uint64_t(0xed558ccdu);
-  uint64_t mix = kx * A;
-  uint h = uint(mix >> 32) & mask;
-  for (uint i=0u; i<cap; ++i) {
-    uint idx = (h + i) & mask;
-    uint64_t k = HK.keys[idx];
-    if (k == key) { brickIdx = HV.vals[idx]; return true; }
-    if (k == 0ul) break;
-  }
-  return false;
-}
-
-bool findMacro(ivec3 mc) {
-  const uint B = 1u<<20; uint64_t key = (uint64_t(mc.x + int(B)) << 42) | (uint64_t(mc.y + int(B)) << 21) | uint64_t(mc.z + int(B));
-  uint cap = g.macroHashCapacity; if (cap == 0u) return false; uint mask = cap - 1u;
-  uint64_t kx = key ^ (key >> 33u); const uint64_t A = (uint64_t(0xff51afd7u) << 32) | uint64_t(0xed558ccdu);
   uint h = uint((kx * A) >> 32) & mask;
-  for (uint i=0u;i<cap;++i) { uint idx=(h+i)&mask; uint64_t k=MK.mkeys[idx]; if (k==key) return (MV.mvals[idx]!=0u); if (k==0ul) break; }
+  for (uint probe = 0u; probe < cap; ++probe) {
+    uint idx = (h + probe) & mask;
+    uint64_t stored = worldKeys[idx];
+    if (stored == key) {
+      brickIdx = worldVals[idx];
+      return true;
+    }
+    if (stored == 0ul) break;
+  }
   return false;
 }
 
-bool rayAABB(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, out float t0, out float t1) {
-  vec3 inv = 1.0 / rd;
-  vec3 tA = (bmin - ro) * inv;
-  vec3 tB = (bmax - ro) * inv;
-  vec3 tmin = min(tA, tB);
-  vec3 tmax = max(tA, tB);
-  t0 = max(0.0, max(tmin.x, max(tmin.y, tmin.z)));
-  t1 = max(t0, min(tmax.x, min(tmax.y, tmax.z)));
-  return t1 > t0;
+bool macroTileOccupied(ivec3 mc) {
+  uint cap = g.macroHashCapacity;
+  if (cap == 0u) return false;
+  uint64_t key = packKey(mc);
+  uint mask = cap - 1u;
+  uint64_t kx = key ^ (key >> 33u);
+  const uint64_t A = (uint64_t(0xff51afd7u) << 32) | uint64_t(0xed558ccdu);
+  uint h = uint((kx * A) >> 32) & mask;
+  for (uint probe = 0u; probe < cap; ++probe) {
+    uint idx = (h + probe) & mask;
+    uint64_t stored = macroKeys[idx];
+    if (stored == key) return macroVals[idx] != 0u;
+    if (stored == 0ul) break;
+  }
+  return false;
 }
 
-bool brickIsEmpty(uint baseWord) {
-  // 8 words per brick
-  for (int i=0;i<8;++i) if (OCC.occWords[baseWord + i] != 0ul) return false;
-  return true;
+bool brickHasOccupancy(const BrickHeader h) {
+  uint base = h.occOffset >> 3u; // bytes -> uint64 index
+  for (int i = 0; i < 8; ++i) {
+    if (OCC.occWords[base + uint(i)] != 0ul) return true;
+  }
+  return false;
 }
 
-bool sampleOcc(in BrickHeader h, in vec3 p) {
-  // Convert world p to local voxel indices
-  vec3 brickOrigin = vec3(h.bx, h.by, h.bz) * g.brickSize;
-  vec3 lp = (p - brickOrigin) / g.voxelSize;
-  ivec3 v = ivec3(floor(lp));
-  if (any(lessThan(v, ivec3(0))) || any(greaterThan(v, ivec3(7)))) return false;
-  uint idx = uint(v.x + v.y*uint(VOXEL_BRICK_SIZE) + v.z*uint(VOXEL_BRICK_SIZE*VOXEL_BRICK_SIZE));
-  uint w = idx >> 6; uint b = idx & 63u;
-  uint baseWord = h.occOffset / 8u; // bytes -> uint64 index
-  return ((OCC.occWords[baseWord + w] >> b) & 1ul) != 0ul;
+float evaluateField(vec3 p, const BrickHeader /*h*/) {
+  // Placeholder: use analytic crust field. When TSDF is available, sample it here.
+  return F_crust(p, g.Rsea);
 }
 
-void makeRay(in ivec2 pix, out vec3 ro, out vec3 rd) {
-  ivec2 dims = imageSize(accumImage);
-  vec2 uv = (vec2(pix) + vec2(0.5)) / vec2(dims);
-  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-  mat4 invV = inverse(g.currView);
-  mat4 invP = inverse(g.currProj);
-  ro = vec3(invV * vec4(0,0,0,1));
-  vec4 pView = invP * vec4(ndc, 1.0, 1.0);
-  pView /= max(pView.w, 1e-6);
-  rd = normalize(vec3(invV * vec4(normalize(vec3(pView)), 0.0)));
+vec3 evaluateNormal(vec3 p, const BrickHeader h, float voxelSize) {
+  float eps = max(voxelSize * REFINE_EPS, 1e-4);
+  float fx1 = evaluateField(p + vec3(eps, 0.0, 0.0), h);
+  float fx0 = evaluateField(p - vec3(eps, 0.0, 0.0), h);
+  float fy1 = evaluateField(p + vec3(0.0, eps, 0.0), h);
+  float fy0 = evaluateField(p - vec3(0.0, eps, 0.0), h);
+  float fz1 = evaluateField(p + vec3(0.0, 0.0, eps), h);
+  float fz0 = evaluateField(p - vec3(0.0, 0.0, eps), h);
+  vec3 n = vec3(fx1 - fx0, fy1 - fy0, fz1 - fz0);
+  return (length(n) > 0.0) ? normalize(n) : vec3(0.0, 1.0, 0.0);
 }
 
-void main() {
-  ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
-  ivec2 dims = imageSize(accumImage);
-  if (pix.x >= dims.x || pix.y >= dims.y) return;
-
-  vec3 ro, rd; makeRay(pix, ro, rd);
-
-  // DEBUG OVERLAY: probe brick presence at the analytic sea-level sphere hit
-  if ((g.flags & 1u) != 0u) {
-    float t0, t1; vec3 color = vec3(0.0);
-    if (intersectSphere(ro, rd, g.Rsea, t0, t1)) {
-      float t = (t0 > 1e-6) ? t0 : ((t1 > 1e-6) ? t1 : 1e30);
-      if (t < 1e20) {
-        vec3 p = ro + t * rd;
-        ivec3 bcProbe = ivec3(floor(p / g.brickSize));
-        uint idx; bool found = findBrick(bcProbe, idx);
-        color = found ? vec3(1.0, 0.1, 0.1) : vec3(0.1, 0.1, 0.6);
-      } else {
-        color = vec3(0.0, 0.0, 0.0);
-      }
+float refineSurface(vec3 origin, vec3 dir, float ta, float tb, const BrickHeader h) {
+  float fa = evaluateField(origin + dir * ta, h);
+  float fb = evaluateField(origin + dir * tb, h);
+  if (fa * fb > 0.0) return ta; // no sign change, fallback to entering point
+  float a = ta;
+  float b = tb;
+  float tMid = ta;
+  for (int i = 0; i < REFINE_MAX_ITERS; ++i) {
+    tMid = 0.5 * (a + b);
+    float fm = evaluateField(origin + dir * tMid, h);
+    if (fm == 0.0) break;
+    bool same = (fm * fa) > 0.0;
+    if (same) {
+      a = tMid;
+      fa = fm;
     } else {
-      color = vec3(0.0, 0.0, 0.0);
+      b = tMid;
+      fb = fm;
     }
-    imageStore(accumImage, pix, vec4(color, 1.0));
+  }
+  return tMid;
+}
+
+uint fallbackMaterialId() {
+  return 0u;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Queue helpers
+// -------------------------------------------------------------------------------------------------
+
+bool dequeueRay(out RayPayload ray) {
+  for (;;) {
+    uint idx = atomicAdd(RayQueueIn.header.head, 1u);
+    uint tail = RayQueueIn.header.tail;
+    if (idx < tail) {
+      uint slot = idx & (RayQueueIn.header.capacity - 1u);
+      ray = RayQueueIn.rays[slot];
+      return true;
+    }
+    atomicAdd(RayQueueIn.header.head, uint(0u - 1u));
+    if (idx >= tail) return false;
+  }
+}
+
+uint reserveMissSlot(uint overflowReason) {
+  uint slot = atomicAdd(MissQueue.header.tail, 1u);
+  uint capacity = MissQueue.header.capacity;
+  if (capacity == 0u) {
+    atomicAdd(MissQueue.header.dropped, 1u);
+    return 0u;
+  }
+  uint headSnapshot = MissQueue.header.head;
+  if ((slot - headSnapshot) >= capacity) {
+    atomicAdd(MissQueue.header.dropped, max(1u, overflowReason));
+    return headSnapshot & (capacity - 1u);
+  }
+  return slot & (capacity - 1u);
+}
+
+void enqueueMiss(const RayPayload ray, uint reason) {
+  uint slot = reserveMissSlot(reason + 1u);
+  MissPayload payload;
+  payload.origin     = ray.origin;
+  payload.tMin       = ray.tMin;
+  payload.direction  = ray.direction;
+  payload.tMax       = ray.tMax;
+  payload.rng        = ray.rng;
+  payload.pixelIndex = ray.pixelIndex;
+  payload.pathDepth  = ray.pathDepth;
+  payload.reason     = reason;
+  MissQueue.misses[slot] = payload;
+}
+
+void enqueueHit(const RayPayload ray, float tHit, vec3 normal, uint material) {
+  uint slot = atomicAdd(HitQueue.header.tail, 1u);
+  uint capacity = HitQueue.header.capacity;
+  if (capacity == 0u) {
+    atomicAdd(HitQueue.header.dropped, 1u);
+    return;
+  }
+  uint headSnapshot = HitQueue.header.head;
+  if ((slot - headSnapshot) >= capacity) {
+    atomicAdd(HitQueue.header.dropped, 1u);
+    slot = headSnapshot;
+  }
+  slot &= (capacity - 1u);
+  HitPayload payload;
+  payload.position   = ray.origin + ray.direction * tHit;
+  payload.t          = tHit;
+  payload.normal     = normal;
+  payload.material   = material;
+  payload.direction  = ray.direction;
+  payload.rng        = ray.rng;
+  payload.pixelIndex = ray.pixelIndex;
+  payload.pathDepth  = ray.pathDepth;
+  HitQueue.hits[slot] = payload;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Macro skipping
+// -------------------------------------------------------------------------------------------------
+
+bool advanceEmptyMacroTiles(vec3 origin,
+                            vec3 dir,
+                            float tMacroMin,
+                            float tMacroMax,
+                            inout float tCursor,
+                            inout ivec3 brickCoords) {
+  if ((g.flags & FLAG_ENABLE_MACRO) == 0u || g.macroHashCapacity == 0u) {
+    return false;
+  }
+
+  float macroSize = g.macroSize;
+  float tSearch = clamp(tCursor, tMacroMin, tMacroMax);
+  vec3 pos = origin + dir * (tSearch + MACRO_STEP_EPS * macroSize);
+  ivec3 bc = ivec3(floor(pos / g.brickSize));
+  ivec3 mc = ivec3(
+    floorDiv(bc.x, int(g.macroDimBricks)),
+    floorDiv(bc.y, int(g.macroDimBricks)),
+    floorDiv(bc.z, int(g.macroDimBricks))
+  );
+
+  for (int step = 0; step < MACRO_MAX_STEPS; ++step) {
+    if (macroTileOccupied(mc)) {
+      tCursor = tSearch;
+      brickCoords = bc;
+      return false;
+    }
+
+    vec3 macroMin = vec3(mc) * macroSize;
+    vec3 macroMax = macroMin + vec3(macroSize);
+    float tx = safeNextBoundary(pos.x, macroMin.x, macroMax.x, dir.x);
+    float ty = safeNextBoundary(pos.y, macroMin.y, macroMax.y, dir.y);
+    float tz = safeNextBoundary(pos.z, macroMin.z, macroMax.z, dir.z);
+    float tNext = min(tx, min(ty, tz));
+    if (!(tNext >= 0.0)) break;
+
+    tSearch = min(tMacroMax, tSearch + tNext + MACRO_STEP_EPS * macroSize);
+    if (tSearch >= tMacroMax) {
+      tCursor = tSearch;
+      brickCoords = ivec3(floor((origin + dir * (tSearch + BRICK_NUDGE * g.brickSize)) / g.brickSize));
+      return true; // marched to end of macro window
+    }
+
+    pos = origin + dir * (tSearch + MACRO_STEP_EPS * macroSize);
+    bc = ivec3(floor(pos / g.brickSize));
+    mc = ivec3(
+      floorDiv(bc.x, int(g.macroDimBricks)),
+      floorDiv(bc.y, int(g.macroDimBricks)),
+      floorDiv(bc.z, int(g.macroDimBricks))
+    );
+  }
+
+  tCursor = tSearch;
+  brickCoords = bc;
+  return false;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Micro traversal inside an occupied brick.
+// -------------------------------------------------------------------------------------------------
+
+bool traverseBrickMicro(const RayPayload ray,
+                        float tEnter,
+                        float tExit,
+                        const BrickHeader h,
+                        out float tHit,
+                        out vec3 hitNormal,
+                        out uint materialId) {
+  float t0 = max(tEnter, ray.tMin);
+  float t1 = min(tExit, ray.tMax);
+  if (t0 > t1) return false;
+
+  vec3 brickOrigin = vec3(h.bx, h.by, h.bz) * g.brickSize;
+  vec3 dir = ray.direction;
+  if (length(dir) == 0.0) return false;
+
+  vec3 p0 = ray.origin + dir * t0;
+  vec3 local = (p0 - brickOrigin) / g.voxelSize;
+
+  ivec3 voxel = clamp(ivec3(floor(local)), ivec3(0), ivec3(VOXEL_BRICK_SIZE - 1));
+  ivec3 step = ivec3(
+    (dir.x > 0.0) ? 1 : ((dir.x < 0.0) ? -1 : 0),
+    (dir.y > 0.0) ? 1 : ((dir.y < 0.0) ? -1 : 0),
+    (dir.z > 0.0) ? 1 : ((dir.z < 0.0) ? -1 : 0)
+  );
+
+  vec3 invDir = vec3(
+    safeReciprocal(dir.x),
+    safeReciprocal(dir.y),
+    safeReciprocal(dir.z)
+  );
+  vec3 absInv = abs(invDir);
+  vec3 tDelta = vec3(g.voxelSize) * absInv;
+
+  vec3 nextBoundary;
+  nextBoundary.x = (step.x > 0) ? ((float(voxel.x) + 1.0) - local.x) : (local.x - float(voxel.x));
+  nextBoundary.y = (step.y > 0) ? ((float(voxel.y) + 1.0) - local.y) : (local.y - float(voxel.y));
+  nextBoundary.z = (step.z > 0) ? ((float(voxel.z) + 1.0) - local.z) : (local.z - float(voxel.z));
+  nextBoundary = max(nextBoundary, vec3(0.0));
+
+  vec3 tMax = vec3(
+    (step.x == 0) ? INF_T : (t0 + nextBoundary.x * absInv.x * g.voxelSize),
+    (step.y == 0) ? INF_T : (t0 + nextBoundary.y * absInv.y * g.voxelSize),
+    (step.z == 0) ? INF_T : (t0 + nextBoundary.z * absInv.z * g.voxelSize)
+  );
+
+  float tCellEnter = t0;
+  uint baseWord = h.occOffset >> 3u;
+
+  for (int iter = 0; iter < MICRO_MAX_STEPS && tCellEnter <= t1; ++iter) {
+    uint linear = uint(voxel.x) +
+                  uint(voxel.y) * uint(VOXEL_BRICK_SIZE) +
+                  uint(voxel.z) * uint(VOXEL_BRICK_SIZE * VOXEL_BRICK_SIZE);
+    uint word = baseWord + (linear >> 6u);
+    uint bit  = linear & 63u;
+    bool occupied = ((OCC.occWords[word] >> bit) & 1ul) != 0ul;
+
+    float tCellExit = min(tMax.x, min(tMax.y, tMax.z));
+    if (occupied) {
+      float tRefined = refineSurface(ray.origin, dir, tCellEnter, min(tCellExit, t1), h);
+      vec3 normal = evaluateNormal(ray.origin + dir * tRefined, h, g.voxelSize);
+      tHit = tRefined;
+      hitNormal = normal;
+      materialId = fallbackMaterialId(); // TODO: decode palette/material streams
+      return true;
+    }
+
+    if (tCellExit > t1) break;
+
+    if (tMax.x <= tMax.y && tMax.x <= tMax.z) {
+      tCellEnter = tMax.x;
+      if (step.x == 0) break;
+      tMax.x += tDelta.x;
+      voxel.x += step.x;
+    } else if (tMax.y <= tMax.z) {
+      tCellEnter = tMax.y;
+      if (step.y == 0) break;
+      tMax.y += tDelta.y;
+      voxel.y += step.y;
+    } else {
+      tCellEnter = tMax.z;
+      if (step.z == 0) break;
+      tMax.z += tDelta.z;
+      voxel.z += step.z;
+    }
+
+    if (any(lessThan(voxel, ivec3(0))) || any(greaterThan(voxel, ivec3(VOXEL_BRICK_SIZE - 1)))) {
+      break;
+    }
+  }
+
+  return false;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Main traversal
+// -------------------------------------------------------------------------------------------------
+
+void processRay(const RayPayload rayIn) {
+  RayPayload ray = rayIn;
+
+  float shellEnter, shellExit;
+  if (!intersectSphereShell(ray.origin, ray.direction, g.Rin, g.Rout, shellEnter, shellExit)) {
+    enqueueMiss(ray, MISS_REASON_SHELL);
     return;
   }
 
-  // DEBUG OVERLAY 2: show first coarse-DDA brick hit (yellow if any, blue sky otherwise)
-  if ((g.flags & 2u) != 0u) {
-    float tEnter, tExit; bool inShell = intersectSphereShell(ro, rd, g.Rin, g.Rout, tEnter, tExit);
-    float tmin = inShell ? tEnter : 0.0; float tmax = inShell ? tExit : 50000.0;
-    // Clamp traversal to a band around the near-side crust intersection to avoid far-hemisphere hits
-    float s0, s1; if (intersectSphere(ro, rd, g.Rsea, s0, s1)) {
-      float s = 1e30; if (s0>=tmin && s0<=tmax) s=min(s,s0); if (s1>=tmin && s1<=tmax) s=min(s,s1);
-      if (s < 1e20) {
-        float band = 8.0 * g.brickSize; // conservative band around surface
-        float eps  = 1e-4 * g.brickSize;
-        tmin = max(tEnter, s - band) + eps;
-        tmax = min(tExit,  s + band);
-      }
-    }
-    vec3 pos = ro + rd * tmin;
-    ivec3 bc = ivec3(floor(pos / g.brickSize));
-    vec3 cellMin = vec3(bc) * g.brickSize; vec3 cellMax = cellMin + vec3(g.brickSize);
-    vec3 tDelta = vec3(g.brickSize) / abs(rd);
-    vec3 tMax;
-    tMax.x = (rd.x > 0.0) ? ((cellMax.x - pos.x) / rd.x) : ((pos.x - cellMin.x) / -rd.x);
-    tMax.y = (rd.y > 0.0) ? ((cellMax.y - pos.y) / rd.y) : ((pos.y - cellMin.y) / -rd.y);
-    tMax.z = (rd.z > 0.0) ? ((cellMax.z - pos.z) / rd.z) : ((pos.z - cellMin.z) / -rd.z);
-    tMax += vec3(tmin);
-    bool any=false;
-    for (int stepCount=0; stepCount<4096 && tmin < tmax; ++stepCount) {
-      uint bidx; if (findBrick(bc, bidx)) { any=true; break; }
-      if (tMax.x <= tMax.y && tMax.x <= tMax.z) { tmin = tMax.x; bc.x += (rd.x>0.0)?1:-1; tMax.x += tDelta.x; }
-      else if (tMax.y <= tMax.z) { tmin = tMax.y; bc.y += (rd.y>0.0)?1:-1; tMax.y += tDelta.y; }
-      else { tmin = tMax.z; bc.z += (rd.z>0.0)?1:-1; tMax.z += tDelta.z; }
-    }
-    vec3 color = any ? vec3(1.0,1.0,0.2) : vec3(0.1,0.1,0.6);
-    imageStore(accumImage, pix, vec4(color,1.0));
+  float tMin = max(ray.tMin, shellEnter);
+  float tMax = min(ray.tMax, shellExit);
+  if (tMin >= tMax) {
+    enqueueMiss(ray, MISS_REASON_SHELL);
     return;
   }
 
-  // DEBUG OVERLAY 4: Macro tile presence at start (green=present, orange=absent)
-  if ((g.flags & 16u) != 0u) {
-    float tEnter, tExit; bool inShell = intersectSphereShell(ro, rd, g.Rin, g.Rout, tEnter, tExit);
-    float tmin = inShell ? tEnter : 0.0; float tmax = inShell ? tExit : 50000.0;
-    float s0, s1; if (intersectSphere(ro, rd, g.Rsea, s0, s1)) {
-      float s = 1e30; if (s0>=tmin && s0<=tmax) s=min(s,s0); if (s1>=tmin && s1<=tmax) s=min(s,s1);
-      if (s < 1e20) tmin = max(tEnter, s - 8.0*g.brickSize) + 1e-4*g.brickSize;
-    }
-    vec3 pos = ro + rd * tmin;
-    ivec3 bc = ivec3(floor(pos / g.brickSize));
-    ivec3 mc = ivec3(floor(vec3(bc) / float(g.macroDimBricks)));
-    bool present = (g.macroHashCapacity>0u) ? findMacro(mc) : true;
-    vec3 color = present ? vec3(0.2,1.0,0.2) : vec3(1.0,0.6,0.2);
-    imageStore(accumImage, pix, vec4(color,1.0));
-    return;
-  }
-
-  // Clamp traversal to shell to reduce brick steps
-  float tEnter, tExit;
-  bool inShell = intersectSphereShell(ro, rd, g.Rin, g.Rout, tEnter, tExit);
-  float tmin = inShell ? tEnter : 0.0;
-  float tmax = inShell ? tExit  : 50000.0; // fallback
-
-  // Clamp traversal to a band around the near-side crust intersection; prevents seeing far hemisphere when near side is empty
-  float s0n, s1n; if (intersectSphere(ro, rd, g.Rsea, s0n, s1n)) {
-    float s = 1e30; if (s0n>=tmin && s0n<=tmax) s=min(s,s0n); if (s1n>=tmin && s1n<=tmax) s=min(s,s1n);
-    if (s < 1e20) {
+  // Near-surface band to prioritise traversal around the crust
+  float tBandMin = tMin;
+  float tBandMax = tMax;
+  float sea0, sea1;
+  if (intersectSphere(ray.origin, ray.direction, g.Rsea, sea0, sea1)) {
+    float sea = INF_T;
+    if (sea0 >= tMin && sea0 <= tMax) sea = min(sea, sea0);
+    if (sea1 >= tMin && sea1 <= tMax) sea = min(sea, sea1);
+    if (sea < INF_T * 0.5) {
       float band = 8.0 * g.brickSize;
       float eps  = 1e-4 * g.brickSize;
-      tmin = max(tEnter, s - band) + eps;
-      tmax = min(tExit,  s + band);
+      tBandMin = max(shellEnter, sea - band) + eps;
+      tBandMax = min(shellExit, sea + band);
     }
   }
 
-  // Brick stepping (coarse 3D DDA). Start at shell (or sea-level) entry point.
-  vec3 pos = ro + rd * (tmin + 1e-5 * g.brickSize); // nudge inside to avoid boundary ambiguity
-  ivec3 bc = ivec3(floor(pos / g.brickSize));
-  vec3 cellMin = vec3(bc) * g.brickSize;
-  vec3 cellMax = cellMin + vec3(g.brickSize);
-  vec3 tDelta = vec3(g.brickSize) / abs(rd);
-  vec3 tMax;
-  tMax.x = (rd.x > 0.0) ? ((cellMax.x - pos.x) / rd.x) : ((pos.x - cellMin.x) / -rd.x);
-  tMax.y = (rd.y > 0.0) ? ((cellMax.y - pos.y) / rd.y) : ((pos.y - cellMin.y) / -rd.y);
-  tMax.z = (rd.z > 0.0) ? ((cellMax.z - pos.z) / rd.z) : ((pos.z - cellMin.z) / -rd.z);
-  tMax += vec3(tmin);
+  float tMacroMin = max(tMin, tBandMin);
+  float tMacroMax = min(tMax, tBandMax);
 
-  vec3 colorSkyTop = vec3(0.25, 0.45, 0.9);
-  vec3 colorSkyBot = vec3(0.85, 0.9, 1.0);
-  vec3 color = vec3(0.0);
-  bool shaded = false;
+  float tCursor = tMin;
+  vec3 dir = ray.direction;
+  vec3 posStart = ray.origin + dir * (tCursor + BRICK_NUDGE * g.brickSize);
+  ivec3 brickCoords = ivec3(floor(posStart / g.brickSize));
 
-  // Write debug sample for center pixel
-  if (pix.x == dims.x/2 && pix.y == dims.y/2) {
-    ivec3 mc0 = ivec3(floor(vec3(bc) / float(g.macroDimBricks)));
-    bool pres0 = (g.macroHashCapacity>0u) ? findMacro(mc0) : true;
-    // dbg layout: [0]=frame, [1]=flags, [2]=macroCap, [3]=macroDim,
-    // [4..6]=bc, [7]=present, [8..10]=mc, [11]=reserved
-    DBG.dbg[0] = g.frameIdx;
-    DBG.dbg[1] = g.flags;
-    DBG.dbg[2] = g.macroHashCapacity;
-    DBG.dbg[3] = g.macroDimBricks;
-    DBG.dbg[4] = uint(bc.x);
-    DBG.dbg[5] = uint(bc.y);
-    DBG.dbg[6] = uint(bc.z);
-    DBG.dbg[7] = pres0 ? 1u : 0u;
-    DBG.dbg[8] = uint(mc0.x);
-    DBG.dbg[9] = uint(mc0.y);
-    DBG.dbg[10] = uint(mc0.z);
-    DBG.dbg[11] = 0u;
+  // Optionally skip empty macro tiles before we enter the brick loop.
+  if ((g.flags & FLAG_ENABLE_MACRO) != 0u && g.macroHashCapacity > 0u) {
+    advanceEmptyMacroTiles(ray.origin, dir, tMacroMin, tMacroMax, tCursor, brickCoords);
   }
 
-  for (int stepCount=0; stepCount<4096 && tmin < tmax; ++stepCount) {
-    // Macro mask skipping (coarse 3D DDA across macro tiles), gated by bit 8
-    if (((g.flags & 8u) != 0u) && (g.macroHashCapacity > 0u)) {
-      float macroSize = g.macroSize;
-      // Compute macro coords from current brick coords to avoid float boundary noise
-      ivec3 mc = ivec3(floor(vec3(bc) / float(g.macroDimBricks)));
-      // Advance macro tiles deterministically until we find a present tile or exit band
-      for (int mstep=0; mstep<1024; ++mstep) {
-        if (findMacro(mc)) break;
-        vec3 mMin = vec3(mc) * macroSize;
-        vec3 mMax = mMin + vec3(macroSize);
-        // Compute t to next macro boundary along each axis from current pos
-        float tx = (rd.x > 0.0) ? ((mMax.x - pos.x) / rd.x) : ((pos.x - mMin.x) / -rd.x);
-        float ty = (rd.y > 0.0) ? ((mMax.y - pos.y) / rd.y) : ((pos.y - mMin.y) / -rd.y);
-        float tz = (rd.z > 0.0) ? ((mMax.z - pos.z) / rd.z) : ((pos.z - mMin.z) / -rd.z);
-        float tNext = min(tx, min(ty, tz));
-        if (!(tNext >= 0.0)) break;
-        tmin = min(tmax, tmin + tNext + 1e-5 * macroSize);
-        pos = ro + rd * tmin;
-        // Step mc along axis of min tNext
-        if (tx <= ty && tx <= tz) mc.x += (rd.x > 0.0) ? 1 : -1;
-        else if (ty <= tz)        mc.y += (rd.y > 0.0) ? 1 : -1;
-        else                      mc.z += (rd.z > 0.0) ? 1 : -1;
-        if (tmin >= tmax) break;
+  vec3 invDir = vec3(
+    safeReciprocal(dir.x),
+    safeReciprocal(dir.y),
+    safeReciprocal(dir.z)
+  );
+  vec3 absInvDir = abs(invDir);
+  vec3 tDelta = vec3(g.brickSize) * absInvDir;
+
+  for (int step = 0; step < BRICK_MAX_STEPS && tCursor < tMax; ++step) {
+    vec3 cellMin = vec3(brickCoords) * g.brickSize;
+    vec3 cellMax = cellMin + vec3(g.brickSize);
+    vec3 samplePos = ray.origin + dir * (tCursor + BRICK_NUDGE * g.brickSize);
+
+    float tx = tCursor + safeNextBoundary(samplePos.x, cellMin.x, cellMax.x, dir.x);
+    float ty = tCursor + safeNextBoundary(samplePos.y, cellMin.y, cellMax.y, dir.y);
+    float tz = tCursor + safeNextBoundary(samplePos.z, cellMin.z, cellMax.z, dir.z);
+    float tBrickExit = min(tx, min(ty, tz));
+
+    // Macro skip inside the loop to avoid spending time in empty coarse tiles.
+    if ((g.flags & FLAG_ENABLE_MACRO) != 0u && g.macroHashCapacity > 0u) {
+      ivec3 macroCoord = ivec3(
+        floorDiv(brickCoords.x, int(g.macroDimBricks)),
+        floorDiv(brickCoords.y, int(g.macroDimBricks)),
+        floorDiv(brickCoords.z, int(g.macroDimBricks))
+      );
+      if (!macroTileOccupied(macroCoord)) {
+        bool exhaustedBand = advanceEmptyMacroTiles(ray.origin, dir, tMacroMin, tMacroMax, tCursor, brickCoords);
+        if (exhaustedBand || tCursor >= tMax) {
+          enqueueMiss(ray, MISS_REASON_BAND);
+          return;
+        }
+        continue;
       }
-      // Recompute brick DDA state from new pos
-      bc = ivec3(floor(pos / g.brickSize));
-      cellMin = vec3(bc) * g.brickSize; cellMax = cellMin + vec3(g.brickSize);
-      tDelta = vec3(g.brickSize) / abs(rd);
-      tMax.x = (rd.x > 0.0) ? ((cellMax.x - pos.x) / rd.x) : ((pos.x - cellMin.x) / -rd.x);
-      tMax.y = (rd.y > 0.0) ? ((cellMax.y - pos.y) / rd.y) : ((pos.y - cellMin.y) / -rd.y);
-      tMax.z = (rd.z > 0.0) ? ((cellMax.z - pos.z) / rd.z) : ((pos.z - cellMin.z) / -rd.z);
-      tMax += vec3(tmin);
     }
 
-    uint bidx = 0u;
-    if (findBrick(bc, bidx)) {
-      // If debug flag 4 set: shade immediately (coarse brick hit) to validate coarse DDA
-      if ((g.flags & 4u) != 0u) {
-        imageStore(accumImage, pix, vec4(1.0, 1.0, 0.2, 1.0));
-        return;
-      }
-      BrickHeader h = BH.headers[bidx];
-      uint baseWord = h.occOffset / 8u;
-      if (!brickIsEmpty(baseWord)) {
-        // Intersect ray with this brick AABB to limit search interval
-        float tb0, tb1; vec3 bmin = vec3(h.bx, h.by, h.bz) * g.brickSize; vec3 bmax = bmin + vec3(g.brickSize);
-        if (rayAABB(ro, rd, bmin, bmax, tb0, tb1)) {
-          float t0 = max(tb0, tmin);
-          float t1 = min(tb1, tmax);
-          // Micro-DDA in voxel space
-          vec3 p0 = ro + t0 * rd;
-          vec3 lpos = (p0 - bmin) / g.voxelSize; // voxel units
-          ivec3 v = ivec3(clamp(floor(lpos), vec3(0.0), vec3(float(VOXEL_BRICK_SIZE-1))));
-          vec3 r = rd; vec3 invr = 1.0 / max(abs(r), vec3(1e-9));
-          vec3 tDeltaV = g.voxelSize * invr;
-          vec3 nextB;
-          nextB.x = (r.x > 0.0) ? ((float(v.x)+1.0) - lpos.x) : (lpos.x - float(v.x));
-          nextB.y = (r.y > 0.0) ? ((float(v.y)+1.0) - lpos.y) : (lpos.y - float(v.y));
-          nextB.z = (r.z > 0.0) ? ((float(v.z)+1.0) - lpos.z) : (lpos.z - float(v.z));
-          vec3 tMaxV = t0 + nextB * invr * g.voxelSize;
-          float tCellEnter = t0;
-          for (int iter=0; iter<128 && tCellEnter <= t1; ++iter) {
-            uint idx = uint(v.x + v.y*uint(VOXEL_BRICK_SIZE) + v.z*uint(VOXEL_BRICK_SIZE*VOXEL_BRICK_SIZE));
-            uint baseWord = h.occOffset / 8u; uint w = idx >> 6u; uint b = idx & 63u;
-            bool occ = ((OCC.occWords[baseWord + w] >> b) & 1ul) != 0ul;
-            float tCellExit = min(tMaxV.x, min(tMaxV.y, tMaxV.z));
-            if (occ) {
-              // refine within [tCellEnter, tCellExit]
-              float ta = tCellEnter; float tb = tCellExit; float tm = tb;
-              float fa = F_crust(ro + ta*rd, g.Rsea); float fb = F_crust(ro + tb*rd, g.Rsea);
-              if (fa*fb <= 0.0) {
-                for (int j=0;j<6;++j) { tm = 0.5*(ta+tb); float fm = F_crust(ro + tm*rd, g.Rsea); if (fm==0.0) break; bool same = (fm*fa)>0.0; ta = same? tm:ta; fa = same? fm:fa; tb = same? tb:tm; }
-              }
-              vec3 hitP = ro + tm * rd; vec3 n = gradF(hitP); color = 0.5*(n+vec3(1.0)); shaded = true; break;
-            }
-            // step to next voxel
-            if (tMaxV.x <= tMaxV.y && tMaxV.x <= tMaxV.z) { tCellEnter = tMaxV.x; v.x += (r.x>0.0)?1:-1; tMaxV.x += tDeltaV.x; }
-            else if (tMaxV.y <= tMaxV.z) { tCellEnter = tMaxV.y; v.y += (r.y>0.0)?1:-1; tMaxV.y += tDeltaV.y; }
-            else { tCellEnter = tMaxV.z; v.z += (r.z>0.0)?1:-1; tMaxV.z += tDeltaV.z; }
-            if (any(lessThan(v, ivec3(0))) || any(greaterThan(v, ivec3(VOXEL_BRICK_SIZE-1)))) break;
-          }
-          if (shaded) break;
+    uint brickIdx;
+    if (findBrick(brickCoords, brickIdx)) {
+      BrickHeader h = BH.headers[brickIdx];
+      if (brickHasOccupancy(h)) {
+        float tHit;
+        vec3 normal;
+        uint material;
+        if (traverseBrickMicro(ray, tCursor, min(tBrickExit, tMax), h, tHit, normal, material)) {
+          enqueueHit(ray, tHit, normal, material);
+          return;
         }
       }
     }
-    // advance to next brick boundary
-    // Advance along smallest tMax axis
-    if (tMax.x <= tMax.y && tMax.x <= tMax.z) {
-      tmin = tMax.x;
-      bc.x += (rd.x > 0.0) ? 1 : -1;
-      tMax.x += tDelta.x;
-    } else if (tMax.y <= tMax.z) {
-      tmin = tMax.y;
-      bc.y += (rd.y > 0.0) ? 1 : -1;
-      tMax.y += tDelta.y;
+
+    // Advance to next brick along the smallest tMax axis.
+    if (tx <= ty && tx <= tz) {
+      tCursor = tx;
+      brickCoords.x += (dir.x >= 0.0) ? 1 : -1;
+    } else if (ty <= tz) {
+      tCursor = ty;
+      brickCoords.y += (dir.y >= 0.0) ? 1 : -1;
     } else {
-      tmin = tMax.z;
-      bc.z += (rd.z > 0.0) ? 1 : -1;
-      tMax.z += tDelta.z;
+      tCursor = tz;
+      brickCoords.z += (dir.z >= 0.0) ? 1 : -1;
     }
   }
 
-  if (!shaded) {
-    vec2 uv = (vec2(pix) + vec2(0.5)) / vec2(dims);
-    float v = 1.0 - uv.y;
-    color = mix(colorSkyBot, colorSkyTop, pow(v, 1.5));
+  // Reached the end of the traversal window without hitting a voxel.
+  enqueueMiss(ray, MISS_REASON_ENV);
+}
+
+void main() {
+  for (;;) {
+    RayPayload ray;
+    if (!dequeueRay(ray)) {
+      return;
+    }
+    processRay(ray);
   }
-  imageStore(accumImage, pix, vec4(color, 1.0));
 }

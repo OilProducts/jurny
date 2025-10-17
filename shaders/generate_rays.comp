@@ -1,5 +1,81 @@
 #version 460
-// generate_rays.comp — K0 primary ray generation (placeholder)
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-void main() {}
-// Writes rays to RayQueueIn with camera-relative origin and direction.
+
+#include "common.glsl"
+#include "spherical.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform GlobalsUBO { GlobalsUBO_t g; };
+
+struct QueueHeader {
+  uint head;
+  uint tail;
+  uint capacity;
+  uint dropped;
+};
+
+struct RayPayload {
+  vec3  origin;
+  float tMin;
+  vec3  direction;
+  float tMax;
+  uint  rng;
+  uint  pixelIndex;
+  uint  pathDepth;
+  uint  flags;
+};
+
+layout(set = 0, binding = 10, std430) buffer RayQueueBuf {
+  QueueHeader header;
+  RayPayload rays[];
+} RayQueueIn;
+
+vec3 makeCameraOrigin() {
+  mat4 invView = inverse(g.currView);
+  vec4 o = invView * vec4(0.0, 0.0, 0.0, 1.0);
+  return o.xyz;
+}
+
+vec3 makeCameraRay(vec2 ndc) {
+  mat4 invProj = inverse(g.currProj);
+  mat4 invView = inverse(g.currView);
+  vec4 clip = vec4(ndc, 1.0, 1.0);
+  vec4 view = invProj * clip;
+  view /= max(view.w, 1e-6);
+  vec4 world = invView * vec4(normalize(view.xyz), 0.0);
+  return normalize(world.xyz);
+}
+
+void main() {
+  ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+  if (pix.x >= int(g.width) || pix.y >= int(g.height)) return;
+
+  uint pixelIndex = uint(pix.y) * g.width + uint(pix.x);
+  vec2 uv = (vec2(pix) + vec2(0.5)) / vec2(float(g.width), float(g.height));
+  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+
+  vec3 origin = makeCameraOrigin();
+  vec3 dir = makeCameraRay(ndc);
+
+  float tMin = 0.0;
+  float tMax = g.Rout * 4.0;
+
+  uint capacity = RayQueueIn.header.capacity;
+  if (capacity == 0u) return;
+  uint slot = atomicAdd(RayQueueIn.header.tail, 1u);
+  if ((slot - RayQueueIn.header.head) >= capacity) {
+    atomicAdd(RayQueueIn.header.dropped, 1u);
+    return;
+  }
+  uint idx = slot & (capacity - 1u);
+  RayPayload payload;
+  payload.origin = origin;
+  payload.tMin = tMin;
+  payload.direction = dir;
+  payload.tMax = tMax;
+  payload.rng = pcg_hash(pixelIndex ^ (g.frameIdx * 1664525u));
+  payload.pixelIndex = pixelIndex;
+  payload.pathDepth = 0u;
+  payload.flags = 0u;
+  RayQueueIn.rays[idx] = payload;
+}

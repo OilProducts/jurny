@@ -40,10 +40,14 @@ private:
     void destroyDescriptors(platform::VulkanContext& vk);
     bool createWorld(platform::VulkanContext& vk);
     void destroyWorld(platform::VulkanContext& vk);
+    bool createQueues(platform::VulkanContext& vk);
+    void destroyQueues(platform::VulkanContext& vk);
+    void writeQueueHeaders(VkCommandBuffer cb);
 
 private:
     VkDescriptorSetLayout setLayout_{};
     VkPipelineLayout      pipeLayout_{};
+    VkPipeline            pipeGenerate_{};
     VkPipeline            pipeShade_{};
     VkPipeline            pipeTraverse_{};
     VkPipeline            pipeComposite_{};
@@ -61,6 +65,12 @@ private:
     VkBuffer hvBuf_{}; VkDeviceMemory hvMem_{};
     VkBuffer mkBuf_{}; VkDeviceMemory mkMem_{};
     VkBuffer mvBuf_{}; VkDeviceMemory mvMem_{};
+    // Ray/hit/miss queues
+    VkBuffer rayQueueBuf_{};      VkDeviceMemory rayQueueMem_{};
+    VkBuffer hitQueueBuf_{};      VkDeviceMemory hitQueueMem_{};
+    VkBuffer missQueueBuf_{};     VkDeviceMemory missQueueMem_{};
+    VkBuffer secondaryQueueBuf_{};VkDeviceMemory secondaryQueueMem_{};
+    uint32_t queueCapacity_{};
     uint32_t hashCapacity_{}; uint32_t brickCount_{};
     uint32_t macroCapacity_{}; uint32_t macroDimBricks_{};
 

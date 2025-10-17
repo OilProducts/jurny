@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <vector>
 #include <string>
+#include <algorithm>
 
 namespace render {
 
@@ -15,6 +16,29 @@ static uint32_t findMemoryType(VkPhysicalDevice phys, uint32_t typeBits, VkMemor
         if ((typeBits & (1u<<i)) && (mp.memoryTypes[i].propertyFlags & req) == req) return i;
     }
     return UINT32_MAX;
+}
+
+static bool allocateBuffer(VkDevice device,
+                           VkPhysicalDevice phys,
+                           VkDeviceSize size,
+                           VkBufferUsageFlags usage,
+                           VkMemoryPropertyFlags flags,
+                           VkBuffer& outBuf,
+                           VkDeviceMemory& outMem) {
+    VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bi.size = size;
+    bi.usage = usage;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(device, &bi, nullptr, &outBuf) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(device, outBuf, &mr);
+    uint32_t typeIndex = findMemoryType(phys, mr.memoryTypeBits, flags);
+    if (typeIndex == UINT32_MAX) return false;
+    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = typeIndex;
+    if (vkAllocateMemory(device, &mai, nullptr, &outMem) != VK_SUCCESS) return false;
+    vkBindBufferMemory(device, outBuf, outMem, 0);
+    return true;
 }
 
 bool Raytracer::createImages(platform::VulkanContext& vk, platform::Swapchain& swap) {
@@ -50,7 +74,8 @@ void Raytracer::destroyImages(platform::VulkanContext& vk) {
 }
 
 bool Raytracer::createPipelines(platform::VulkanContext& vk) {
-    // Descriptor set layout: 0=UBO, 1=accum, 2=out, 3=BrickHeaders, 4=Occ, 5=HashKeys, 6=HashVals, 7=MacroKeys, 8=MacroVals
+    // Descriptor set layout: 0=UBO, 1=accum, 2=out, 3=BrickHeaders, 4=Occ, 5=HashKeys, 6=HashVals,
+    // 7=MacroKeys, 8=MacroVals, 9=Debug, 10=RayQueue, 11=HitQueue, 12=MissQueue, 13=SecondaryQueue
     VkDescriptorSetLayoutBinding bUbo{ }; bUbo.binding=0; bUbo.descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; bUbo.descriptorCount=1; bUbo.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bAcc{ }; bAcc.binding=1; bAcc.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bAcc.descriptorCount=1; bAcc.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bOut{ }; bOut.binding=2; bOut.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bOut.descriptorCount=1; bOut.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
@@ -61,9 +86,13 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     VkDescriptorSetLayoutBinding bMK{ };  bMK.binding=7;  bMK.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bMK.descriptorCount=1; bMK.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bMV{ };  bMV.binding=8;  bMV.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bMV.descriptorCount=1; bMV.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bDBG{ }; bDBG.binding=9;  bDBG.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bDBG.descriptorCount=1; bDBG.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutBinding bindings[10] = { bUbo, bAcc, bOut, bBH, bOcc, bHK, bHV, bMK, bMV, bDBG };
+    VkDescriptorSetLayoutBinding bRayQ{ }; bRayQ.binding=10; bRayQ.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bRayQ.descriptorCount=1; bRayQ.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding bHitQ{ }; bHitQ.binding=11; bHitQ.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bHitQ.descriptorCount=1; bHitQ.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding bMissQ{}; bMissQ.binding=12; bMissQ.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bMissQ.descriptorCount=1; bMissQ.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding bSecQ{ }; bSecQ.binding=13; bSecQ.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bSecQ.descriptorCount=1; bSecQ.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding bindings[14] = { bUbo, bAcc, bOut, bBH, bOcc, bHK, bHV, bMK, bMV, bDBG, bRayQ, bHitQ, bMissQ, bSecQ };
     VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    dslci.bindingCount=10; dslci.pBindings=bindings;
+    dslci.bindingCount=14; dslci.pBindings=bindings;
     if (vkCreateDescriptorSetLayout(vk.device(), &dslci, nullptr, &setLayout_) != VK_SUCCESS) return false;
     VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     plci.setLayoutCount=1; plci.pSetLayouts=&setLayout_;
@@ -85,17 +114,20 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
         smci.codeSize = spv.size()*sizeof(uint32_t); smci.pCode = spv.data();
         VkShaderModule sm{}; vkCreateShaderModule(vk.device(), &smci, nullptr, &sm); return sm;
     };
+    VkShaderModule smGen   = loadShader("generate_rays.comp.spv");
     VkShaderModule smShade = loadShader("shade.comp.spv");
     VkShaderModule smTrav  = loadShader("traverse_bricks.comp.spv");
     VkShaderModule smComp  = loadShader("composite.comp.spv");
-    if (!smShade || !smTrav || !smComp) return false;
+    if (!smGen || !smShade || !smTrav || !smComp) return false;
     VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
     VkPipelineShaderStageCreateInfo ss{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
     ss.stage = VK_SHADER_STAGE_COMPUTE_BIT; ss.pName = "main"; cpci.layout = pipeLayout_;
+    ss.module = smGen;   cpci.stage = ss; if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeGenerate_) != VK_SUCCESS) return false;
     ss.module = smShade; cpci.stage = ss; if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeShade_) != VK_SUCCESS) return false;
     ss.module = smTrav;  cpci.stage = ss; if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeTraverse_) != VK_SUCCESS) return false;
     ss.module = smComp;  cpci.stage = ss;
     if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeComposite_) != VK_SUCCESS) return false;
+    vkDestroyShaderModule(vk.device(), smGen, nullptr);
     vkDestroyShaderModule(vk.device(), smShade, nullptr);
     vkDestroyShaderModule(vk.device(), smTrav, nullptr);
     vkDestroyShaderModule(vk.device(), smComp, nullptr);
@@ -105,6 +137,8 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
 void Raytracer::destroyPipelines(platform::VulkanContext& vk) {
     if (pipeComposite_) { vkDestroyPipeline(vk.device(), pipeComposite_, nullptr); pipeComposite_ = VK_NULL_HANDLE; }
     if (pipeShade_) { vkDestroyPipeline(vk.device(), pipeShade_, nullptr); pipeShade_ = VK_NULL_HANDLE; }
+    if (pipeTraverse_) { vkDestroyPipeline(vk.device(), pipeTraverse_, nullptr); pipeTraverse_ = VK_NULL_HANDLE; }
+    if (pipeGenerate_) { vkDestroyPipeline(vk.device(), pipeGenerate_, nullptr); pipeGenerate_ = VK_NULL_HANDLE; }
     if (pipeLayout_) { vkDestroyPipelineLayout(vk.device(), pipeLayout_, nullptr); pipeLayout_ = VK_NULL_HANDLE; }
     if (setLayout_) { vkDestroyDescriptorSetLayout(vk.device(), setLayout_, nullptr); setLayout_ = VK_NULL_HANDLE; }
 }
@@ -113,7 +147,7 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
     VkDescriptorPoolSize sizes[5] = {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,  swap.imageCount() },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,   2u * swap.imageCount() },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  7u * swap.imageCount() },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  11u * swap.imageCount() },
         { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1 },
         { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1 }
     };
@@ -139,7 +173,7 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
 
     // Create Debug buffer (host visible)
     VkBufferCreateInfo bdbg{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-    bdbg.size = 16 * sizeof(uint32_t);
+    bdbg.size = 128 * sizeof(uint32_t); // expanded for richer diagnostics
     bdbg.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     if (vkCreateBuffer(vk.device(), &bdbg, nullptr, &dbgBuf_) != VK_SUCCESS) return false;
     VkMemoryRequirements mrd{}; vkGetBufferMemoryRequirements(vk.device(), dbgBuf_, &mrd);
@@ -147,6 +181,8 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
     VkMemoryAllocateInfo maid{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO }; maid.allocationSize = mrd.size; maid.memoryTypeIndex = typeIndexDbg;
     if (vkAllocateMemory(vk.device(), &maid, nullptr, &dbgMem_) != VK_SUCCESS) return false;
     vkBindBufferMemory(vk.device(), dbgBuf_, dbgMem_, 0);
+
+    if (!createQueues(vk)) return false;
 
     // Write descriptors per swapchain image
     for (uint32_t i=0;i<swap.imageCount();++i) {
@@ -157,7 +193,11 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
         VkDescriptorBufferInfo dbOcc{ occBuf_, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo dbHK{ hkBuf_, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo dbHV{ hvBuf_, 0, VK_WHOLE_SIZE };
-        VkWriteDescriptorSet writes[10]{};
+        VkDescriptorBufferInfo dbRay{ rayQueueBuf_, 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo dbHit{ hitQueueBuf_, 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo dbMiss{ missQueueBuf_, 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo dbSec{ secondaryQueueBuf_, 0, VK_WHOLE_SIZE };
+        VkWriteDescriptorSet writes[14]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[0].dstSet = sets_[i]; writes[0].dstBinding=0; writes[0].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; writes[0].descriptorCount=1; writes[0].pBufferInfo=&db;
         writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[1].dstSet = sets_[i]; writes[1].dstBinding=1; writes[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[1].descriptorCount=1; writes[1].pImageInfo=&diAcc;
         writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[2].dstSet = sets_[i]; writes[2].dstBinding=2; writes[2].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[2].descriptorCount=1; writes[2].pImageInfo=&diOut;
@@ -171,12 +211,17 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
         writes[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[7].dstSet = sets_[i]; writes[7].dstBinding=7; writes[7].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[7].descriptorCount=1; writes[7].pBufferInfo=&dbMK;
         writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[8].dstSet = sets_[i]; writes[8].dstBinding=8; writes[8].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[8].descriptorCount=1; writes[8].pBufferInfo=&dbMV;
         writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[9].dstSet = sets_[i]; writes[9].dstBinding=9; writes[9].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[9].descriptorCount=1; writes[9].pBufferInfo=&dbDBG;
-        vkUpdateDescriptorSets(vk.device(), 10, writes, 0, nullptr);
+        writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[10].dstSet=sets_[i]; writes[10].dstBinding=10; writes[10].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[10].descriptorCount=1; writes[10].pBufferInfo=&dbRay;
+        writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[11].dstSet=sets_[i]; writes[11].dstBinding=11; writes[11].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[11].descriptorCount=1; writes[11].pBufferInfo=&dbHit;
+        writes[12].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[12].dstSet=sets_[i]; writes[12].dstBinding=12; writes[12].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[12].descriptorCount=1; writes[12].pBufferInfo=&dbMiss;
+        writes[13].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[13].dstSet=sets_[i]; writes[13].dstBinding=13; writes[13].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[13].descriptorCount=1; writes[13].pBufferInfo=&dbSec;
+        vkUpdateDescriptorSets(vk.device(), 14, writes, 0, nullptr);
     }
     return true;
 }
 
 void Raytracer::destroyDescriptors(platform::VulkanContext& vk) {
+    destroyQueues(vk);
     if (ubo_) { vkDestroyBuffer(vk.device(), ubo_, nullptr); ubo_ = VK_NULL_HANDLE; }
     if (uboMem_) { vkFreeMemory(vk.device(), uboMem_, nullptr); uboMem_ = VK_NULL_HANDLE; }
     if (dbgBuf_) { vkDestroyBuffer(vk.device(), dbgBuf_, nullptr); dbgBuf_ = VK_NULL_HANDLE; }
@@ -216,6 +261,26 @@ bool Raytracer::createWorld(platform::VulkanContext& vk) {
             const auto& h = cpu.headers[i];
             spdlog::info("  h[{}]: bc=({}, {}, {}), occOffset={}B", i, h.bx, h.by, h.bz, h.occOffset);
         }
+    }
+
+    // Log macro hash bounds to validate CPU build vs expected ranges
+    {
+        auto unpackKey = [](uint64_t key, int& x, int& y, int& z){
+            const int B = 1<<20;
+            x = int((key >> 42) & ((1ull<<21)-1)) - B;
+            y = int((key >> 21) & ((1ull<<21)-1)) - B;
+            z = int((key >>  0) & ((1ull<<21)-1)) - B;
+        };
+        int mxMin=INT32_MAX,myMin=INT32_MAX,mzMin=INT32_MAX;
+        int mxMax=INT32_MIN,myMax=INT32_MIN,mzMax=INT32_MIN;
+        uint32_t presentCount=0;
+        for (size_t i=0;i<cpu.macroKeys.size();++i){
+            uint64_t k = cpu.macroKeys[i]; if (!k) continue; int x,y,z; unpackKey(k,x,y,z);
+            mxMin = std::min(mxMin, x); myMin = std::min(myMin, y); mzMin = std::min(mzMin, z);
+            mxMax = std::max(mxMax, x); myMax = std::max(myMax, y); mzMax = std::max(mzMax, z);
+            presentCount++;
+        }
+        spdlog::info("Macro hash: cap={} present={} dimBricks={} bounds mx:[{}..{}] my:[{}..{}] mz:[{}..{}]", cpu.macroCapacity, presentCount, cpu.macroDimBricks, mxMin,mxMax,myMin,myMax,mzMin,mzMax);
     }
 
     auto createBuffer = [&](VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buf, VkDeviceMemory& mem){
@@ -265,6 +330,64 @@ void Raytracer::destroyWorld(platform::VulkanContext& vk) {
     if (mvMem_) { vkFreeMemory(vk.device(), mvMem_, nullptr); mvMem_=VK_NULL_HANDLE; }
 }
 
+namespace {
+constexpr VkDeviceSize kQueueHeaderBytes = sizeof(uint32_t) * 4;
+constexpr VkDeviceSize kRayPayloadBytes  = 80;
+constexpr VkDeviceSize kHitPayloadBytes  = 96;
+constexpr VkDeviceSize kMissPayloadBytes = 80;
+
+uint32_t nextPow2(uint32_t v) {
+    if (v <= 1u) return 1u;
+    v -= 1u;
+    v |= v >> 1u;
+    v |= v >> 2u;
+    v |= v >> 4u;
+    v |= v >> 8u;
+    v |= v >> 16u;
+    return v + 1u;
+}
+}
+
+bool Raytracer::createQueues(platform::VulkanContext& vk) {
+    destroyQueues(vk);
+    uint64_t pixelCount = uint64_t(extent_.width) * uint64_t(extent_.height);
+    queueCapacity_ = nextPow2(static_cast<uint32_t>(std::max<uint64_t>(1ull, pixelCount)));
+    auto alloc = [&](VkBuffer& buf, VkDeviceMemory& mem, VkDeviceSize payloadBytes) {
+        VkDeviceSize size = kQueueHeaderBytes + payloadBytes * queueCapacity_;
+        return allocateBuffer(vk.device(), vk.physicalDevice(), size,
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                              buf, mem);
+    };
+    if (!alloc(rayQueueBuf_, rayQueueMem_, kRayPayloadBytes)) return false;
+    if (!alloc(hitQueueBuf_, hitQueueMem_, kHitPayloadBytes)) return false;
+    if (!alloc(missQueueBuf_, missQueueMem_, kMissPayloadBytes)) return false;
+    if (!alloc(secondaryQueueBuf_, secondaryQueueMem_, kRayPayloadBytes)) return false;
+    return true;
+}
+
+void Raytracer::destroyQueues(platform::VulkanContext& vk) {
+    if (secondaryQueueBuf_) { vkDestroyBuffer(vk.device(), secondaryQueueBuf_, nullptr); secondaryQueueBuf_ = VK_NULL_HANDLE; }
+    if (secondaryQueueMem_) { vkFreeMemory(vk.device(), secondaryQueueMem_, nullptr); secondaryQueueMem_ = VK_NULL_HANDLE; }
+    if (missQueueBuf_) { vkDestroyBuffer(vk.device(), missQueueBuf_, nullptr); missQueueBuf_ = VK_NULL_HANDLE; }
+    if (missQueueMem_) { vkFreeMemory(vk.device(), missQueueMem_, nullptr); missQueueMem_ = VK_NULL_HANDLE; }
+    if (hitQueueBuf_) { vkDestroyBuffer(vk.device(), hitQueueBuf_, nullptr); hitQueueBuf_ = VK_NULL_HANDLE; }
+    if (hitQueueMem_) { vkFreeMemory(vk.device(), hitQueueMem_, nullptr); hitQueueMem_ = VK_NULL_HANDLE; }
+    if (rayQueueBuf_) { vkDestroyBuffer(vk.device(), rayQueueBuf_, nullptr); rayQueueBuf_ = VK_NULL_HANDLE; }
+    if (rayQueueMem_) { vkFreeMemory(vk.device(), rayQueueMem_, nullptr); rayQueueMem_ = VK_NULL_HANDLE; }
+    queueCapacity_ = 0u;
+}
+
+void Raytracer::writeQueueHeaders(VkCommandBuffer cb) {
+    if (queueCapacity_ == 0u) return;
+    struct Header { uint32_t head; uint32_t tail; uint32_t capacity; uint32_t dropped; } hdr{0u, 0u, queueCapacity_, 0u};
+    vkCmdUpdateBuffer(cb, rayQueueBuf_, 0, sizeof(Header), &hdr);
+    vkCmdUpdateBuffer(cb, hitQueueBuf_, 0, sizeof(Header), &hdr);
+    vkCmdUpdateBuffer(cb, missQueueBuf_, 0, sizeof(Header), &hdr);
+    vkCmdUpdateBuffer(cb, secondaryQueueBuf_, 0, sizeof(Header), &hdr);
+}
+
 bool Raytracer::init(platform::VulkanContext& vk, platform::Swapchain& swap) {
     if (!createImages(vk, swap)) return false;
     if (!createPipelines(vk)) return false;
@@ -295,11 +418,54 @@ void Raytracer::updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData&
 }
 
 void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, VkCommandBuffer cb, uint32_t swapIndex) {
-    // Traverse+shade into accum
+    writeQueueHeaders(cb);
+    VkMemoryBarrier2 hdrBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    hdrBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    hdrBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    hdrBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    hdrBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    VkDependencyInfo hdrDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    hdrDep.memoryBarrierCount = 1;
+    hdrDep.pMemoryBarriers = &hdrBarrier;
+    vkCmdPipelineBarrier2(cb, &hdrDep);
+
+    // Generate primary rays into queue
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeGenerate_);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_, 0, 1, &sets_[swapIndex], 0, nullptr);
+    uint32_t gx = (extent_.width + 7u)/8u;
+    uint32_t gy = (extent_.height + 7u)/8u;
+    vkCmdDispatch(cb, gx, gy, 1);
+    VkMemoryBarrier2 genBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    genBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    genBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    genBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    genBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    VkDependencyInfo genDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    genDep.memoryBarrierCount = 1;
+    genDep.pMemoryBarriers = &genBarrier;
+    vkCmdPipelineBarrier2(cb, &genDep);
+
+    // Traverse rays into queues
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeTraverse_);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_, 0, 1, &sets_[swapIndex], 0, nullptr);
-    uint32_t gx = (extent_.width + 7u)/8u, gy = (extent_.height + 7u)/8u;
     vkCmdDispatch(cb, gx, gy, 1);
+    // Ensure queue writes are visible to shading pass
+    VkMemoryBarrier2 queueBarrier{};
+    queueBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    queueBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    queueBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    queueBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    queueBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    VkDependencyInfo queueDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    queueDep.memoryBarrierCount = 1;
+    queueDep.pMemoryBarriers = &queueBarrier;
+    vkCmdPipelineBarrier2(cb, &queueDep);
+
+    // Shade hits/misses from queues into accum image
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeShade_);
+    uint32_t shadeGroups = gx * gy; // one workgroup per traverse workgroup (64 threads)
+    vkCmdDispatch(cb, shadeGroups, 1, 1);
+
     // Barrier accum for read by composite and out image for write
     VkImageMemoryBarrier2 barriers[2]{};
     barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -322,14 +488,58 @@ void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, V
 }
 
 void Raytracer::readDebug(platform::VulkanContext& vk, uint32_t frameIdx) {
+    // Poll infrequently and debounce identical frames to avoid log spam.
     if ((frameIdx % 30u) != 0u) return;
     void* p=nullptr; if (vkMapMemory(vk.device(), dbgMem_, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS || !p) return;
     uint32_t* u = reinterpret_cast<uint32_t*>(p);
     uint32_t frame = u[0]; uint32_t flags = u[1]; uint32_t mcap=u[2]; uint32_t mdim=u[3];
-    int bcx = int(u[4]), bcy=int(u[5]), bcz=int(u[6]); uint32_t present=u[7];
-    int mcx = int(u[8]), mcy=int(u[9]), mcz=int(u[10]);
-    spdlog::info("DBG frame={} flags={} macroCap={} macroDim={} bc=({}, {}, {}) mc=({}, {}, {}) present={}",
-                 frame, flags, mcap, mdim, bcx,bcy,bcz, mcx,mcy,mcz, present);
+    int bcx0 = int(u[4]), bcy0=int(u[5]), bcz0=int(u[6]); uint32_t present0=u[7];
+    int mcx0 = int(u[8]), mcy0=int(u[9]), mcz0=int(u[10]); uint32_t macroStepCount=u[11];
+    int bcxH = int(u[12]), bcyH=int(u[13]), bczH=int(u[14]); uint32_t presentHit=u[15];
+    // Extended diagnostics
+    uint32_t zeroDirMask = u[16];
+    uint32_t hugeStepCount = u[17];
+    uint32_t nanCount = u[18];
+    uint32_t breakMask = u[19];
+    uint32_t zeroSentinelUseCount = u[20];
+    uint32_t clampCount = u[21];
+    float lastTNext = 0.f, lastTSearch = 0.f;
+    std::memcpy(&lastTNext, &u[22], sizeof(float));
+    std::memcpy(&lastTSearch, &u[23], sizeof(float));
+
+    bool changed = (frame != lastDbgFrame_) || (mcx0!=lastMcX_) || (mcy0!=lastMcY_) || (mcz0!=lastMcZ_) || (int(present0)!=lastPresent_);
+    if (changed) {
+        spdlog::info("DBG frame={} flags={} macroCap={} macroDim={} start-bc=({}, {}, {}) start-mc=({}, {}, {}) present={} msteps={} hit-bc=({}, {}, {}) hit-present={}",
+                     frame, flags, mcap, mdim,
+                     bcx0,bcy0,bcz0, mcx0,mcy0,mcz0, present0, macroStepCount,
+                     bcxH,bcyH,bczH, presentHit);
+        spdlog::info("DBG macroDiag: zeroMask={} hugeCnt={} nanCnt={} breakMask={} zeroSentUses={} clampCnt={} lastTNext={:.6f} lastTSearch={:.6f}",
+                     zeroDirMask, hugeStepCount, nanCount, breakMask, zeroSentinelUseCount, clampCount, lastTNext, lastTSearch);
+        // Decode extended diagnostics (band start and sea-level expectations)
+        int mcStartX = int(u[24]), mcStartY = int(u[25]), mcStartZ = int(u[26]); uint32_t presentStart = u[27];
+        int mcSeaX   = int(u[28]), mcSeaY   = int(u[29]), mcSeaZ   = int(u[30]); uint32_t presentSea = u[31];
+        int bcBandX  = int(u[32]), bcBandY  = int(u[33]), bcBandZ  = int(u[34]);
+        int bcSeaX   = int(u[35]), bcSeaY   = int(u[36]), bcSeaZ   = int(u[37]);
+        spdlog::info("DBG bandStart: mc=({}, {}, {}) present={} bc=({}, {}, {}) | sea: mc=({}, {}, {}) present={} bc=({}, {}, {})",
+                     mcStartX, mcStartY, mcStartZ, presentStart,
+                     bcBandX, bcBandY, bcBandZ,
+                     mcSeaX, mcSeaY, mcSeaZ, presentSea,
+                     bcSeaX, bcSeaY, bcSeaZ);
+        // Times overview to verify windowing
+        float tEnterF=0, tExitF=0, s0F=0, s1F=0, sNearF=0, tBandMinF=0, tBandMaxF=0, tMacroMinF=0, tMacroMaxF=0;
+        std::memcpy(&tEnterF,   &u[38], sizeof(float));
+        std::memcpy(&tExitF,    &u[39], sizeof(float));
+        std::memcpy(&s0F,       &u[40], sizeof(float));
+        std::memcpy(&s1F,       &u[41], sizeof(float));
+        std::memcpy(&sNearF,    &u[42], sizeof(float));
+        std::memcpy(&tBandMinF, &u[43], sizeof(float));
+        std::memcpy(&tBandMaxF, &u[44], sizeof(float));
+        std::memcpy(&tMacroMinF,&u[45], sizeof(float));
+        std::memcpy(&tMacroMaxF,&u[46], sizeof(float));
+        spdlog::info("DBG times: tEnter={:.3f} tExit={:.3f} s0={:.3f} s1={:.3f} sNear={:.3f} | band=[{:.3f}..{:.3f}] macro=[{:.3f}..{:.3f}]",
+                     tEnterF, tExitF, s0F, s1F, sNearF, tBandMinF, tBandMaxF, tMacroMinF, tMacroMaxF);
+        lastDbgFrame_ = frame; lastMcX_=mcx0; lastMcY_=mcy0; lastMcZ_=mcz0; lastPresent_=int(present0);
+    }
     vkUnmapMemory(vk.device(), dbgMem_);
 }
 

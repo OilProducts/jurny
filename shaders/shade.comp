@@ -2,22 +2,121 @@
 
 #include "common.glsl"
 
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform GlobalsUBO { GlobalsUBO_t g; };
 layout(set = 0, binding = 1, rgba8) uniform writeonly image2D accumImage;
 
-void main() {
-  ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
-  // These dims will be set via UBO; however imageSize is convenient.
-  ivec2 dims = imageSize(accumImage);
-  if (pix.x >= dims.x || pix.y >= dims.y) return;
+struct QueueHeader {
+  uint head;
+  uint tail;
+  uint capacity;
+  uint dropped;
+};
 
-  // Simple sky gradient based on view direction (no reprojection yet)
-  vec2 uv = (vec2(pix) + vec2(0.5)) / vec2(dims);
-  float v = 1.0 - uv.y;
+struct HitPayload {
+  vec3  position;
+  float t;
+  vec3  normal;
+  uint  material;
+  vec3  direction;
+  uint  rng;
+  uint  pixelIndex;
+  uint  pathDepth;
+};
+
+struct MissPayload {
+  vec3  origin;
+  float tMin;
+  vec3  direction;
+  float tMax;
+  uint  rng;
+  uint  pixelIndex;
+  uint  pathDepth;
+  uint  reason;
+};
+
+layout(set = 0, binding = 11, std430) buffer HitQueueBuf {
+  QueueHeader header;
+  HitPayload  hits[];
+} HitQueue;
+
+layout(set = 0, binding = 12, std430) buffer MissQueueBuf {
+  QueueHeader header;
+  MissPayload misses[];
+} MissQueue;
+
+bool dequeueHit(out HitPayload hit) {
+  for (;;) {
+    uint idx = atomicAdd(HitQueue.header.head, 1u);
+    uint tail = HitQueue.header.tail;
+    if (idx < tail) {
+      uint slot = idx & (HitQueue.header.capacity - 1u);
+      hit = HitQueue.hits[slot];
+      return true;
+    }
+    atomicAdd(HitQueue.header.head, uint(0u - 1u));
+    if (idx >= tail) return false;
+  }
+}
+
+bool dequeueMiss(out MissPayload miss) {
+  for (;;) {
+    uint idx = atomicAdd(MissQueue.header.head, 1u);
+    uint tail = MissQueue.header.tail;
+    if (idx < tail) {
+      uint slot = idx & (MissQueue.header.capacity - 1u);
+      miss = MissQueue.misses[slot];
+      return true;
+    }
+    atomicAdd(MissQueue.header.head, uint(0u - 1u));
+    if (idx >= tail) return false;
+  }
+}
+
+ivec2 pixelFromIndex(uint idx) {
+  uint w = max(g.width, 1u);
+  uint x = idx % w;
+  uint y = idx / w;
+  return ivec2(int(x), int(y));
+}
+
+vec3 shadeHit(const HitPayload hit) {
+  vec3 n = normalize(hit.normal);
+  vec3 lightDir = normalize(vec3(0.3, 0.6, 0.7));
+  float ndotl = max(dot(n, lightDir), 0.0);
+  vec3 base = 0.5 * (n + vec3(1.0));
+  return base * (0.1 + 0.9 * ndotl);
+}
+
+vec3 shadeMiss(const MissPayload miss) {
+  vec3 dir = normalize(miss.direction);
+  float v = clamp(0.5 * (dir.y + 1.0), 0.0, 1.0);
   vec3 top = vec3(0.25, 0.45, 0.9);
   vec3 bottom = vec3(0.85, 0.9, 1.0);
-  vec3 color = mix(bottom, top, pow(v, 1.5));
+  return mix(bottom, top, pow(v, 1.5));
+}
+
+void storeColor(uint pixelIndex, vec3 color) {
+  ivec2 pix = pixelFromIndex(pixelIndex);
+  if (pix.x < 0 || pix.y < 0 || pix.x >= int(g.width) || pix.y >= int(g.height)) return;
   imageStore(accumImage, pix, vec4(color, 1.0));
+}
+
+void main() {
+  for (;;) {
+    HitPayload hit;
+    if (dequeueHit(hit)) {
+      vec3 color = shadeHit(hit);
+      storeColor(hit.pixelIndex, color);
+      continue;
+    }
+    MissPayload miss;
+    if (dequeueMiss(miss)) {
+      vec3 color = shadeMiss(miss);
+      storeColor(miss.pixelIndex, color);
+      continue;
+    }
+    break;
+  }
 }
