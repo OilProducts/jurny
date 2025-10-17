@@ -16,6 +16,7 @@ layout(set = 0, binding = 5, std430) readonly buffer HashKeysBuf    { uint64_t  
 layout(set = 0, binding = 6, std430) readonly buffer HashValsBuf    { uint      vals[];     } HV;
 layout(set = 0, binding = 7, std430) readonly buffer MacroKeysBuf   { uint64_t  mkeys[];    } MK;
 layout(set = 0, binding = 8, std430) readonly buffer MacroValsBuf   { uint      mvals[];    } MV;
+layout(set = 0, binding = 9, std430) buffer DebugOut { uint dbg[]; } DBG;
 
 // Simple hash find (linear probe), capacity from UBO
 bool findBrick(ivec3 bc, out uint brickIdx) {
@@ -149,6 +150,23 @@ void main() {
     return;
   }
 
+  // DEBUG OVERLAY 4: Macro tile presence at start (green=present, orange=absent)
+  if ((g.flags & 16u) != 0u) {
+    float tEnter, tExit; bool inShell = intersectSphereShell(ro, rd, g.Rin, g.Rout, tEnter, tExit);
+    float tmin = inShell ? tEnter : 0.0; float tmax = inShell ? tExit : 50000.0;
+    float s0, s1; if (intersectSphere(ro, rd, g.Rsea, s0, s1)) {
+      float s = 1e30; if (s0>=tmin && s0<=tmax) s=min(s,s0); if (s1>=tmin && s1<=tmax) s=min(s,s1);
+      if (s < 1e20) tmin = max(tEnter, s - 8.0*g.brickSize) + 1e-4*g.brickSize;
+    }
+    vec3 pos = ro + rd * tmin;
+    ivec3 bc = ivec3(floor(pos / g.brickSize));
+    ivec3 mc = ivec3(floor(vec3(bc) / float(g.macroDimBricks)));
+    bool present = (g.macroHashCapacity>0u) ? findMacro(mc) : true;
+    vec3 color = present ? vec3(0.2,1.0,0.2) : vec3(1.0,0.6,0.2);
+    imageStore(accumImage, pix, vec4(color,1.0));
+    return;
+  }
+
   // Clamp traversal to shell to reduce brick steps
   float tEnter, tExit;
   bool inShell = intersectSphereShell(ro, rd, g.Rin, g.Rout, tEnter, tExit);
@@ -183,31 +201,59 @@ void main() {
   vec3 color = vec3(0.0);
   bool shaded = false;
 
+  // Write debug sample for center pixel
+  if (pix.x == dims.x/2 && pix.y == dims.y/2) {
+    ivec3 mc0 = ivec3(floor(vec3(bc) / float(g.macroDimBricks)));
+    bool pres0 = (g.macroHashCapacity>0u) ? findMacro(mc0) : true;
+    // dbg layout: [0]=frame, [1]=flags, [2]=macroCap, [3]=macroDim,
+    // [4..6]=bc, [7]=present, [8..10]=mc, [11]=reserved
+    DBG.dbg[0] = g.frameIdx;
+    DBG.dbg[1] = g.flags;
+    DBG.dbg[2] = g.macroHashCapacity;
+    DBG.dbg[3] = g.macroDimBricks;
+    DBG.dbg[4] = uint(bc.x);
+    DBG.dbg[5] = uint(bc.y);
+    DBG.dbg[6] = uint(bc.z);
+    DBG.dbg[7] = pres0 ? 1u : 0u;
+    DBG.dbg[8] = uint(mc0.x);
+    DBG.dbg[9] = uint(mc0.y);
+    DBG.dbg[10] = uint(mc0.z);
+    DBG.dbg[11] = 0u;
+  }
+
   for (int stepCount=0; stepCount<4096 && tmin < tmax; ++stepCount) {
-    // Macro mask skipping (skip whole macro tiles if absent) — gated by flag bit 8
+    // Macro mask skipping (coarse 3D DDA across macro tiles), gated by bit 8
     if (((g.flags & 8u) != 0u) && (g.macroHashCapacity > 0u)) {
       float macroSize = g.macroSize;
       // Compute macro coords from current brick coords to avoid float boundary noise
       ivec3 mc = ivec3(floor(vec3(bc) / float(g.macroDimBricks)));
-      if (!findMacro(mc)) {
+      // Advance macro tiles deterministically until we find a present tile or exit band
+      for (int mstep=0; mstep<1024; ++mstep) {
+        if (findMacro(mc)) break;
         vec3 mMin = vec3(mc) * macroSize;
         vec3 mMax = mMin + vec3(macroSize);
-        vec3 tMaxM;
-        tMaxM.x = (rd.x > 0.0) ? ((mMax.x - pos.x) / rd.x) : ((pos.x - mMin.x) / -rd.x);
-        tMaxM.y = (rd.y > 0.0) ? ((mMax.y - pos.y) / rd.y) : ((pos.y - mMin.y) / -rd.y);
-        tMaxM.z = (rd.z > 0.0) ? ((mMax.z - pos.z) / rd.z) : ((pos.z - mMin.z) / -rd.z);
-        float tNext = min(tMaxM.x, min(tMaxM.y, tMaxM.z));
-        tmin = min(tmax, tmin + max(tNext, 0.0) + 1e-5 * g.brickSize);
+        // Compute t to next macro boundary along each axis from current pos
+        float tx = (rd.x > 0.0) ? ((mMax.x - pos.x) / rd.x) : ((pos.x - mMin.x) / -rd.x);
+        float ty = (rd.y > 0.0) ? ((mMax.y - pos.y) / rd.y) : ((pos.y - mMin.y) / -rd.y);
+        float tz = (rd.z > 0.0) ? ((mMax.z - pos.z) / rd.z) : ((pos.z - mMin.z) / -rd.z);
+        float tNext = min(tx, min(ty, tz));
+        if (!(tNext >= 0.0)) break;
+        tmin = min(tmax, tmin + tNext + 1e-5 * macroSize);
         pos = ro + rd * tmin;
-        bc = ivec3(floor(pos / g.brickSize));
-        cellMin = vec3(bc) * g.brickSize; cellMax = cellMin + vec3(g.brickSize);
-        tDelta = vec3(g.brickSize) / abs(rd);
-        tMax.x = (rd.x > 0.0) ? ((cellMax.x - pos.x) / rd.x) : ((pos.x - cellMin.x) / -rd.x);
-        tMax.y = (rd.y > 0.0) ? ((cellMax.y - pos.y) / rd.y) : ((pos.y - cellMin.y) / -rd.y);
-        tMax.z = (rd.z > 0.0) ? ((cellMax.z - pos.z) / rd.z) : ((pos.z - cellMin.z) / -rd.z);
-        tMax += vec3(tmin);
-        continue;
+        // Step mc along axis of min tNext
+        if (tx <= ty && tx <= tz) mc.x += (rd.x > 0.0) ? 1 : -1;
+        else if (ty <= tz)        mc.y += (rd.y > 0.0) ? 1 : -1;
+        else                      mc.z += (rd.z > 0.0) ? 1 : -1;
+        if (tmin >= tmax) break;
       }
+      // Recompute brick DDA state from new pos
+      bc = ivec3(floor(pos / g.brickSize));
+      cellMin = vec3(bc) * g.brickSize; cellMax = cellMin + vec3(g.brickSize);
+      tDelta = vec3(g.brickSize) / abs(rd);
+      tMax.x = (rd.x > 0.0) ? ((cellMax.x - pos.x) / rd.x) : ((pos.x - cellMin.x) / -rd.x);
+      tMax.y = (rd.y > 0.0) ? ((cellMax.y - pos.y) / rd.y) : ((pos.y - cellMin.y) / -rd.y);
+      tMax.z = (rd.z > 0.0) ? ((cellMax.z - pos.z) / rd.z) : ((pos.z - cellMin.z) / -rd.z);
+      tMax += vec3(tmin);
     }
 
     uint bidx = 0u;

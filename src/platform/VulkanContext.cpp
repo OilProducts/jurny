@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <string_view>
 #include <cstdio>
+#include <spdlog/spdlog.h>
 
 #include <volk.h>
 
@@ -27,9 +28,13 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     const VkDebugUtilsMessengerCallbackDataEXT* callbackData,
     void* userData) {
     (void)type; (void)userData;
-    if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
-        fprintf(stderr, "[vulkan] %s\n", callbackData->pMessage);
-    }
+    spdlog::level::level_enum lvl = spdlog::level::info;
+    if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) lvl = spdlog::level::err;
+    else if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) lvl = spdlog::level::warn;
+    else if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT) lvl = spdlog::level::info;
+    else lvl = spdlog::level::debug; // VERBOSE
+
+    spdlog::log(lvl, "[vulkan] {}", callbackData && callbackData->pMessage ? callbackData->pMessage : "(null)");
     return VK_FALSE;
 }
 

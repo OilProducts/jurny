@@ -31,3 +31,10 @@ Useful CMake options (ON/OFF)
 - `VOXEL_ENABLE_LTO` (default ON in Release)
 - `VOXEL_SHADER_DEBUG` (default ON in Debug)
 - Feature flags bridged to shaders: `VOXEL_BRICK_SIZE` (default 8), `VOXEL_USE_TSDF`, `VOXEL_MATERIAL_4BIT` (default ON), `VOXEL_ENABLE_DENOISER` (default ON)
+
+Logging
+- Uses `spdlog` with a color console sink by default.
+- Configure at runtime:
+  - Env: `VOXEL_LOG_LEVEL=trace|debug|info|warn|error|critical|off`, `VOXEL_LOG_FILE=/path/to/voxel.log`.
+  - CLI: `--log-level <level>`, `--log-file <path>`, `--no-color`.
+- Vulkan/GLFW validation/errors are routed through the logger.

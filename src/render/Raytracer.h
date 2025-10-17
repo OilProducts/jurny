@@ -28,6 +28,7 @@ public:
     void resize(platform::VulkanContext& vk, platform::Swapchain& swap);
     void updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData& data);
     void record(platform::VulkanContext& vk, platform::Swapchain& swap, VkCommandBuffer cb, uint32_t swapIndex);
+    void readDebug(platform::VulkanContext& vk, uint32_t frameIdx);
     void shutdown(platform::VulkanContext& vk);
 
 private:
@@ -62,6 +63,11 @@ private:
     VkBuffer mvBuf_{}; VkDeviceMemory mvMem_{};
     uint32_t hashCapacity_{}; uint32_t brickCount_{};
     uint32_t macroCapacity_{}; uint32_t macroDimBricks_{};
+
+    // Debug buffer (GPU→CPU) for per-frame diagnostics
+    VkBuffer dbgBuf_{}; VkDeviceMemory dbgMem_{}; // 16*4 bytes sufficient
+    uint32_t lastDbgFrame_{}; int lastMcX_{}; int lastMcY_{}; int lastMcZ_{}; int lastPresent_{};
+    uint32_t currFrameIdx_{};
 };
 
 }

@@ -4,12 +4,13 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 #include <cstdio>
+#include <spdlog/spdlog.h>
 #include <vector>
 
 namespace platform {
 
 static void glfwErrorCallback(int code, const char* desc) {
-    fprintf(stderr, "[glfw] error %d: %s\n", code, desc);
+    spdlog::error("[glfw] error {}: {}", code, desc ? desc : "(null)");
 }
 
 bool Window::create(int w, int h, const char* title) {

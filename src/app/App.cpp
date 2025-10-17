@@ -27,6 +27,7 @@ int App::run() {
     platform::VulkanContext vk;
     bool enableValidation = true;
 #if VOXEL_ENABLE_WINDOW
+    // Logging is initialized in main(); no per-frame flush here.
     platform::Window window;
     if (!window.create()) return 1;
     std::vector<const char*> instanceExts;
@@ -142,16 +143,21 @@ int App::run() {
     auto last = t0;
     uint32_t frameCounter = 0;
     bool useShell = false; // toggle with 'V'
+    bool mPrevDown = false; // edge-trigger for 'M'
     uint32_t debugFlags = 0; // traverse debug flags (bit0: probe brick at Rsea)
     while (!window.shouldClose()) {
         window.poll(); uint32_t idx=0; if (vkAcquireNextImageKHR(vk.device(), swap.handle(), UINT64_MAX, acquireSem, VK_NULL_HANDLE, &idx) != VK_SUCCESS) break;
 #if VOXEL_ENABLE_WINDOW
         if (glfwGetKey(window.handle(), GLFW_KEY_V) == GLFW_PRESS) useShell = true;
         if (glfwGetKey(window.handle(), GLFW_KEY_B) == GLFW_PRESS) useShell = false;
-        if (glfwGetKey(window.handle(), GLFW_KEY_1) == GLFW_PRESS) { debugFlags = 1u; }  // probe overlay (red)
-        if (glfwGetKey(window.handle(), GLFW_KEY_2) == GLFW_PRESS) { debugFlags = 2u; }  // coarse DDA overlay (yellow)
-        if (glfwGetKey(window.handle(), GLFW_KEY_3) == GLFW_PRESS) { debugFlags = 4u; }  // shade at first brick hit
-        if (glfwGetKey(window.handle(), GLFW_KEY_M) == GLFW_PRESS) { debugFlags ^= 8u; } // toggle macro-skip on/off
+        if (glfwGetKey(window.handle(), GLFW_KEY_1) == GLFW_PRESS) { debugFlags = 1u; }   // probe overlay (red)
+        if (glfwGetKey(window.handle(), GLFW_KEY_2) == GLFW_PRESS) { debugFlags = 2u; }   // coarse DDA overlay (yellow)
+        if (glfwGetKey(window.handle(), GLFW_KEY_3) == GLFW_PRESS) { debugFlags = 4u; }   // shade at first brick hit
+        if (glfwGetKey(window.handle(), GLFW_KEY_4) == GLFW_PRESS) { debugFlags = 16u; }  // macro presence overlay
+        int mState = glfwGetKey(window.handle(), GLFW_KEY_M);
+        bool mDown = (mState == GLFW_PRESS);
+        if (mDown && !mPrevDown) { debugFlags ^= 8u; spdlog::info("macro-skip {}", (debugFlags & 8u) ? "ON" : "OFF"); }
+        mPrevDown = mDown;
         if (glfwGetKey(window.handle(), GLFW_KEY_0) == GLFW_PRESS) debugFlags = 0u;   // disable debug overlays
 #endif
         // Update UBO (orbit camera for eyeballing)
@@ -238,6 +244,8 @@ int App::run() {
         vkEndCommandBuffer(cb);
         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT; VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.waitSemaphoreCount=1; si.pWaitSemaphores=&acquireSem; si.pWaitDstStageMask=&waitStage; si.commandBufferCount=1; si.pCommandBuffers=&cb; si.signalSemaphoreCount=1; si.pSignalSemaphores=&finishSem; vkQueueSubmit(vk.graphicsQueue(), 1, &si, VK_NULL_HANDLE);
         VkPresentInfoKHR pi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR }; VkSwapchainKHR sc=swap.handle(); pi.waitSemaphoreCount=1; pi.pWaitSemaphores=&finishSem; pi.swapchainCount=1; pi.pSwapchains=&sc; pi.pImageIndices=&idx; vkQueuePresentKHR(vk.graphicsQueue(), &pi); vkQueueWaitIdle(vk.graphicsQueue());
+        // After GPU work finishes, read debug buffer (every ~30 frames)
+        ray.readDebug(vk, data.frameIdx);
     }
 
     vkDestroySemaphore(vk.device(), finishSem, nullptr); vkDestroySemaphore(vk.device(), acquireSem, nullptr);
