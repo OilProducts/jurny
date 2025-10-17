@@ -18,6 +18,10 @@ function(voxel_compile_shaders)
   file(GLOB_RECURSE GLSL_SOURCES CONFIGURE_DEPENDS
     "${VOXEL_SHADERS_SOURCE_DIR}/*.comp"
   )
+  # Also track includes so modifying shared headers triggers rebuilds.
+  file(GLOB_RECURSE GLSL_INCLUDES CONFIGURE_DEPENDS
+    "${VOXEL_SHADERS_SOURCE_DIR}/*.glsl"
+  )
 
   find_program(GLSLC_EXECUTABLE NAMES glslc HINTS ENV VULKAN_SDK PATH_SUFFIXES Bin bin)
 
@@ -26,10 +30,12 @@ function(voxel_compile_shaders)
     foreach(src ${GLSL_SOURCES})
       file(RELATIVE_PATH rel "${VOXEL_SHADERS_SOURCE_DIR}" "${src}")
       set(out "${CMAKE_BINARY_DIR}/shaders/${rel}.spv")
+      # Per-shader depfile (so includes trigger rebuilds robustly under Ninja)
+      set(dep "${out}.d")
       get_filename_component(out_dir "${out}" DIRECTORY)
       file(MAKE_DIRECTORY "${out_dir}")
 
-      set(args -c -o "${out}" "${src}" --target-env=vulkan1.3 -O)
+      set(args -c -o "${out}" "${src}" --target-env=vulkan1.3 -O -MD -MF "${dep}")
       if (VOXEL_SHADERS_DEBUG_INFO)
         list(APPEND args -g)
       endif()
@@ -50,6 +56,7 @@ function(voxel_compile_shaders)
         OUTPUT "${out}"
         COMMAND ${GLSLC_EXECUTABLE} ${args}
         DEPENDS "${src}"
+        DEPFILE "${dep}"
         COMMENT "[glslc] ${rel}"
         VERBATIM
       )

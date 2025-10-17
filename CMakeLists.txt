@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
-project(voxel_planet LANGUAGES CXX)
+if(POLICY CMP0135)
+  cmake_policy(SET CMP0135 NEW) # Updated default for external downloads/extract timestamps
+endif()
+project(voxel_planet VERSION 0.1.0 LANGUAGES CXX)
 
 # Default build type
 if(NOT CMAKE_BUILD_TYPE)
@@ -42,25 +45,16 @@ include(Warnings)
 include(Sanitizers)
 include(Shaders)
 
-# Dependencies (extern/) — create interface targets as wrappers
+## Dependency wrapper interface targets (linked/populated in FetchDeps.cmake)
 add_library(ext_glm INTERFACE)
-target_include_directories(ext_glm INTERFACE ${CMAKE_SOURCE_DIR}/extern/glm)
 add_library(ext_spdlog INTERFACE)
-target_include_directories(ext_spdlog INTERFACE ${CMAKE_SOURCE_DIR}/extern/spdlog/include ${CMAKE_SOURCE_DIR}/extern/spdlog)
 add_library(ext_tracy INTERFACE)
-target_include_directories(ext_tracy INTERFACE ${CMAKE_SOURCE_DIR}/extern/tracy)
 add_library(ext_stb INTERFACE)
-target_include_directories(ext_stb INTERFACE ${CMAKE_SOURCE_DIR}/extern/stb)
 add_library(ext_xxhash INTERFACE)
-target_include_directories(ext_xxhash INTERFACE ${CMAKE_SOURCE_DIR}/extern/xxhash)
 add_library(ext_volk INTERFACE)
-target_include_directories(ext_volk INTERFACE ${CMAKE_SOURCE_DIR}/extern/volk)
 add_library(ext_vma INTERFACE)
-target_include_directories(ext_vma INTERFACE ${CMAKE_SOURCE_DIR}/extern/VMA/include ${CMAKE_SOURCE_DIR}/extern/VMA)
 add_library(ext_glfw INTERFACE)
-target_include_directories(ext_glfw INTERFACE ${CMAKE_SOURCE_DIR}/extern/glfw/include)
 
-# Always include dependency helper; it will auto-fetch when extern/* is missing.
 include(FetchContent)
 include(FetchDeps)
 

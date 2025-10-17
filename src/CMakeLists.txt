@@ -44,12 +44,13 @@ voxel_enable_sanitizers(voxel_world)
 file(GLOB_RECURSE RENDER_SRC CONFIGURE_DEPENDS render/*.cpp)
 add_library(voxel_render STATIC ${RENDER_SRC})
 target_include_directories(voxel_render PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(voxel_render PUBLIC voxel_core voxel_math voxel_world)
+target_link_libraries(voxel_render PUBLIC voxel_core voxel_math voxel_world ext_volk)
 target_compile_definitions(voxel_render PUBLIC
   VOXEL_BRICK_SIZE=${VOXEL_BRICK_SIZE}
   $<$<BOOL:${VOXEL_USE_TSDF}>:VOXEL_USE_TSDF=1>
   $<$<BOOL:${VOXEL_MATERIAL_4BIT}>:VOXEL_MATERIAL_4BIT=1>
   $<$<BOOL:${VOXEL_ENABLE_DENOISER}>:VOXEL_ENABLE_DENOISER=1>
+  VOXEL_ASSETS_DIR=\"$<SHELL_PATH:${CMAKE_BINARY_DIR}/assets>\"
 )
 voxel_set_warnings(voxel_render)
 voxel_enable_sanitizers(voxel_render)
@@ -76,12 +77,34 @@ target_link_libraries(voxel_app PRIVATE voxel_platform voxel_render voxel_tools 
 voxel_set_warnings(voxel_app)
 voxel_enable_sanitizers(voxel_app)
 add_dependencies(voxel_app shaders_spv)
-target_compile_definitions(voxel_app PRIVATE VOXEL_ENABLE_WINDOW=1)
+target_compile_definitions(voxel_app PRIVATE VOXEL_ENABLE_WINDOW=1 VOXEL_ASSETS_DIR=\"$<SHELL_PATH:${CMAKE_BINARY_DIR}/assets>\")
 
-# Copy shaders to runtime assets after build (if any exist)
+# Ensure shader edits propagate to runtime assets even if the exe doesn't relink
+# For each compiled SPIR-V, create a copy_if_different into ${CMAKE_BINARY_DIR}/assets/shaders
+# and make voxel_app depend on that target. This runs when shaders change, independent of
+# whether the executable itself needs rebuilding.
+set(ASSETS_SHADERS_DIR "${CMAKE_BINARY_DIR}/assets/shaders")
+set(SPV_COPY_OUTPUTS)
+foreach(spv ${VOXEL_SPV_FILES})
+  file(RELATIVE_PATH rel "${CMAKE_BINARY_DIR}/shaders" "${spv}")
+  set(dst "${ASSETS_SHADERS_DIR}/${rel}")
+  get_filename_component(dst_dir "${dst}" DIRECTORY)
+  add_custom_command(
+    OUTPUT "${dst}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${dst_dir}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${spv}" "${dst}"
+    DEPENDS "${spv}"
+    COMMENT "[assets] ${rel}"
+    VERBATIM)
+  list(APPEND SPV_COPY_OUTPUTS "${dst}")
+endforeach()
+if(SPV_COPY_OUTPUTS)
+  add_custom_target(shaders_assets DEPENDS ${SPV_COPY_OUTPUTS})
+  add_dependencies(voxel_app shaders_assets)
+endif()
+
+# Copy static data folder next to the executable (less frequent changes)
 add_custom_command(TARGET voxel_app POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:voxel_app>/assets/shaders
-  COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_BINARY_DIR}/shaders $<TARGET_FILE_DIR:voxel_app>/assets/shaders
   COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:voxel_app>/assets/data
   COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/data $<TARGET_FILE_DIR:voxel_app>/assets/data
   VERBATIM)

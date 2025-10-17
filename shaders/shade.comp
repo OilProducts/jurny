@@ -1,5 +1,23 @@
 #version 460
-// shade.comp — K2 material evaluation and secondary ray spawn (placeholder)
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-void main() {}
-// PBR lighting, environment, and temporal accumulation outputs.
+
+#include "common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform GlobalsUBO { GlobalsUBO_t g; };
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D accumImage;
+
+void main() {
+  ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+  // These dims will be set via UBO; however imageSize is convenient.
+  ivec2 dims = imageSize(accumImage);
+  if (pix.x >= dims.x || pix.y >= dims.y) return;
+
+  // Simple sky gradient based on view direction (no reprojection yet)
+  vec2 uv = (vec2(pix) + vec2(0.5)) / vec2(dims);
+  float v = 1.0 - uv.y;
+  vec3 top = vec3(0.25, 0.45, 0.9);
+  vec3 bottom = vec3(0.85, 0.9, 1.0);
+  vec3 color = mix(bottom, top, pow(v, 1.5));
+  imageStore(accumImage, pix, vec4(color, 1.0));
+}

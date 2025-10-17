@@ -1,0 +1,54 @@
+#version 460
+
+#include "common.glsl"
+#include "spherical.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform GlobalsUBO { GlobalsUBO_t g; };
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D outImage;
+
+// Reconstruct a world-space ray from pixel and matrices.
+// Assumes Vulkan NDC (z in [0,1]). Use invProj+invView.
+void makeRay(in ivec2 pix, out vec3 ro, out vec3 rd) {
+  ivec2 dims = imageSize(outImage);
+  vec2 uv = (vec2(pix) + vec2(0.5)) / vec2(dims);
+  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+
+  mat4 invV = inverse(g.currView);
+  mat4 invP = inverse(g.currProj);
+  // Camera position in world space
+  ro = vec3(invV * vec4(0.0, 0.0, 0.0, 1.0));
+  // View-space position along this pixel's ray
+  vec4 pView = invP * vec4(ndc, 1.0, 1.0);
+  pView /= max(pView.w, 1e-6);
+  vec3 dirWorld = vec3(invV * vec4(normalize(vec3(pView)), 0.0));
+  rd = normalize(dirWorld);
+}
+
+void main() {
+  ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 dims = imageSize(outImage);
+  if (pix.x >= dims.x || pix.y >= dims.y) return;
+
+  vec3 ro, rd; makeRay(pix, ro, rd);
+
+  vec3 color;
+  // Find nearest positive intersection with either inner or outer sphere.
+  float o0,o1,i0,i1; bool hitOut = intersectSphere(ro, rd, g.Rout, o0, o1); bool hitIn = intersectSphere(ro, rd, g.Rin, i0, i1);
+  const float EPS = 1e-5;
+  float tOut = 1e30; if (hitOut) { tOut = (o0 > EPS) ? o0 : ((o1 > EPS) ? o1 : 1e30); }
+  float tIn  = 1e30; if (hitIn)  { tIn  = (i0 > EPS) ? i0 : ((i1 > EPS) ? i1 : 1e30); }
+  float t = min(tOut, tIn);
+  if (t < 1e20) {
+    vec3 p = ro + t * rd;
+    vec3 n = gradF(p);
+    color = 0.5 * (n + vec3(1.0));
+  } else {
+    // sky
+    float u = float(pix.x) / float(max(dims.x - 1, 1));
+    float v = float(pix.y) / float(max(dims.y - 1, 1));
+    color = vec3(0.4, 0.6, 0.9) * (0.6 + 0.4 * (1.0 - v));
+  }
+  imageStore(outImage, pix, vec4(color, 1.0));
+}

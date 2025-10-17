@@ -168,6 +168,9 @@ bool VulkanContext::createDevice(bool enableValidation, VkSurfaceKHR surface) {
     descIdx.runtimeDescriptorArray = VK_TRUE;
     descIdx.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE; // illustrative
 
+    // Request 64-bit integers in shaders for SSBO keys/occupancy (used in traversal shader)
+    feats2.features.shaderInt64 = VK_TRUE;
+
     deviceInfo_.hasTimelineSemaphore = v12.timelineSemaphore;
     deviceInfo_.hasDescriptorIndexing = descIdx.runtimeDescriptorArray;
 
