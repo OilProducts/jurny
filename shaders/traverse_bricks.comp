@@ -298,66 +298,6 @@ void enqueueHit(const RayPayload ray, float tHit, vec3 normal, uint material) {
 // Macro skipping
 // -------------------------------------------------------------------------------------------------
 
-bool advanceEmptyMacroTiles(vec3 origin,
-                            vec3 dir,
-                            float tMacroMin,
-                            float tMacroMax,
-                            inout float tCursor,
-                            inout ivec3 brickCoords) {
-  if ((g.flags & FLAG_ENABLE_MACRO) == 0u || g.macroHashCapacity == 0u) {
-    return false;
-  }
-
-  float macroSize = g.macroSize;
-  float tSearch = clamp(tCursor, tMacroMin, tMacroMax);
-  vec3 pos = origin + dir * (tSearch + MACRO_STEP_EPS * macroSize);
-  ivec3 bc = ivec3(floor(pos / g.brickSize));
-  ivec3 mc = ivec3(
-    floorDiv(bc.x, int(g.macroDimBricks)),
-    floorDiv(bc.y, int(g.macroDimBricks)),
-    floorDiv(bc.z, int(g.macroDimBricks))
-  );
-
-  for (int step = 0; step < MACRO_MAX_STEPS; ++step) {
-    if (macroTileOccupied(mc)) {
-      tCursor = tSearch;
-      brickCoords = bc;
-      return false;
-    }
-
-    vec3 macroMin = vec3(mc) * macroSize;
-    vec3 macroMax = macroMin + vec3(macroSize);
-    float tx = safeNextBoundary(pos.x, macroMin.x, macroMax.x, dir.x);
-    float ty = safeNextBoundary(pos.y, macroMin.y, macroMax.y, dir.y);
-    float tz = safeNextBoundary(pos.z, macroMin.z, macroMax.z, dir.z);
-    float tNext = min(tx, min(ty, tz));
-    if (!(tNext >= 0.0)) break;
-
-    tSearch = min(tMacroMax, tSearch + tNext + MACRO_STEP_EPS * macroSize);
-    if (tSearch >= tMacroMax) {
-      tCursor = tSearch;
-      brickCoords = ivec3(floor((origin + dir * (tSearch + BRICK_NUDGE * g.brickSize)) / g.brickSize));
-      return true; // marched to end of macro window
-    }
-
-    pos = origin + dir * (tSearch + MACRO_STEP_EPS * macroSize);
-    bc = ivec3(floor(pos / g.brickSize));
-    mc = ivec3(
-      floorDiv(bc.x, int(g.macroDimBricks)),
-      floorDiv(bc.y, int(g.macroDimBricks)),
-      floorDiv(bc.z, int(g.macroDimBricks))
-    );
-  }
-
-  tCursor = tSearch;
-  brickCoords = bc;
-  return false;
-}
-
-// -------------------------------------------------------------------------------------------------
-// Micro traversal inside an occupied brick.
-// -------------------------------------------------------------------------------------------------
-
 bool traverseBrickMicro(const RayPayload ray,
                         float tEnter,
                         float tExit,
@@ -495,9 +435,16 @@ void processRay(const RayPayload rayIn) {
   vec3 posStart = ray.origin + dir * (tCursor + BRICK_NUDGE * g.brickSize);
   ivec3 brickCoords = ivec3(floor(posStart / g.brickSize));
 
-  // Optionally skip empty macro tiles before we enter the brick loop.
-  if ((g.flags & FLAG_ENABLE_MACRO) != 0u && g.macroHashCapacity > 0u) {
-    advanceEmptyMacroTiles(ray.origin, dir, tMacroMin, tMacroMax, tCursor, brickCoords);
+  float macroSize = g.macroSize;
+  int macroDim = int(g.macroDimBricks);
+  bool useMacroSkip = ((g.flags & FLAG_ENABLE_MACRO) != 0u) && (g.macroHashCapacity > 0u) && (macroDim > 0) && (macroSize > 0.0);
+  ivec3 macroCoords = ivec3(0);
+  if (useMacroSkip) {
+    macroCoords = ivec3(
+      floorDiv(brickCoords.x, macroDim),
+      floorDiv(brickCoords.y, macroDim),
+      floorDiv(brickCoords.z, macroDim)
+    );
   }
 
   vec3 invDir = vec3(
@@ -519,18 +466,51 @@ void processRay(const RayPayload rayIn) {
     float tBrickExit = min(tx, min(ty, tz));
 
     // Macro skip inside the loop to avoid spending time in empty coarse tiles.
-    if ((g.flags & FLAG_ENABLE_MACRO) != 0u && g.macroHashCapacity > 0u) {
-      ivec3 macroCoord = ivec3(
-        floorDiv(brickCoords.x, int(g.macroDimBricks)),
-        floorDiv(brickCoords.y, int(g.macroDimBricks)),
-        floorDiv(brickCoords.z, int(g.macroDimBricks))
-      );
-      if (!macroTileOccupied(macroCoord)) {
-        bool exhaustedBand = advanceEmptyMacroTiles(ray.origin, dir, tMacroMin, tMacroMax, tCursor, brickCoords);
-        if (exhaustedBand || tCursor >= tMax) {
+    if (useMacroSkip) {
+      bool skipped = false;
+      int macroLoop = 0;
+      while (!macroTileOccupied(macroCoords)) {
+        if (macroLoop++ >= MACRO_MAX_STEPS) {
+          useMacroSkip = false;
+          break;
+        }
+        vec3 macroMin = vec3(macroCoords) * macroSize;
+        vec3 macroMax = macroMin + vec3(macroSize);
+        vec3 macroSample = ray.origin + dir * (tCursor + MACRO_STEP_EPS * macroSize);
+        float txMacro = (abs(dir.x) < 1e-20) ? INF_T : safeNextBoundary(macroSample.x, macroMin.x, macroMax.x, dir.x);
+        float tyMacro = (abs(dir.y) < 1e-20) ? INF_T : safeNextBoundary(macroSample.y, macroMin.y, macroMax.y, dir.y);
+        float tzMacro = (abs(dir.z) < 1e-20) ? INF_T : safeNextBoundary(macroSample.z, macroMin.z, macroMax.z, dir.z);
+        float tAdvance = min(txMacro, min(tyMacro, tzMacro));
+        if (!(tAdvance >= 0.0)) {
+          useMacroSkip = false;
+          break;
+        }
+        float nextCursor = tCursor + tAdvance + MACRO_STEP_EPS * macroSize;
+        if (nextCursor >= tMacroMax) {
           enqueueMiss(ray, MISS_REASON_BAND);
           return;
         }
+        tCursor = min(nextCursor, tMax);
+        if (tCursor >= tMax) {
+          enqueueMiss(ray, MISS_REASON_ENV);
+          return;
+        }
+        vec3 samplePos = ray.origin + dir * (tCursor + BRICK_NUDGE * g.brickSize);
+        brickCoords = ivec3(floor(samplePos / g.brickSize));
+        macroCoords = ivec3(
+          floorDiv(brickCoords.x, macroDim),
+          floorDiv(brickCoords.y, macroDim),
+          floorDiv(brickCoords.z, macroDim)
+        );
+        macroMin = vec3(macroCoords) * macroSize;
+        macroMax = macroMin + vec3(macroSize);
+        skipped = true;
+        if (tCursor >= tMacroMax) {
+          enqueueMiss(ray, MISS_REASON_BAND);
+          return;
+        }
+      }
+      if (useMacroSkip && skipped) {
         continue;
       }
     }
