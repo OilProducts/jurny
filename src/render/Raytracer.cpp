@@ -41,6 +41,9 @@ static bool allocateBuffer(VkDevice device,
     return true;
 }
 
+static constexpr uint32_t kTimestampCount = 8;
+static constexpr uint32_t kTimestampPairs = 4;
+
 bool Raytracer::createImages(platform::VulkanContext& vk, platform::Swapchain& swap) {
     extent_ = swap.extent();
     accumFormat_ = swap.format();
@@ -90,9 +93,10 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     VkDescriptorSetLayoutBinding bHitQ{ }; bHitQ.binding=11; bHitQ.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bHitQ.descriptorCount=1; bHitQ.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bMissQ{}; bMissQ.binding=12; bMissQ.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bMissQ.descriptorCount=1; bMissQ.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bSecQ{ }; bSecQ.binding=13; bSecQ.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bSecQ.descriptorCount=1; bSecQ.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutBinding bindings[14] = { bUbo, bAcc, bOut, bBH, bOcc, bHK, bHV, bMK, bMV, bDBG, bRayQ, bHitQ, bMissQ, bSecQ };
+    VkDescriptorSetLayoutBinding bStats{ }; bStats.binding=14; bStats.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bStats.descriptorCount=1; bStats.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding bindings[15] = { bUbo, bAcc, bOut, bBH, bOcc, bHK, bHV, bMK, bMV, bDBG, bRayQ, bHitQ, bMissQ, bSecQ, bStats };
     VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    dslci.bindingCount=14; dslci.pBindings=bindings;
+    dslci.bindingCount=15; dslci.pBindings=bindings;
     if (vkCreateDescriptorSetLayout(vk.device(), &dslci, nullptr, &setLayout_) != VK_SUCCESS) return false;
     VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     plci.setLayoutCount=1; plci.pSetLayouts=&setLayout_;
@@ -183,6 +187,8 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
     vkBindBufferMemory(vk.device(), dbgBuf_, dbgMem_, 0);
 
     if (!createQueues(vk)) return false;
+    if (!createStatsBuffer(vk)) return false;
+    if (!createProfilingResources(vk)) return false;
 
     // Write descriptors per swapchain image
     for (uint32_t i=0;i<swap.imageCount();++i) {
@@ -197,7 +203,8 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
         VkDescriptorBufferInfo dbHit{ hitQueueBuf_, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo dbMiss{ missQueueBuf_, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo dbSec{ secondaryQueueBuf_, 0, VK_WHOLE_SIZE };
-        VkWriteDescriptorSet writes[14]{};
+        VkDescriptorBufferInfo dbStats{ statsBuf_, 0, sizeof(TraversalStatsHost) };
+        VkWriteDescriptorSet writes[15]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[0].dstSet = sets_[i]; writes[0].dstBinding=0; writes[0].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; writes[0].descriptorCount=1; writes[0].pBufferInfo=&db;
         writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[1].dstSet = sets_[i]; writes[1].dstBinding=1; writes[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[1].descriptorCount=1; writes[1].pImageInfo=&diAcc;
         writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[2].dstSet = sets_[i]; writes[2].dstBinding=2; writes[2].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[2].descriptorCount=1; writes[2].pImageInfo=&diOut;
@@ -215,12 +222,15 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
         writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[11].dstSet=sets_[i]; writes[11].dstBinding=11; writes[11].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[11].descriptorCount=1; writes[11].pBufferInfo=&dbHit;
         writes[12].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[12].dstSet=sets_[i]; writes[12].dstBinding=12; writes[12].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[12].descriptorCount=1; writes[12].pBufferInfo=&dbMiss;
         writes[13].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[13].dstSet=sets_[i]; writes[13].dstBinding=13; writes[13].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[13].descriptorCount=1; writes[13].pBufferInfo=&dbSec;
-        vkUpdateDescriptorSets(vk.device(), 14, writes, 0, nullptr);
+        writes[14].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[14].dstSet=sets_[i]; writes[14].dstBinding=14; writes[14].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[14].descriptorCount=1; writes[14].pBufferInfo=&dbStats;
+        vkUpdateDescriptorSets(vk.device(), 15, writes, 0, nullptr);
     }
     return true;
 }
 
 void Raytracer::destroyDescriptors(platform::VulkanContext& vk) {
+    destroyProfilingResources(vk);
+    destroyStatsBuffer(vk);
     destroyQueues(vk);
     if (ubo_) { vkDestroyBuffer(vk.device(), ubo_, nullptr); ubo_ = VK_NULL_HANDLE; }
     if (uboMem_) { vkFreeMemory(vk.device(), uboMem_, nullptr); uboMem_ = VK_NULL_HANDLE; }
@@ -388,6 +398,57 @@ void Raytracer::writeQueueHeaders(VkCommandBuffer cb) {
     vkCmdUpdateBuffer(cb, secondaryQueueBuf_, 0, sizeof(Header), &hdr);
 }
 
+bool Raytracer::createProfilingResources(platform::VulkanContext& vk) {
+    destroyProfilingResources(vk);
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(vk.physicalDevice(), &props);
+    timestampPeriodNs_ = props.limits.timestampPeriod;
+    VkQueryPoolCreateInfo qpci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+    qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qpci.queryCount = kTimestampCount;
+    if (vkCreateQueryPool(vk.device(), &qpci, nullptr, &timestampPool_) != VK_SUCCESS) {
+        timestampPool_ = VK_NULL_HANDLE;
+        return false;
+    }
+    std::fill(std::begin(gpuTimingsMs_), std::end(gpuTimingsMs_), 0.0);
+    lastTimingFrame_ = 0;
+    return true;
+}
+
+void Raytracer::destroyProfilingResources(platform::VulkanContext& vk) {
+    if (timestampPool_) {
+        vkDestroyQueryPool(vk.device(), timestampPool_, nullptr);
+        timestampPool_ = VK_NULL_HANDLE;
+    }
+}
+
+bool Raytracer::createStatsBuffer(platform::VulkanContext& vk) {
+    destroyStatsBuffer(vk);
+    VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bi.size = sizeof(TraversalStatsHost);
+    bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(vk.device(), &bi, nullptr, &statsBuf_) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(vk.device(), statsBuf_, &mr);
+    uint32_t typeIndex = findMemoryType(vk.physicalDevice(), mr.memoryTypeBits,
+                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (typeIndex == UINT32_MAX) return false;
+    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = typeIndex;
+    if (vkAllocateMemory(vk.device(), &mai, nullptr, &statsMem_) != VK_SUCCESS) return false;
+    vkBindBufferMemory(vk.device(), statsBuf_, statsMem_, 0);
+    std::memset(&statsHost_, 0, sizeof(statsHost_));
+    spdlog::info("Created traversal stats buffer size={} handle={} mem={}", sizeof(TraversalStatsHost), (void*)statsBuf_, (void*)statsMem_);
+    return true;
+}
+
+void Raytracer::destroyStatsBuffer(platform::VulkanContext& vk) {
+    if (statsBuf_) { vkDestroyBuffer(vk.device(), statsBuf_, nullptr); statsBuf_ = VK_NULL_HANDLE; }
+    if (statsMem_) { vkFreeMemory(vk.device(), statsMem_, nullptr); statsMem_ = VK_NULL_HANDLE; }
+    std::memset(&statsHost_, 0, sizeof(statsHost_));
+}
+
 bool Raytracer::init(platform::VulkanContext& vk, platform::Swapchain& swap) {
     if (!createImages(vk, swap)) return false;
     if (!createPipelines(vk)) return false;
@@ -419,6 +480,9 @@ void Raytracer::updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData&
 
 void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, VkCommandBuffer cb, uint32_t swapIndex) {
     writeQueueHeaders(cb);
+    if (statsBuf_) {
+        vkCmdFillBuffer(cb, statsBuf_, 0, sizeof(TraversalStatsHost), 0);
+    }
     VkMemoryBarrier2 hdrBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
     hdrBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
     hdrBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -428,6 +492,10 @@ void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, V
     hdrDep.memoryBarrierCount = 1;
     hdrDep.pMemoryBarriers = &hdrBarrier;
     vkCmdPipelineBarrier2(cb, &hdrDep);
+    if (timestampPool_) {
+        vkCmdResetQueryPool(cb, timestampPool_, 0, kTimestampCount);
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 0);
+    }
 
     // Generate primary rays into queue
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeGenerate_);
@@ -435,6 +503,9 @@ void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, V
     uint32_t gx = (extent_.width + 7u)/8u;
     uint32_t gy = (extent_.height + 7u)/8u;
     vkCmdDispatch(cb, gx, gy, 1);
+    if (timestampPool_) {
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 1);
+    }
     VkMemoryBarrier2 genBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
     genBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     genBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
@@ -444,6 +515,9 @@ void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, V
     genDep.memoryBarrierCount = 1;
     genDep.pMemoryBarriers = &genBarrier;
     vkCmdPipelineBarrier2(cb, &genDep);
+    if (timestampPool_) {
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 2);
+    }
 
     // Traverse rays into queues
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeTraverse_);
@@ -460,11 +534,20 @@ void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, V
     queueDep.memoryBarrierCount = 1;
     queueDep.pMemoryBarriers = &queueBarrier;
     vkCmdPipelineBarrier2(cb, &queueDep);
+    if (timestampPool_) {
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 3);
+    }
 
     // Shade hits/misses from queues into accum image
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeShade_);
     uint32_t shadeGroups = gx * gy; // one workgroup per traverse workgroup (64 threads)
+    if (timestampPool_) {
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 4);
+    }
     vkCmdDispatch(cb, shadeGroups, 1, 1);
+    if (timestampPool_) {
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 5);
+    }
 
     // Barrier accum for read by composite and out image for write
     VkImageMemoryBarrier2 barriers[2]{};
@@ -482,14 +565,20 @@ void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, V
     // Composite: read accum, write swap image already in GENERAL from App
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeComposite_);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_, 0, 1, &sets_[swapIndex], 0, nullptr);
+    if (timestampPool_) {
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 6);
+    }
     vkCmdDispatch(cb, gx, gy, 1);
+    if (timestampPool_) {
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 7);
+    }
 
     // Debug readback moved to readDebug(), called after submit/present to ensure GPU wrote the data.
 }
 
 void Raytracer::readDebug(platform::VulkanContext& vk, uint32_t frameIdx) {
     // Poll infrequently and debounce identical frames to avoid log spam.
-    if ((frameIdx % 30u) != 0u) return;
+    // Temporarily read back every frame for profiling
     void* p=nullptr; if (vkMapMemory(vk.device(), dbgMem_, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS || !p) return;
     uint32_t* u = reinterpret_cast<uint32_t*>(p);
     uint32_t frame = u[0]; uint32_t flags = u[1]; uint32_t mcap=u[2]; uint32_t mdim=u[3];
@@ -541,6 +630,43 @@ void Raytracer::readDebug(platform::VulkanContext& vk, uint32_t frameIdx) {
         lastDbgFrame_ = frame; lastMcX_=mcx0; lastMcY_=mcy0; lastMcZ_=mcz0; lastPresent_=int(present0);
     }
     vkUnmapMemory(vk.device(), dbgMem_);
+
+    if (timestampPool_) {
+        uint64_t timestamps[kTimestampCount];
+        VkResult qr = vkGetQueryPoolResults(vk.device(), timestampPool_, 0, kTimestampCount,
+                                            sizeof(timestamps), timestamps, sizeof(uint64_t),
+                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        if (qr == VK_SUCCESS) {
+            double scaleMs = timestampPeriodNs_ * 1e-6;
+            auto diffMs = [&](uint32_t a, uint32_t b) {
+                return (timestamps[b] > timestamps[a]) ? double(timestamps[b] - timestamps[a]) * scaleMs : 0.0;
+            };
+            gpuTimingsMs_[0] = diffMs(0, 1);
+            gpuTimingsMs_[1] = diffMs(2, 3);
+            gpuTimingsMs_[2] = diffMs(4, 5);
+            gpuTimingsMs_[3] = diffMs(6, 7);
+            if ((frameIdx % 60u) == 0u) {
+                spdlog::info("GPU timings (ms): generate={:.3f} traverse={:.3f} shade={:.3f} composite={:.3f}",
+                             gpuTimingsMs_[0], gpuTimingsMs_[1], gpuTimingsMs_[2], gpuTimingsMs_[3]);
+                lastTimingFrame_ = frameIdx;
+            }
+        }
+    }
+
+    if (statsBuf_) {
+        TraversalStatsHost stats{};
+        void* mapped = nullptr;
+        VkResult mapRes = vkMapMemory(vk.device(), statsMem_, 0, sizeof(TraversalStatsHost), 0, &mapped);
+        if (mapRes == VK_SUCCESS && mapped) {
+            std::memcpy(&stats, mapped, sizeof(TraversalStatsHost));
+            vkUnmapMemory(vk.device(), statsMem_);
+            statsHost_ = stats;
+            spdlog::info("Traverse stats: macroVisited={} macroSkipped={} brickSteps={} microSteps={} hits={}",
+                         stats.macroVisited, stats.macroSkipped, stats.brickSteps, stats.microSteps, stats.hitsTotal);
+        } else {
+            spdlog::warn("Failed to map traversal stats buffer (res={})", int(mapRes));
+        }
+    }
 }
 
 void Raytracer::shutdown(platform::VulkanContext& vk) {

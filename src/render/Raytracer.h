@@ -43,6 +43,10 @@ private:
     bool createQueues(platform::VulkanContext& vk);
     void destroyQueues(platform::VulkanContext& vk);
     void writeQueueHeaders(VkCommandBuffer cb);
+    bool createProfilingResources(platform::VulkanContext& vk);
+    void destroyProfilingResources(platform::VulkanContext& vk);
+    bool createStatsBuffer(platform::VulkanContext& vk);
+    void destroyStatsBuffer(platform::VulkanContext& vk);
 
 private:
     VkDescriptorSetLayout setLayout_{};
@@ -71,8 +75,23 @@ private:
     VkBuffer missQueueBuf_{};     VkDeviceMemory missQueueMem_{};
     VkBuffer secondaryQueueBuf_{};VkDeviceMemory secondaryQueueMem_{};
     uint32_t queueCapacity_{};
+    VkBuffer statsBuf_{}; VkDeviceMemory statsMem_{};
+    struct TraversalStatsHost {
+        uint32_t macroVisited;
+        uint32_t macroSkipped;
+        uint32_t brickSteps;
+        uint32_t microSteps;
+        uint32_t hitsTotal;
+        uint32_t pad0;
+        uint32_t pad1;
+        uint32_t pad2;
+    } statsHost_{};
     uint32_t hashCapacity_{}; uint32_t brickCount_{};
     uint32_t macroCapacity_{}; uint32_t macroDimBricks_{};
+    VkQueryPool timestampPool_{};
+    double timestampPeriodNs_{}; // GPU timestamp period in nanoseconds
+    double gpuTimingsMs_[4]{};   // generate, traverse, shade, composite
+    uint32_t lastTimingFrame_{}; // last frame we logged timings
 
     // Debug buffer (GPU→CPU) for per-frame diagnostics
     VkBuffer dbgBuf_{}; VkDeviceMemory dbgMem_{}; // 16*4 bytes sufficient

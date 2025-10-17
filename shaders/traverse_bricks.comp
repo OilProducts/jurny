@@ -90,6 +90,17 @@ layout(set = 0, binding = 13, std430) buffer SecondaryQueueBuf {
   RayPayload  rays[];
 } SecondaryQueue;
 
+layout(set = 0, binding = 14, std430) buffer TraverseStatsBuf {
+  uint macroVisited;
+  uint macroSkipped;
+  uint brickSteps;
+  uint microSteps;
+  uint hitsTotal;
+  uint pad0;
+  uint pad1;
+  uint pad2;
+} TraverseStats;
+
 // Constants ----------------------------------------------------------------------------
 const float INF_T              = 1e30;
 const float BRICK_NUDGE        = 1e-5;
@@ -347,6 +358,7 @@ bool traverseBrickMicro(const RayPayload ray,
   uint baseWord = h.occOffset >> 3u;
 
   for (int iter = 0; iter < MICRO_MAX_STEPS && tCellEnter <= t1; ++iter) {
+    atomicAdd(TraverseStats.microSteps, 1u);
     uint linear = uint(voxel.x) +
                   uint(voxel.y) * uint(VOXEL_BRICK_SIZE) +
                   uint(voxel.z) * uint(VOXEL_BRICK_SIZE * VOXEL_BRICK_SIZE);
@@ -466,10 +478,11 @@ void processRay(const RayPayload rayIn) {
     float tBrickExit = min(tx, min(ty, tz));
 
     // Macro skip inside the loop to avoid spending time in empty coarse tiles.
-    if (useMacroSkip) {
-      bool skipped = false;
-      int macroLoop = 0;
-      while (!macroTileOccupied(macroCoords)) {
+  if (useMacroSkip) {
+    bool skipped = false;
+    int macroLoop = 0;
+    while (!macroTileOccupied(macroCoords)) {
+      atomicAdd(TraverseStats.macroSkipped, 1u);
         if (macroLoop++ >= MACRO_MAX_STEPS) {
           useMacroSkip = false;
           break;
@@ -511,9 +524,10 @@ void processRay(const RayPayload rayIn) {
         }
       }
       if (useMacroSkip && skipped) {
+        atomicAdd(TraverseStats.macroVisited, 1u);
         continue;
       }
-    }
+     }
 
     uint brickIdx;
     if (findBrick(brickCoords, brickIdx)) {
@@ -523,6 +537,7 @@ void processRay(const RayPayload rayIn) {
         vec3 normal;
         uint material;
         if (traverseBrickMicro(ray, tCursor, min(tBrickExit, tMax), h, tHit, normal, material)) {
+          atomicAdd(TraverseStats.hitsTotal, 1u);
           enqueueHit(ray, tHit, normal, material);
           return;
         }
@@ -540,6 +555,7 @@ void processRay(const RayPayload rayIn) {
       tCursor = tz;
       brickCoords.z += (dir.z >= 0.0) ? 1 : -1;
     }
+    atomicAdd(TraverseStats.brickSteps, 1u);
   }
 
   // Reached the end of the traversal window without hitting a voxel.

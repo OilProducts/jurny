@@ -144,7 +144,7 @@ int App::run() {
     uint32_t frameCounter = 0;
     bool useShell = false; // toggle with 'V'
     bool mPrevDown = false; // edge-trigger for 'M'
-    uint32_t debugFlags = 0; // traverse debug flags (bit0: probe brick at Rsea)
+    uint32_t debugFlags = 8u; // start with macro skip enabled (bit3)
     while (!window.shouldClose()) {
         window.poll(); uint32_t idx=0; if (vkAcquireNextImageKHR(vk.device(), swap.handle(), UINT64_MAX, acquireSem, VK_NULL_HANDLE, &idx) != VK_SUCCESS) break;
 #if VOXEL_ENABLE_WINDOW
