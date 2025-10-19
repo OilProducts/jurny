@@ -1,5 +1,95 @@
 #version 460
-// denoise_atrous.comp — SVGF/A-trous spatiotemporal filter (placeholder)
+
+#include "common.glsl"
+
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
-void main() {}
-// Uses albedo/normal/variance and motion vectors for reprojection.
+layout(set = 0, binding = 1,  rgba16f) uniform readonly  image2D currImage;
+layout(set = 0, binding = 15, rgba16f) uniform readonly  image2D motionImage;
+layout(set = 0, binding = 16, rgba16f) uniform readonly  image2D historyPrev;
+layout(set = 0, binding = 17, rgba16f) uniform writeonly image2D historyNext;
+layout(set = 0, binding = 18, rgba16f) uniform readonly  image2D albedoImage;
+layout(set = 0, binding = 19, rgba16f) uniform readonly  image2D normalImage;
+layout(set = 0, binding = 20, rgba16f) uniform readonly  image2D momentsImage;
+layout(set = 0, binding = 21, rgba16f) uniform readonly  image2D historyMomentsPrev;
+layout(set = 0, binding = 22, rgba16f) uniform writeonly image2D historyMomentsNext;
+
+vec2 clipToScreen(vec4 clip) {
+  float invW = (abs(clip.w) > 1e-6) ? (1.0 / clip.w) : 0.0;
+  vec2 ndc = clip.xy * invW;
+  return ndc * 0.5 + 0.5;
+}
+
+bool sampleHistory(ivec2 pix, vec2 velocity, out vec4 historyColor, out ivec2 prevPix) {
+  if (g.frameIdx == 0u || g.historyValid == 0u) return false;
+  vec2 dims = vec2(float(g.width), float(g.height));
+  vec2 screen = (vec2(pix) + vec2(0.5)) / dims;
+  vec2 prevScreen = screen - velocity;
+  if (prevScreen.x < 0.0 || prevScreen.x > 1.0 || prevScreen.y < 0.0 || prevScreen.y > 1.0) {
+    return false;
+  }
+  vec2 prevPixF = prevScreen * dims - vec2(0.5);
+  prevPix = ivec2(clamp(floor(prevPixF + vec2(0.5)), vec2(0.0), dims - vec2(1.0)));
+  historyColor = imageLoad(historyPrev, prevPix);
+  return true;
+}
+
+void main() {
+  ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+  if (pix.x >= int(g.width) || pix.y >= int(g.height)) return;
+
+  vec4 curr = imageLoad(currImage, pix);
+  vec4 motion = imageLoad(motionImage, pix);
+  vec2 velocity = motion.xy;
+  float valid = motion.z;
+
+  vec3 albedo = imageLoad(albedoImage, pix).rgb;
+  vec4 normalDepth = imageLoad(normalImage, pix);
+  vec3 normal = normalDepth.xyz * 2.0 - 1.0;
+  float depth = normalDepth.w;
+  vec4 currMoments = imageLoad(momentsImage, pix);
+  float currMoment1 = currMoments.x;
+  float currMoment2 = currMoments.y;
+
+  vec4 historyColor = vec4(0.0);
+  vec4 historyMoments = vec4(currMoment1, currMoment2, 1.0, depth);
+  bool historyUsed = false;
+  ivec2 prevPix = pix;
+
+  if (valid > 0.0) {
+    if (sampleHistory(pix, velocity, historyColor, prevPix)) {
+      vec4 prevMoments = imageLoad(historyMomentsPrev, prevPix);
+      float prevLength = prevMoments.z;
+      float prevDepth = prevMoments.w;
+      bool prevValid = (prevLength > 0.0);
+      float normalFactor = clamp(abs(normal.z), 0.2, 1.0);
+      float depthThreshold = max(0.01, depth * 0.01 / normalFactor);
+      if (prevValid && abs(prevDepth - depth) <= depthThreshold) {
+        float albedoLuma = dot(albedo, vec3(0.299, 0.587, 0.114));
+        float moment1Prev = prevMoments.x;
+        float moment2Prev = prevMoments.y;
+        float variancePrev = max(moment2Prev - moment1Prev * moment1Prev, 0.0);
+        float sigma = sqrt(variancePrev);
+        float historyLen = clamp(prevLength + 1.0, 1.0, 64.0);
+        float alpha = 1.0 / historyLen;
+        float clampK = mix(1.0, 1.5, albedoLuma);
+        vec3 minColor = curr.rgb - vec3(clampK * sigma);
+        vec3 maxColor = curr.rgb + vec3(clampK * sigma);
+        vec3 clampedHistory = clamp(historyColor.rgb, minColor, maxColor);
+        vec3 blendedColor = mix(clampedHistory, curr.rgb, alpha);
+        float blendedMoment1 = mix(moment1Prev, currMoment1, alpha);
+        float blendedMoment2 = mix(moment2Prev, currMoment2, alpha);
+        curr = vec4(blendedColor, 1.0);
+        historyMoments = vec4(blendedMoment1, blendedMoment2, historyLen, depth);
+        historyUsed = true;
+      }
+    }
+  }
+
+  if (!historyUsed) {
+    historyMoments = vec4(currMoment1, currMoment2, 1.0, depth);
+    curr = vec4(curr.rgb, 1.0);
+  }
+
+  imageStore(historyNext, pix, vec4(curr.rgb, 1.0));
+  imageStore(historyMomentsNext, pix, historyMoments);
+}

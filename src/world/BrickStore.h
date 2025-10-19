@@ -1,9 +1,16 @@
 #pragma once
 
-#include <vector>
+#include <atomic>
 #include <cstdint>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+#include <glm/vec3.hpp>
+
 #include "BrickFormats.h"
 #include "math/Spherical.h"
+#include "world/WorldGen.h"
 
 // BrickStore — CPU brick generation & packing for a test slab near +X.
 // GPU upload is handled by the renderer for M2.
@@ -11,7 +18,10 @@ namespace world {
 
 struct CpuWorld {
     std::vector<BrickHeader> headers;
-    std::vector<uint64_t>    occWords;   // 8x uint64 per brick
+    std::vector<uint64_t>    occWords;   // occupancy words per brick (brickDim-dependent)
+    std::vector<uint32_t>    materialIndices; // packed material data (4-bit or 8-bit)
+    std::vector<uint32_t>    palettes;        // packed per-brick palettes (uint32 per entry)
+    std::vector<MaterialGpu> materialTable;
     std::vector<uint64_t>    hashKeys;   // packed (bx,by,bz)
     std::vector<uint32_t>    hashVals;   // index into headers
     uint32_t                 hashCapacity = 0; // power-of-two
@@ -24,39 +34,46 @@ struct CpuWorld {
 
 class BrickStore {
 public:
-    void clear();
+    void configure(const math::PlanetParams& P, float voxelSize, int brickDim,
+                   const WorldGen::NoiseParams& noise, std::uint32_t seed);
 
-    // Generate a small curved "terrain" slab that approximates the spherical crust
-    // centered around +X axis. Returns number of bricks.
-    size_t generateTestSlab(const math::PlanetParams& P,
-                            float voxelSize,
-                            int brickDim,
-                            float yExtentMeters,
-                            float zExtentMeters,
-                            float radialHalfThicknessMeters);
+    CpuWorld buildCpuWorld(const std::vector<glm::ivec3>& brickCoords,
+                           std::atomic<bool>* cancel = nullptr) const;
 
-    // Generate a spherical cap centered around +X axis: for each (by,bz) within tangential extents,
-    // place bricks around the analytic surface x = sqrt(R^2 - y^2 - z^2) with given radial half thickness.
-    size_t generateSphericalCap(const math::PlanetParams& P,
-                                float voxelSize,
-                                int brickDim,
-                                float yExtentMeters,
-                                float zExtentMeters,
-                                float radialHalfThicknessMeters);
-
-    const CpuWorld& cpu() const { return cpu_; }
+    float brickSize() const { return brickSize_; }
+    float voxelSize() const { return voxelSize_; }
+    int brickDim() const { return brickDim_; }
+    const math::PlanetParams& params() const { return params_; }
+    const WorldGen& worldGen() const { return worldGen_; }
 
 private:
     static uint64_t packKey(int bx, int by, int bz);
-    void buildHash();
-    void buildMacroHash(uint32_t macroDimBricks);
+    static void buildHash(CpuWorld& world);
+    static void buildMacroHash(CpuWorld& world, uint32_t macroDimBricks);
+    bool buildBrickOccupancy(const glm::ivec3& bc,
+                             const math::PlanetParams& P,
+                             float voxelSize,
+                             int brickDim,
+                             float brickSize,
+                             std::vector<uint64_t>& outOcc,
+                             std::vector<uint16_t>& outMaterials) const;
 
 private:
     int brickDim_ = 8;
     float brickSize_ = 4.0f;
     float voxelSize_ = 0.5f;
     math::PlanetParams params_{};
-    CpuWorld cpu_{};
+    std::vector<MaterialGpu> materialTable_;
+    void initMaterialTable();
+    uint32_t classifyMaterial(const glm::vec3& p) const;
+    struct CachedBrick {
+        bool solid = false;
+        std::vector<uint64_t> occ;
+        std::vector<uint16_t> materials;
+    };
+    mutable std::unordered_map<uint64_t, CachedBrick> brickCache_;
+    mutable std::mutex cacheMutex_;
+    WorldGen worldGen_{};
 };
 
 }

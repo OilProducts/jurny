@@ -17,6 +17,11 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <spdlog/spdlog.h>
 #include "math/Spherical.h"
+#include "core/Jobs.h"
+#include "world/Streaming.h"
+#include <atomic>
+#include <mutex>
+#include <numeric>
 #if VOXEL_ENABLE_WINDOW
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -46,6 +51,21 @@ int App::run() {
     sci.width = window.width();
     sci.height= window.height();
     swap.create(sci);
+
+    core::Jobs jobs;
+    jobs.start();
+    world::Streaming streaming;
+    std::vector<glm::ivec3> currentGpuSelection;
+    struct PendingUpload {
+        std::atomic<bool> jobRunning{false};
+        std::atomic<bool> ready{false};
+        std::atomic<bool> cancel{false};
+        std::mutex mutex;
+        std::vector<glm::ivec3> selection;
+        std::vector<glm::ivec3> toUpload;
+        std::vector<glm::ivec3> toDrop;
+        world::CpuWorld cpu;
+    } pending;
 
     // Shell-visualization compute pipeline (UBO + storage image)
     VkDescriptorSetLayoutBinding bUbo{}; bUbo.binding = 0; bUbo.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; bUbo.descriptorCount = 1; bUbo.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -79,16 +99,7 @@ int App::run() {
     VkPipeline pipe{}; vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipe);
 
     // Create a small UBO
-    struct alignas(16) GlobalsUBO {
-        float currView[16];
-        float currProj[16];
-        float prevView[16];
-        float prevProj[16];
-        float originDeltaPrevToCurr[4];
-        float voxelSize, brickSize, Rin, Rout;
-        float Rsea, exposure; uint32_t frameIdx, maxBounces;
-        uint32_t width, height, raysPerPixel, flags;
-    };
+    using GlobalsUBO = render::GlobalsUBOData;
 
     VkBuffer ubo{}; VkDeviceMemory uboMem{};
     {
@@ -138,6 +149,21 @@ int App::run() {
         spdlog::error("Raytracer init failed.");
         return 1;
     }
+    spdlog::debug("Raytracer initialized");
+    const float planetRadius = 100.0f;
+    if (const auto* store = ray.worldStore()) {
+        world::Streaming::Config streamCfg;
+        streamCfg.shellInner = planetRadius - 25.0f;
+        streamCfg.shellOuter = planetRadius + 75.0f;
+        streamCfg.keepRadius = 70.0f;
+        streamCfg.loadRadius = 110.0f;
+        streamCfg.simRadius  = 90.0f;
+        streamCfg.regionDimBricks = 16;
+        streaming.initialize(*store, streamCfg, &jobs);
+        spdlog::debug("Streaming initialized");
+    } else {
+        spdlog::warn("Streaming not initialized: no brick store available");
+    }
     VkSemaphoreCreateInfo sciSem{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO }; VkSemaphore acquireSem{}, finishSem{}; vkCreateSemaphore(vk.device(), &sciSem, nullptr, &acquireSem); vkCreateSemaphore(vk.device(), &sciSem, nullptr, &finishSem);
     auto t0 = std::chrono::steady_clock::now();
     auto last = t0;
@@ -145,6 +171,17 @@ int App::run() {
     bool useShell = false; // toggle with 'V'
     bool mPrevDown = false; // edge-trigger for 'M'
     uint32_t debugFlags = 8u; // start with macro skip enabled (bit3)
+    glm::dvec3 camWorld = glm::dvec3(double(planetRadius) + 5.0, 0.0, 5.0);
+    glm::dvec3 prevRenderOrigin = camWorld;
+    glm::mat4 prevViewMat(1.0f);
+    glm::mat4 prevProjMat(1.0f);
+    float yawDeg = 180.0f;
+    float pitchDeg = 0.0f;
+    bool firstMouse = true;
+    double lastX = 0.0, lastY = 0.0;
+#if VOXEL_ENABLE_WINDOW
+    glfwSetInputMode(window.handle(), GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+#endif
     while (!window.shouldClose()) {
         window.poll(); uint32_t idx=0; if (vkAcquireNextImageKHR(vk.device(), swap.handle(), UINT64_MAX, acquireSem, VK_NULL_HANDLE, &idx) != VK_SUCCESS) break;
 #if VOXEL_ENABLE_WINDOW
@@ -163,38 +200,201 @@ int App::run() {
         // Update UBO (orbit camera for eyeballing)
         GlobalsUBO data{};
         auto now = std::chrono::steady_clock::now();
-        float t = std::chrono::duration<float>(now - t0).count();
         float dt = std::chrono::duration<float>(now - last).count();
         last = now;
-        float R = 10000.0f; // planet radius
-        static float dist = R + 10000.0f; // start further back for clarity
+        const float R = planetRadius; // planet radius (200 m diameter)
+        glm::vec3 forward;
+        glm::vec3 up(0.0f, 0.0f, 1.0f);
 #if VOXEL_ENABLE_WINDOW
-        // Simple manual zoom with +/- keys
-        if (glfwGetKey(window.handle(), GLFW_KEY_EQUAL) == GLFW_PRESS || glfwGetKey(window.handle(), GLFW_KEY_KP_ADD) == GLFW_PRESS) dist += 2000.0f * dt;
-        if (glfwGetKey(window.handle(), GLFW_KEY_MINUS) == GLFW_PRESS || glfwGetKey(window.handle(), GLFW_KEY_KP_SUBTRACT) == GLFW_PRESS) dist -= 2000.0f * dt;
-        dist = std::max(dist, R + 200.0f);
+        if (glfwGetKey(window.handle(), GLFW_KEY_ESCAPE) == GLFW_PRESS) break;
+
+        double mouseX, mouseY;
+        glfwGetCursorPos(window.handle(), &mouseX, &mouseY);
+        if (firstMouse) {
+            lastX = mouseX;
+            lastY = mouseY;
+            firstMouse = false;
+        }
+        double xoffset = mouseX - lastX;
+        double yoffset = mouseY - lastY; // inverted vertical look: move mouse up to pitch down
+        lastX = mouseX;
+        lastY = mouseY;
+        const float sensitivity = 0.08f;
+        yawDeg += static_cast<float>(xoffset) * sensitivity;
+        pitchDeg += static_cast<float>(yoffset) * sensitivity;
+        pitchDeg = std::clamp(pitchDeg, -89.0f, 89.0f);
+
+        const float yawRad = glm::radians(yawDeg);
+        const float pitchRad = glm::radians(pitchDeg);
+        forward.x = std::cos(pitchRad) * std::cos(yawRad);
+        forward.y = std::cos(pitchRad) * std::sin(yawRad);
+        forward.z = std::sin(pitchRad);
+        forward = glm::normalize(forward);
+        glm::vec3 worldUp(0.0f, 0.0f, 1.0f);
+        glm::vec3 right = glm::normalize(glm::cross(forward, worldUp));
+        if (glm::dot(right, right) < 1e-4f) {
+            right = glm::vec3(1.0f, 0.0f, 0.0f);
+        }
+        up = glm::normalize(glm::cross(right, forward));
+
+        float moveSpeed = 25.0f;
+        if (glfwGetKey(window.handle(), GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS || glfwGetKey(window.handle(), GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
+            moveSpeed *= 2.0f;
+        }
+        if (glfwGetKey(window.handle(), GLFW_KEY_W) == GLFW_PRESS) camWorld += glm::dvec3(forward) * double(moveSpeed * dt);
+        if (glfwGetKey(window.handle(), GLFW_KEY_S) == GLFW_PRESS) camWorld -= glm::dvec3(forward) * double(moveSpeed * dt);
+        if (glfwGetKey(window.handle(), GLFW_KEY_A) == GLFW_PRESS) camWorld -= glm::dvec3(right)   * double(moveSpeed * dt);
+        if (glfwGetKey(window.handle(), GLFW_KEY_D) == GLFW_PRESS) camWorld += glm::dvec3(right)   * double(moveSpeed * dt);
+        if (glfwGetKey(window.handle(), GLFW_KEY_SPACE) == GLFW_PRESS) camWorld += glm::dvec3(up) * double(moveSpeed * dt);
+        if (glfwGetKey(window.handle(), GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS) camWorld -= glm::dvec3(up) * double(moveSpeed * dt);
+#else
+        forward = glm::vec3(-1.0f, 0.0f, 0.0f);
 #endif
-        float cx = dist * std::cos(0.15f * t);
-        float cy = dist * std::sin(0.15f * t);
-        float cz = 1500.0f;
-        glm::vec3 eyePos(cx,cy,cz);
-        glm::mat4 V = glm::lookAt(eyePos, glm::vec3(0,0,0), glm::vec3(0,0,1));
+        glm::vec3 camPosF = glm::vec3(camWorld);
+        streaming.update(camPosF, frameCounter);
+        if ((frameCounter % 120u) == 0u) {
+            const auto& st = streaming.stats();
+            spdlog::debug("Streaming: keep={} load={} drop={} sim={}", st.keepCount, st.loadCount, st.dropCount, st.simCount);
+        }
+        auto diff = streaming.collectSelectionDiff(currentGpuSelection);
+        bool selectionChanged = (diff.toUpload.size() || diff.toRemove.size());
+        if (selectionChanged) {
+            bool scheduled = pending.jobRunning.load(std::memory_order_acquire) || pending.ready.load(std::memory_order_acquire);
+            if (!scheduled) {
+                const auto* store = ray.worldStore();
+                if (store) {
+                    spdlog::debug("Queueing streaming job: target={} adds={} drops={} (current={})",
+                                   diff.target.size(), diff.toUpload.size(), diff.toRemove.size(), currentGpuSelection.size());
+                    pending.jobRunning.store(true, std::memory_order_release);
+                    pending.ready.store(false, std::memory_order_release);
+                    pending.cancel.store(false, std::memory_order_release);
+                    auto targetCopy = diff.target;
+                    auto addsCopy = diff.toUpload;
+                    auto dropsCopy = diff.toRemove;
+                    jobs.schedule([&, store,
+                                   selection = std::move(targetCopy),
+                                   adds = std::move(addsCopy),
+                                   drops = std::move(dropsCopy)]() mutable {
+                        if (pending.cancel.load(std::memory_order_acquire)) {
+                            pending.jobRunning.store(false, std::memory_order_release);
+                            return;
+                        }
+                        auto cpu = store->buildCpuWorld(selection, &pending.cancel);
+                        if (pending.cancel.load(std::memory_order_acquire)) {
+                            pending.jobRunning.store(false, std::memory_order_release);
+                            return;
+                        }
+                        std::vector<glm::ivec3> finalSelection;
+                        finalSelection.reserve(cpu.headers.size());
+                        for (const auto& h : cpu.headers) {
+                            finalSelection.emplace_back(h.bx, h.by, h.bz);
+                        }
+                        if (pending.cancel.load(std::memory_order_acquire)) {
+                            pending.jobRunning.store(false, std::memory_order_release);
+                            return;
+                        }
+                        auto contains = [&](const glm::ivec3& coord) {
+                            return std::binary_search(finalSelection.begin(), finalSelection.end(), coord, [](const glm::ivec3& a, const glm::ivec3& b){
+                                if (a.x != b.x) return a.x < b.x;
+                                if (a.y != b.y) return a.y < b.y;
+                                return a.z < b.z;
+                            });
+                        };
+                        std::vector<glm::ivec3> filteredAdds;
+                        filteredAdds.reserve(adds.size());
+                        std::sort(finalSelection.begin(), finalSelection.end(), [](const glm::ivec3& a, const glm::ivec3& b){
+                            if (a.x != b.x) return a.x < b.x;
+                            if (a.y != b.y) return a.y < b.y;
+                            return a.z < b.z;
+                        });
+                        if (pending.cancel.load(std::memory_order_acquire)) {
+                            pending.jobRunning.store(false, std::memory_order_release);
+                            return;
+                        }
+                        for (const auto& c : adds) {
+                            if (contains(c)) filteredAdds.push_back(c);
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(pending.mutex);
+                            pending.selection = std::move(finalSelection);
+                            pending.toUpload = std::move(filteredAdds);
+                            pending.toDrop = std::move(drops);
+                            pending.cpu = std::move(cpu);
+                        }
+                        spdlog::debug("Streaming job completed (target={})", pending.selection.size());
+                        pending.ready.store(true, std::memory_order_release);
+                        pending.jobRunning.store(false, std::memory_order_release);
+                    });
+                }
+            }
+        }
+
+        if (pending.ready.load(std::memory_order_acquire) && !pending.cancel.load(std::memory_order_acquire)) {
+            std::vector<glm::ivec3> readySelection;
+            std::vector<glm::ivec3> readyAdds;
+            std::vector<glm::ivec3> readyDrops;
+            world::CpuWorld readyCpu;
+            {
+                std::lock_guard<std::mutex> lock(pending.mutex);
+                readySelection = std::move(pending.selection);
+                readyAdds = std::move(pending.toUpload);
+                readyDrops = std::move(pending.toDrop);
+                readyCpu = std::move(pending.cpu);
+                pending.selection.clear();
+                pending.toUpload.clear();
+                pending.toDrop.clear();
+            }
+            if (pending.cancel.load(std::memory_order_acquire)) {
+                pending.ready.store(false, std::memory_order_release);
+                continue;
+            }
+            bool committed = ray.commitWorldSubset(vk, readyCpu, readySelection);
+            if (committed) {
+                currentGpuSelection = std::move(readySelection);
+                spdlog::debug("Streaming commit applied: +{} / -{} bricks (resident={})",
+                               readyAdds.size(), readyDrops.size(), currentGpuSelection.size());
+            }
+            pending.ready.store(false, std::memory_order_release);
+        }
+        glm::mat4 V = glm::lookAt(camPosF, camPosF + forward, up);
         float aspect = float(swap.extent().width)/float(swap.extent().height);
-        glm::mat4 P = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 100000.0f);
+        glm::mat4 P = glm::perspective(glm::radians(45.0f), aspect, 0.05f, 2000.0f);
         std::memcpy(data.currView, &V[0][0], sizeof(float)*16);
         std::memcpy(data.currProj, &P[0][0], sizeof(float)*16);
-        std::memcpy(data.prevView, &V[0][0], sizeof(float)*16);
-        std::memcpy(data.prevProj, &P[0][0], sizeof(float)*16);
-        data.originDeltaPrevToCurr[0]=0; data.originDeltaPrevToCurr[1]=0; data.originDeltaPrevToCurr[2]=0; data.originDeltaPrevToCurr[3]=0;
-        data.voxelSize = 0.5f; data.brickSize = 4.0f; data.Rin = R - 1000.0f; data.Rout = R + 6000.0f;
-        data.Rsea = R; data.exposure = 1.0f; data.frameIdx = frameCounter++; data.maxBounces = 0;
-        data.width = swap.extent().width; data.height = swap.extent().height; data.raysPerPixel = 1; data.flags = debugFlags;
+        std::memcpy(data.prevView, &prevViewMat[0][0], sizeof(float)*16);
+        std::memcpy(data.prevProj, &prevProjMat[0][0], sizeof(float)*16);
+        data.renderOrigin[0] = camPosF.x;
+        data.renderOrigin[1] = camPosF.y;
+        data.renderOrigin[2] = camPosF.z;
+        data.renderOrigin[3] = 0.0f;
+        glm::vec3 originDelta = glm::vec3(prevRenderOrigin - camWorld);
+        data.originDeltaPrevToCurr[0] = originDelta.x;
+        data.originDeltaPrevToCurr[1] = originDelta.y;
+        data.originDeltaPrevToCurr[2] = originDelta.z;
+        data.originDeltaPrevToCurr[3] = 0.0f;
+        data.voxelSize = 0.5f;
+        data.brickSize = 4.0f;
+        data.Rin = R - 20.0f;
+        data.Rout = R + 80.0f;
+        data.Rsea = R;
+        data.planetRadius = R;
+        data.exposure = 1.0f;
+        data.frameIdx = frameCounter;
+        data.maxBounces = 0;
+        data.width = swap.extent().width;
+        data.height = swap.extent().height;
+        data.raysPerPixel = 1;
+        data.flags = debugFlags;
         void* mapped=nullptr; vkMapMemory(vk.device(), uboMem, 0, sizeof(GlobalsUBO), 0, &mapped);
         std::memcpy(mapped, &data, sizeof(GlobalsUBO));
         vkUnmapMemory(vk.device(), uboMem);
+        ++frameCounter;
+        prevViewMat = V;
+        prevProjMat = P;
+        prevRenderOrigin = camWorld;
 
         // One-time debug logging for the center and a corner ray (first few frames only)
-        if (frameCounter < 3) {
+        if (data.frameIdx < 3) {
             auto invV = glm::inverse(V);
             auto invP = glm::inverse(P);
             auto makeRayCPU = [&](int px, int py){
@@ -213,7 +413,7 @@ int App::run() {
             float tEnter=0, tExit=0;
             bool hit = math::IntersectSphereShell(ro0, rd0, data.Rin, data.Rout, tEnter, tExit);
             spdlog::info("Extent={}x{} Rin={} Rout={} eye=({:.1f},{:.1f},{:.1f})",
-                         swap.extent().width, swap.extent().height, data.Rin, data.Rout, eyePos.x, eyePos.y, eyePos.z);
+                         swap.extent().width, swap.extent().height, data.Rin, data.Rout, camPosF.x, camPosF.y, camPosF.z);
             spdlog::info("Center ray ro=({:.1f},{:.1f},{:.1f}) rd=({:.3f},{:.3f},{:.3f}) hit={} t=[{:.1f},{:.1f}]",
                          ro0.x, ro0.y, ro0.z, rd0.x, rd0.y, rd0.z, hit?1:0, tEnter, tExit);
             spdlog::info("Corner ray  ro=({:.1f},{:.1f},{:.1f}) rd=({:.3f},{:.3f},{:.3f})",
@@ -249,6 +449,8 @@ int App::run() {
     }
 
     vkDestroySemaphore(vk.device(), finishSem, nullptr); vkDestroySemaphore(vk.device(), acquireSem, nullptr);
+    pending.cancel.store(true, std::memory_order_release);
+    jobs.stop();
     ray.shutdown(vk);
     vkDestroyPipeline(vk.device(), pipe, nullptr); vkDestroyShaderModule(vk.device(), sm, nullptr);
     vkDestroyDescriptorPool(vk.device(), dpool, nullptr); vkDestroyPipelineLayout(vk.device(), pl, nullptr); vkDestroyDescriptorSetLayout(vk.device(), dsl, nullptr);

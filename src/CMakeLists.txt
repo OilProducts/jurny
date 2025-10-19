@@ -3,7 +3,7 @@
 file(GLOB_RECURSE CORE_SRC CONFIGURE_DEPENDS core/*.cpp)
 add_library(voxel_core STATIC ${CORE_SRC})
 target_include_directories(voxel_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(voxel_core PUBLIC ext_spdlog ext_tracy)
+target_link_libraries(voxel_core PUBLIC ext_spdlog ext_tracy ext_volk)
 target_compile_definitions(voxel_core PUBLIC
   $<$<BOOL:${VOXEL_ENABLE_VALIDATION}>:VOXEL_ENABLE_VALIDATION=1>
   $<$<BOOL:${VOXEL_ENABLE_TRACY}>:VOXEL_ENABLE_TRACY=1>

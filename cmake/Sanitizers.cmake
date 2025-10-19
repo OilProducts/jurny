@@ -1,5 +1,5 @@
 function(voxel_enable_sanitizers target)
-  if (CMAKE_BUILD_TYPE STREQUAL "Debug" AND VOXEL_ENABLE_SANITIZERS)
+  if (VOXEL_ENABLE_SANITIZERS)
     if (MSVC)
       message(STATUS "Sanitizers: not enabled on MSVC in this skeleton")
     else()
@@ -8,4 +8,3 @@ function(voxel_enable_sanitizers target)
     endif()
   endif()
 endfunction()
-

@@ -4,6 +4,12 @@
 
 // BrickFormats — packed GPU layouts and flags.
 namespace world {
+constexpr uint32_t kInvalidOffset = 0xFFFFFFFFu;
+
+enum BrickFlags : uint16_t {
+    kBrickUses4Bit = 1u << 0
+};
+
 struct BrickHeader {
     int32_t bx{}, by{}, bz{};
     uint32_t occOffset{};
@@ -13,5 +19,13 @@ struct BrickHeader {
     uint16_t paletteCount{};
     uint32_t tsdfOffset{}; // 0xFFFFFFFF if none
 };
-}
 
+struct MaterialGpu {
+    float baseColor[3];
+    float roughness;
+    float emission;
+    float metalness;
+    float pad[2];
+};
+
+}

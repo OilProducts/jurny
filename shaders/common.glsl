@@ -8,20 +8,47 @@ struct GlobalsUBO_t {
   mat4 prevView;
   mat4 prevProj;
 
+  // Origin used to rebase world->camera transforms (world space, meters)
+  vec3 renderOrigin; float _padOrigin;
+
   // Origin delta (prev→curr) in local space
   vec3 originDeltaPrevToCurr; float _pad0;
 
   // Planet + render params
   float voxelSize;  float brickSize;  float Rin;       float Rout;
-  float Rsea;       float exposure;   uint  frameIdx;  uint  maxBounces;
+  float Rsea;       float planetRadius; float exposure; float _padExposure;
 
-  // Dimensions
-  uint width; uint height; uint raysPerPixel; uint flags;
+  // Frame / image info
+  uint frameIdx; uint maxBounces; uint width; uint height;
+
+  uint raysPerPixel; uint flags; uint worldHashCapacity; uint worldBrickCount;
   // World hash info for traversal
-  uint worldHashCapacity; uint worldBrickCount; uint _padA; uint _padB;
-  // Macro skipping
-  uint macroHashCapacity; uint macroDimBricks; float macroSize; float _padC;
+  uint macroHashCapacity;
+  uint macroDimBricks;
+  float macroSize;
+  uint historyValid;
+  float noiseContinentFreq;
+  float noiseContinentAmp;
+  float noiseDetailFreq;
+  float noiseDetailAmp;
+  float noiseWarpFreq;
+  float noiseWarpAmp;
+  float noiseCaveFreq;
+  float noiseCaveAmp;
+  float noiseCaveThreshold;
+  float noiseMinHeight;
+  float noiseMaxHeight;
+  float noisePad2;
+  uint noiseSeed;
+  uint noiseContinentOctaves;
+  uint noiseDetailOctaves;
+  uint noiseCaveOctaves;
 };
+
+#ifndef GLOBALS_UBO_DEFINED
+#define GLOBALS_UBO_DEFINED 1
+layout(set = 0, binding = 0) uniform GlobalsUBO { GlobalsUBO_t g; };
+#endif
 
 // layout(set=0, binding=0) uniform GlobalsUBO { GlobalsUBO_t g; };
 // Note: bind this only in passes that need it; first_pixels.comp does not include this file.
