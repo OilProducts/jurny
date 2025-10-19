@@ -104,8 +104,8 @@ void Streaming::update(const glm::vec3& cameraPos, uint64_t /*frameIndex*/) {
     }
 
     if (candidates.empty()) {
-        spdlog::debug("Streaming.update: no region candidates (cameraRadius={:.2f}, loadRadius={}, shell=[{:.2f},{:.2f}], regionDim={})",
-                      glm::length(cameraPos), loadRadius, shellInner, shellOuter, regionDim);
+        spdlog::info("Streaming.update: no region candidates (cameraRadius={:.2f}, loadRadius={}, shell=[{:.2f},{:.2f}], regionDim={})",
+                     glm::length(cameraPos), loadRadius, shellInner, shellOuter, regionDim);
     }
 
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {

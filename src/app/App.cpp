@@ -254,7 +254,7 @@ int App::run() {
         streaming.update(camPosF, frameCounter);
         if ((frameCounter % 120u) == 0u) {
             const auto& st = streaming.stats();
-            spdlog::debug("Streaming: keep={} load={} drop={} sim={}", st.keepCount, st.loadCount, st.dropCount, st.simCount);
+            spdlog::info("Streaming stats: keep={} load={} drop={} sim={}", st.keepCount, st.loadCount, st.dropCount, st.simCount);
         }
         auto diff = streaming.collectSelectionDiff(currentGpuSelection);
         bool selectionChanged = (diff.toUpload.size() || diff.toRemove.size());
@@ -263,8 +263,8 @@ int App::run() {
             if (!scheduled) {
                 const auto* store = ray.worldStore();
                 if (store) {
-                    spdlog::debug("Queueing streaming job: target={} adds={} drops={} (current={})",
-                                   diff.target.size(), diff.toUpload.size(), diff.toRemove.size(), currentGpuSelection.size());
+                    spdlog::info("Streaming job queued: target={} adds={} drops={} currentResident={}",
+                                 diff.target.size(), diff.toUpload.size(), diff.toRemove.size(), currentGpuSelection.size());
                     pending.jobRunning.store(true, std::memory_order_release);
                     pending.ready.store(false, std::memory_order_release);
                     pending.cancel.store(false, std::memory_order_release);
@@ -321,7 +321,7 @@ int App::run() {
                             pending.toDrop = std::move(drops);
                             pending.cpu = std::move(cpu);
                         }
-                        spdlog::debug("Streaming job completed (target={})", pending.selection.size());
+                        spdlog::info("Streaming job completed (target bricks={})", pending.selection.size());
                         pending.ready.store(true, std::memory_order_release);
                         pending.jobRunning.store(false, std::memory_order_release);
                     });
@@ -351,8 +351,8 @@ int App::run() {
             bool committed = ray.commitWorldSubset(vk, readyCpu, readySelection);
             if (committed) {
                 currentGpuSelection = std::move(readySelection);
-                spdlog::debug("Streaming commit applied: +{} / -{} bricks (resident={})",
-                               readyAdds.size(), readyDrops.size(), currentGpuSelection.size());
+                spdlog::info("Streaming commit applied: +{} / -{} bricks (resident={})",
+                             readyAdds.size(), readyDrops.size(), currentGpuSelection.size());
             }
             pending.ready.store(false, std::memory_order_release);
         }

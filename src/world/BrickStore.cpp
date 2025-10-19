@@ -167,8 +167,8 @@ bool BrickStore::buildBrickOccupancy(const glm::ivec3& bc,
     uint32_t count = logged.load(std::memory_order_relaxed);
     if (count < 32) {
         if (logged.compare_exchange_strong(count, count + 1, std::memory_order_relaxed)) {
-            spdlog::debug("BrickStore::buildBrickOccupancy begin bc=({}, {}, {}) voxelSize={} brickSize={}",
-                          bc.x, bc.y, bc.z, voxelSize, brickSize);
+            spdlog::info("BrickStore::buildBrickOccupancy begin bc=({}, {}, {}) voxelSize={} brickSize={}",
+                         bc.x, bc.y, bc.z, voxelSize, brickSize);
         }
     }
 
@@ -218,7 +218,7 @@ bool BrickStore::buildBrickOccupancy(const glm::ivec3& bc,
         uint32_t cnt = logged.load(std::memory_order_relaxed);
         if (cnt < 64) {
             if (logged.compare_exchange_strong(cnt, cnt + 1, std::memory_order_relaxed)) {
-                spdlog::debug("BrickStore::buildBrickOccupancy empty bc=({}, {}, {})", bc.x, bc.y, bc.z);
+                spdlog::info("BrickStore::buildBrickOccupancy empty bc=({}, {}, {})", bc.x, bc.y, bc.z);
             }
         }
         outOcc.clear();
