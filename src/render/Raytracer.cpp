@@ -8,8 +8,19 @@
 #include <string>
 #include <algorithm>
 #include <numeric>
+#include <cctype>
 
 namespace render {
+
+namespace {
+constexpr uint32_t kOverlayMaxCols = 64u;
+constexpr uint32_t kOverlayMaxRows = 12u;
+constexpr uint32_t kOverlayFontWidth = 6u;
+constexpr uint32_t kOverlayFontHeight = 8u;
+constexpr uint32_t kOverlayPadX = 1u;
+constexpr uint32_t kOverlayPadY = 1u;
+constexpr VkDeviceSize kOverlayBufferBytes = (4u + kOverlayMaxCols * kOverlayMaxRows) * sizeof(uint32_t);
+}
 
 static uint32_t findMemoryType(VkPhysicalDevice phys, uint32_t typeBits, VkMemoryPropertyFlags req) {
     VkPhysicalDeviceMemoryProperties mp{}; vkGetPhysicalDeviceMemoryProperties(phys, &mp);
@@ -323,9 +334,11 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     VkDescriptorSetLayoutBinding bMatIdx{ }; bMatIdx.binding=23; bMatIdx.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bMatIdx.descriptorCount=1; bMatIdx.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bMatTable{ }; bMatTable.binding=24; bMatTable.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bMatTable.descriptorCount=1; bMatTable.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bPalette{ }; bPalette.binding=25; bPalette.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bPalette.descriptorCount=1; bPalette.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutBinding bindings[26] = { bUbo, bAcc, bOut, bBH, bOcc, bHK, bHV, bMK, bMV, bDBG, bRayQ, bHitQ, bMissQ, bSecQ, bStats, bMotion, bHistRead, bHistWrite, bAlbedo, bNormal, bMoments, bHistMomentsRead, bHistMomentsWrite, bMatIdx, bMatTable, bPalette };
+    VkDescriptorSetLayoutBinding bOverlayBuf{}; bOverlayBuf.binding=26; bOverlayBuf.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bOverlayBuf.descriptorCount=1; bOverlayBuf.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding bOverlayImage{}; bOverlayImage.binding=27; bOverlayImage.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bOverlayImage.descriptorCount=1; bOverlayImage.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding bindings[28] = { bUbo, bAcc, bOut, bBH, bOcc, bHK, bHV, bMK, bMV, bDBG, bRayQ, bHitQ, bMissQ, bSecQ, bStats, bMotion, bHistRead, bHistWrite, bAlbedo, bNormal, bMoments, bHistMomentsRead, bHistMomentsWrite, bMatIdx, bMatTable, bPalette, bOverlayBuf, bOverlayImage };
     VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    dslci.bindingCount=26; dslci.pBindings=bindings;
+    dslci.bindingCount=28; dslci.pBindings=bindings;
     if (vkCreateDescriptorSetLayout(vk.device(), &dslci, nullptr, &setLayout_) != VK_SUCCESS) return false;
     VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     plci.setLayoutCount=1; plci.pSetLayouts=&setLayout_;
@@ -352,7 +365,8 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     VkShaderModule smTemporal = loadShader("denoise_atrous.comp.spv");
     VkShaderModule smTrav  = loadShader("traverse_bricks.comp.spv");
     VkShaderModule smComp  = loadShader("composite.comp.spv");
-    if (!smGen || !smShade || !smTemporal || !smTrav || !smComp) return false;
+    VkShaderModule smOverlay = loadShader("overlay.comp.spv");
+    if (!smGen || !smShade || !smTemporal || !smTrav || !smComp || !smOverlay) return false;
     VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
     VkPipelineShaderStageCreateInfo ss{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
     ss.stage = VK_SHADER_STAGE_COMPUTE_BIT; ss.pName = "main"; cpci.layout = pipeLayout_;
@@ -362,11 +376,14 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     ss.module = smTrav;  cpci.stage = ss; if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeTraverse_) != VK_SUCCESS) return false;
     ss.module = smComp;  cpci.stage = ss;
     if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeComposite_) != VK_SUCCESS) return false;
+    ss.module = smOverlay; cpci.stage = ss;
+    if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeOverlay_) != VK_SUCCESS) return false;
     vkDestroyShaderModule(vk.device(), smGen, nullptr);
     vkDestroyShaderModule(vk.device(), smShade, nullptr);
     vkDestroyShaderModule(vk.device(), smTemporal, nullptr);
     vkDestroyShaderModule(vk.device(), smTrav, nullptr);
     vkDestroyShaderModule(vk.device(), smComp, nullptr);
+    vkDestroyShaderModule(vk.device(), smOverlay, nullptr);
     return true;
 }
 
@@ -376,6 +393,7 @@ void Raytracer::destroyPipelines(platform::VulkanContext& vk) {
     if (pipeShade_) { vkDestroyPipeline(vk.device(), pipeShade_, nullptr); pipeShade_ = VK_NULL_HANDLE; }
     if (pipeTraverse_) { vkDestroyPipeline(vk.device(), pipeTraverse_, nullptr); pipeTraverse_ = VK_NULL_HANDLE; }
     if (pipeGenerate_) { vkDestroyPipeline(vk.device(), pipeGenerate_, nullptr); pipeGenerate_ = VK_NULL_HANDLE; }
+    if (pipeOverlay_) { vkDestroyPipeline(vk.device(), pipeOverlay_, nullptr); pipeOverlay_ = VK_NULL_HANDLE; }
     if (pipeLayout_) { vkDestroyPipelineLayout(vk.device(), pipeLayout_, nullptr); pipeLayout_ = VK_NULL_HANDLE; }
     if (setLayout_) { vkDestroyDescriptorSetLayout(vk.device(), setLayout_, nullptr); setLayout_ = VK_NULL_HANDLE; }
 }
@@ -383,8 +401,8 @@ void Raytracer::destroyPipelines(platform::VulkanContext& vk) {
 bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapchain& swap) {
     VkDescriptorPoolSize sizes[3] = {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,  swap.imageCount() },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,   10u * swap.imageCount() },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  15u * swap.imageCount() }
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,   12u * swap.imageCount() },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  18u * swap.imageCount() }
     };
     VkDescriptorPoolCreateInfo dpci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     dpci.maxSets = swap.imageCount(); dpci.poolSizeCount = 3; dpci.pPoolSizes = sizes;
@@ -420,6 +438,22 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
     if (!createQueues(vk)) return false;
     if (!createStatsBuffer(vk)) return false;
     if (!createProfilingResources(vk)) return false;
+    VkBufferCreateInfo bover{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bover.size = kOverlayBufferBytes;
+    bover.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if (vkCreateBuffer(vk.device(), &bover, nullptr, &overlayBuf_) != VK_SUCCESS) return false;
+    VkMemoryRequirements mro{}; vkGetBufferMemoryRequirements(vk.device(), overlayBuf_, &mro);
+    uint32_t typeIndexOverlay = findMemoryType(vk.physicalDevice(), mro.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkMemoryAllocateInfo maio{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO }; maio.allocationSize = mro.size; maio.memoryTypeIndex = typeIndexOverlay;
+    if (vkAllocateMemory(vk.device(), &maio, nullptr, &overlayMem_) != VK_SUCCESS) return false;
+    vkBindBufferMemory(vk.device(), overlayBuf_, overlayMem_, 0);
+    overlayCapacity_ = mro.size;
+    overlayActive_ = false;
+    void* overlayInit = nullptr;
+    if (vkMapMemory(vk.device(), overlayMem_, 0, overlayCapacity_, 0, &overlayInit) == VK_SUCCESS && overlayInit) {
+        std::memset(overlayInit, 0, static_cast<size_t>(overlayCapacity_));
+        vkUnmapMemory(vk.device(), overlayMem_);
+    }
     if (matIdxBuf_.buffer == VK_NULL_HANDLE) {
         if (!ensureBuffer(vk, matIdxBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) return false;
     }
@@ -452,8 +486,10 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
         VkDescriptorBufferInfo dbMatIdx{ matIdxBuf_.buffer, 0, matIdxBuf_.size > 0 ? matIdxBuf_.size : VK_WHOLE_SIZE };
         VkDescriptorBufferInfo dbMatTable{ materialTableBuf_.buffer, 0, materialTableBuf_.size > 0 ? materialTableBuf_.size : VK_WHOLE_SIZE };
         VkDescriptorBufferInfo dbPalette{ paletteBuf_.buffer, 0, paletteBuf_.size > 0 ? paletteBuf_.size : VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo dbOverlay{ overlayBuf_, 0, overlayCapacity_ ? overlayCapacity_ : VK_WHOLE_SIZE };
+        VkDescriptorImageInfo diOverlay{}; diOverlay.imageView = swap.imageViews()[i]; diOverlay.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet writes[20]{};
+        VkWriteDescriptorSet writes[22]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[0].dstSet = sets_[i]; writes[0].dstBinding=0; writes[0].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; writes[0].descriptorCount=1; writes[0].pBufferInfo=&db;
         writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[1].dstSet = sets_[i]; writes[1].dstBinding=1; writes[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[1].descriptorCount=1; writes[1].pImageInfo=&diCurr;
         writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[2].dstSet = sets_[i]; writes[2].dstBinding=2; writes[2].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[2].descriptorCount=1; writes[2].pImageInfo=&diOut;
@@ -474,7 +510,10 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
         writes[17].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[17].dstSet=sets_[i]; writes[17].dstBinding=23; writes[17].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[17].descriptorCount=1; writes[17].pBufferInfo=&dbMatIdx;
         writes[18].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[18].dstSet=sets_[i]; writes[18].dstBinding=24; writes[18].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[18].descriptorCount=1; writes[18].pBufferInfo=&dbMatTable;
         writes[19].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[19].dstSet=sets_[i]; writes[19].dstBinding=25; writes[19].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[19].descriptorCount=1; writes[19].pBufferInfo=&dbPalette;
-        vkUpdateDescriptorSets(vk.device(), 20, writes, 0, nullptr);
+        writes[20].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[20].dstSet=sets_[i]; writes[20].dstBinding=26; writes[20].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[20].descriptorCount=1; writes[20].pBufferInfo=&dbOverlay;
+        writes[21].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[21].dstSet=sets_[i]; writes[21].dstBinding=27; writes[21].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[21].descriptorCount=1; writes[21].pImageInfo=&diOverlay;
+        uint32_t writeCount = static_cast<uint32_t>(sizeof(writes) / sizeof(writes[0]));
+        vkUpdateDescriptorSets(vk.device(), writeCount, writes, 0, nullptr);
     }
     descriptorsReady_ = true;
     refreshWorldDescriptors(vk);
@@ -489,6 +528,11 @@ void Raytracer::destroyDescriptors(platform::VulkanContext& vk) {
     if (uboMem_) { vkFreeMemory(vk.device(), uboMem_, nullptr); uboMem_ = VK_NULL_HANDLE; }
     if (dbgBuf_) { vkDestroyBuffer(vk.device(), dbgBuf_, nullptr); dbgBuf_ = VK_NULL_HANDLE; }
     if (dbgMem_) { vkFreeMemory(vk.device(), dbgMem_, nullptr); dbgMem_ = VK_NULL_HANDLE; }
+    if (overlayBuf_) { vkDestroyBuffer(vk.device(), overlayBuf_, nullptr); overlayBuf_ = VK_NULL_HANDLE; }
+    if (overlayMem_) { vkFreeMemory(vk.device(), overlayMem_, nullptr); overlayMem_ = VK_NULL_HANDLE; overlayCapacity_ = 0; }
+    overlayActive_ = false;
+    overlayCharsX_ = overlayCharsY_ = 0;
+    overlayPixelWidth_ = overlayPixelHeight_ = 0;
     if (descPool_) { vkDestroyDescriptorPool(vk.device(), descPool_, nullptr); descPool_ = VK_NULL_HANDLE; }
     sets_.clear();
     descriptorsReady_ = false;
@@ -515,17 +559,8 @@ bool Raytracer::createWorld(platform::VulkanContext& vk) {
     worldSeed_ = 1337u;
     store.configure(P, /*voxelSize*/0.5f, /*brickDim*/VOXEL_BRICK_SIZE, noiseParams_, worldSeed_);
 
-    std::vector<glm::ivec3> initialCoords;
-    world::CpuWorld cpu = store.buildCpuWorld(initialCoords);
-    if (!uploadWorld(vk, cpu)) return false;
-    currentSelectionCoords_.clear();
-    currentSelectionCoords_.reserve(cpu.headers.size());
-    for (const auto& h : cpu.headers) {
-        currentSelectionCoords_.emplace_back(h.bx, h.by, h.bz);
-    }
-
-    spdlog::info("Initial world bricks: {} ({} MiB occupancy)",
-                 cpu.headers.size(), double(cpu.occWords.size() * sizeof(uint64_t)) / (1024.0 * 1024.0));
+    aggregateWorld_ = {};
+    spdlog::info("Initial world bricks: 0 (0 MiB occupancy)");
     return true;
 }
 
@@ -576,12 +611,113 @@ bool Raytracer::uploadWorld(platform::VulkanContext& vk, const world::CpuWorld& 
     return true;
 }
 
-bool Raytracer::commitWorldSubset(platform::VulkanContext& vk, const world::CpuWorld& cpu, const std::vector<glm::ivec3>& coords) {
-    if (!uploadWorld(vk, cpu)) return false;
-    currentSelectionCoords_ = coords;
-    historyReadIndex_ = 0;
-    historyWriteIndex_ = 1;
-    historyInitialized_ = false;
+namespace {
+void buildHash(world::CpuWorld& world);
+void buildMacroHash(world::CpuWorld& world, uint32_t macroDimBricks);
+}
+
+uint64_t Raytracer::packRegionKey(const glm::ivec3& coord) {
+    const uint64_t B = 1ull << 20;
+    return (static_cast<uint64_t>(coord.x + static_cast<int>(B)) << 42) |
+           (static_cast<uint64_t>(coord.y + static_cast<int>(B)) << 21) |
+            static_cast<uint64_t>(coord.z + static_cast<int>(B));
+}
+
+bool Raytracer::addRegion(platform::VulkanContext& vk, const glm::ivec3& regionCoord, world::CpuWorld&& cpu) {
+    uint64_t key = packRegionKey(regionCoord);
+    regionWorlds_[key] = std::move(cpu);
+    bool rebuilt = rebuildGpuWorld(vk);
+    if (rebuilt) {
+        historyReadIndex_ = 0;
+        historyWriteIndex_ = 1;
+        historyInitialized_ = false;
+    }
+    return rebuilt;
+}
+
+bool Raytracer::removeRegion(platform::VulkanContext& vk, const glm::ivec3& regionCoord) {
+    uint64_t key = packRegionKey(regionCoord);
+    auto it = regionWorlds_.find(key);
+    if (it == regionWorlds_.end()) {
+        return true; // nothing to remove
+    }
+    regionWorlds_.erase(it);
+    bool rebuilt = rebuildGpuWorld(vk);
+    if (rebuilt) {
+        historyReadIndex_ = 0;
+        historyWriteIndex_ = 1;
+        historyInitialized_ = false;
+    }
+    return rebuilt;
+}
+
+bool Raytracer::rebuildGpuWorld(platform::VulkanContext& vk) {
+    if (regionWorlds_.empty()) {
+        destroyWorld(vk);
+        aggregateWorld_ = {};
+        return true;
+    }
+
+    world::CpuWorld combined;
+
+    size_t totalHeaders = 0;
+    size_t totalOcc = 0;
+    size_t totalMatIdx = 0;
+    size_t totalPalettes = 0;
+    for (const auto& entry : regionWorlds_) {
+        const world::CpuWorld& cpu = entry.second;
+        totalHeaders += cpu.headers.size();
+        totalOcc += cpu.occWords.size();
+        totalMatIdx += cpu.materialIndices.size();
+        totalPalettes += cpu.palettes.size();
+        if (combined.materialTable.empty() && !cpu.materialTable.empty()) {
+            combined.materialTable = cpu.materialTable;
+        }
+    }
+
+    combined.headers.reserve(totalHeaders);
+    combined.occWords.reserve(totalOcc);
+    combined.materialIndices.reserve(totalMatIdx);
+    combined.palettes.reserve(totalPalettes);
+
+    for (const auto& entry : regionWorlds_) {
+        const world::CpuWorld& cpu = entry.second;
+        if (cpu.headers.empty()) {
+            continue;
+        }
+
+        size_t headerStart = combined.headers.size();
+        size_t occStart = combined.occWords.size();
+        size_t matStart = combined.materialIndices.size();
+        size_t paletteStart = combined.palettes.size();
+
+        combined.headers.insert(combined.headers.end(), cpu.headers.begin(), cpu.headers.end());
+        combined.occWords.insert(combined.occWords.end(), cpu.occWords.begin(), cpu.occWords.end());
+        combined.materialIndices.insert(combined.materialIndices.end(), cpu.materialIndices.begin(), cpu.materialIndices.end());
+        combined.palettes.insert(combined.palettes.end(), cpu.palettes.begin(), cpu.palettes.end());
+
+        uint32_t occOffsetBytes = static_cast<uint32_t>(occStart * sizeof(uint64_t));
+        uint32_t matOffsetBytes = static_cast<uint32_t>(matStart * sizeof(uint32_t));
+        uint32_t paletteOffsetBytes = static_cast<uint32_t>(paletteStart * sizeof(uint32_t));
+
+        for (size_t i = 0; i < cpu.headers.size(); ++i) {
+            world::BrickHeader& h = combined.headers[headerStart + i];
+            h.occOffset += occOffsetBytes;
+            h.matIdxOffset += matOffsetBytes;
+            if (h.paletteOffset != world::kInvalidOffset) {
+                h.paletteOffset += paletteOffsetBytes;
+            }
+        }
+    }
+
+    buildHash(combined);
+    buildMacroHash(combined, 8);
+
+    if (!uploadWorld(vk, combined)) {
+        return false;
+    }
+
+    aggregateWorld_ = std::move(combined);
     return true;
 }
 
@@ -605,6 +741,8 @@ void Raytracer::destroyWorld(platform::VulkanContext& vk) {
     macroDimBricks_ = 0;
     materialCount_ = 0;
     markWorldDescriptorsDirty();
+    aggregateWorld_ = {};
+    regionWorlds_.clear();
 }
 
 namespace {
@@ -612,6 +750,82 @@ constexpr VkDeviceSize kQueueHeaderBytes = sizeof(uint32_t) * 4;
 constexpr VkDeviceSize kRayPayloadBytes  = 80;
 constexpr VkDeviceSize kHitPayloadBytes  = 96;
 constexpr VkDeviceSize kMissPayloadBytes = 80;
+
+void buildHash(world::CpuWorld& world) {
+    const size_t n = world.headers.size();
+    uint32_t cap = 1u;
+    while (cap < n * 2u) cap <<= 1u;
+    if (cap < 8u) cap = 8u;
+    world.hashKeys.assign(cap, 0ull);
+    world.hashVals.assign(cap, 0u);
+
+    auto put = [&](uint64_t key, uint32_t val) {
+        const uint32_t mask = cap - 1u;
+        uint32_t h = static_cast<uint32_t>(((key ^ (key >> 33)) * 0xff51afd7ed558ccdULL) >> 32) & mask;
+        for (uint32_t probe = 0; probe < cap; ++probe) {
+            uint32_t idx = (h + probe) & mask;
+            if (world.hashKeys[idx] == 0ull) {
+                world.hashKeys[idx] = key;
+                world.hashVals[idx] = val;
+                return;
+            }
+        }
+    };
+
+    for (uint32_t i = 0; i < world.headers.size(); ++i) {
+        const auto& h = world.headers[i];
+        const uint64_t B = 1ull << 20;
+        uint64_t key = ((uint64_t)(h.bx + (int)B) << 42) |
+                       ((uint64_t)(h.by + (int)B) << 21) |
+                        (uint64_t)(h.bz + (int)B);
+        put(key, i);
+    }
+    world.hashCapacity = cap;
+}
+
+void buildMacroHash(world::CpuWorld& world, uint32_t macroDimBricks) {
+    world.macroDimBricks = macroDimBricks;
+    std::vector<uint64_t> unique;
+    unique.reserve(world.headers.size());
+    const auto divFloor = [](int a, int b) {
+        int q = a / b;
+        int r = a - q * b;
+        if (((a ^ b) < 0) && r != 0) --q;
+        return q;
+    };
+    for (const auto& h : world.headers) {
+        int mx = divFloor(h.bx, static_cast<int>(macroDimBricks));
+        int my = divFloor(h.by, static_cast<int>(macroDimBricks));
+        int mz = divFloor(h.bz, static_cast<int>(macroDimBricks));
+        const uint64_t B = 1ull << 20;
+        unique.push_back(((uint64_t)(mx + (int)B) << 42) |
+                         ((uint64_t)(my + (int)B) << 21) |
+                          (uint64_t)(mz + (int)B));
+    }
+    std::sort(unique.begin(), unique.end());
+    unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+    uint32_t cap = 1u;
+    while (cap < unique.size() * 2u) cap <<= 1u;
+    if (cap < 8u) cap = 8u;
+    world.macroKeys.assign(cap, 0ull);
+    world.macroVals.assign(cap, 0u);
+    auto put = [&](uint64_t key, uint32_t val) {
+        const uint32_t mask = cap - 1u;
+        uint64_t kx = key ^ (key >> 33);
+        const uint64_t A = 0xff51afd7ed558ccdULL;
+        uint32_t h = static_cast<uint32_t>((kx * A) >> 32) & mask;
+        for (uint32_t probe = 0; probe < cap; ++probe) {
+            uint32_t idx = (h + probe) & mask;
+            if (world.macroKeys[idx] == 0ull) {
+                world.macroKeys[idx] = key;
+                world.macroVals[idx] = val;
+                return;
+            }
+        }
+    };
+    for (auto key : unique) put(key, 1u);
+    world.macroCapacity = cap;
+}
 
 uint32_t nextPow2(uint32_t v) {
     if (v <= 1u) return 1u;
@@ -729,7 +943,9 @@ void Raytracer::updateFrameDescriptors(platform::VulkanContext& vk, platform::Sw
     VkDescriptorImageInfo diHistMomentsRead{ VK_NULL_HANDLE, historyMoments_[historyReadIndex_].view, VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo diHistMomentsWrite{ VK_NULL_HANDLE, historyMoments_[historyWriteIndex_].view, VK_IMAGE_LAYOUT_GENERAL };
 
-    std::array<VkWriteDescriptorSet, 7> writes{};
+    VkDescriptorImageInfo diOverlay{ VK_NULL_HANDLE, swap.imageViews()[swapIndex], VK_IMAGE_LAYOUT_GENERAL };
+
+    std::array<VkWriteDescriptorSet, 8> writes{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = sets_[swapIndex];
     writes[0].dstBinding = 1;
@@ -778,6 +994,13 @@ void Raytracer::updateFrameDescriptors(platform::VulkanContext& vk, platform::Sw
     writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     writes[6].descriptorCount = 1;
     writes[6].pImageInfo = &diHistMomentsWrite;
+
+    writes[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[7].dstSet = sets_[swapIndex];
+    writes[7].dstBinding = 27;
+    writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[7].descriptorCount = 1;
+    writes[7].pImageInfo = &diOverlay;
 
     vkUpdateDescriptorSets(vk.device(), static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -975,6 +1198,124 @@ void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, V
     // Debug readback moved to readDebug(), called after submit/present to ensure GPU wrote the data.
 }
 
+void Raytracer::recordOverlay(VkCommandBuffer cb, uint32_t swapIndex) {
+    if (!overlayActive_ || overlayPixelWidth_ == 0 || overlayPixelHeight_ == 0 || pipeOverlay_ == VK_NULL_HANDLE) {
+        return;
+    }
+    if (swapIndex >= sets_.size()) {
+        return;
+    }
+    VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cb, &dep);
+    uint32_t groupsX = (overlayPixelWidth_ + 7u) / 8u;
+    uint32_t groupsY = (overlayPixelHeight_ + 7u) / 8u;
+    if (groupsX == 0u || groupsY == 0u) {
+        return;
+    }
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeOverlay_);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_, 0, 1, &sets_[swapIndex], 0, nullptr);
+    vkCmdDispatch(cb, groupsX, groupsY, 1);
+}
+
+std::array<double, 4> Raytracer::gpuTimingsMs() const {
+    return { gpuTimingsMs_[0], gpuTimingsMs_[1], gpuTimingsMs_[2], gpuTimingsMs_[3] };
+}
+
+void Raytracer::updateOverlayHUD(platform::VulkanContext& vk, const std::vector<std::string>& lines) {
+    overlayCharsX_ = 0;
+    overlayCharsY_ = 0;
+    overlayPixelWidth_ = 0;
+    overlayPixelHeight_ = 0;
+    overlayActive_ = false;
+
+    if (!overlayBuf_ || !overlayMem_) {
+        return;
+    }
+
+    const uint32_t maxRows = kOverlayMaxRows;
+    const uint32_t maxCols = kOverlayMaxCols;
+    uint32_t rows = std::min<uint32_t>(lines.size(), maxRows);
+    if (rows == 0u) {
+        void* mapped = nullptr;
+        if (vkMapMemory(vk.device(), overlayMem_, 0, overlayCapacity_, 0, &mapped) == VK_SUCCESS && mapped) {
+            std::memset(mapped, 0, static_cast<size_t>(overlayCapacity_));
+            vkUnmapMemory(vk.device(), overlayMem_);
+        }
+        return;
+    }
+
+    std::vector<std::string> sanitized;
+    sanitized.reserve(rows);
+    uint32_t width = 0;
+    for (uint32_t i = 0; i < rows; ++i) {
+        const std::string& line = lines[i];
+        std::string clean;
+        clean.reserve(maxCols);
+        for (char ch : line) {
+            if (clean.size() >= maxCols) break;
+            unsigned char uc = static_cast<unsigned char>(ch);
+            if (uc < 32u || uc > 126u) {
+                uc = ' ';
+            }
+            uc = static_cast<unsigned char>(std::toupper(static_cast<int>(uc)));
+            clean.push_back(static_cast<char>(uc));
+        }
+        while (!clean.empty() && clean.back() == ' ') {
+            clean.pop_back();
+        }
+        sanitized.emplace_back(std::move(clean));
+        width = std::max(width, static_cast<uint32_t>(sanitized.back().size()));
+    }
+
+    if (width == 0u) {
+        void* mapped = nullptr;
+        if (vkMapMemory(vk.device(), overlayMem_, 0, overlayCapacity_, 0, &mapped) == VK_SUCCESS && mapped) {
+            std::memset(mapped, 0, static_cast<size_t>(overlayCapacity_));
+            vkUnmapMemory(vk.device(), overlayMem_);
+        }
+        return;
+    }
+
+    uint32_t stride = width;
+    uint32_t totalCells = stride * rows;
+    std::vector<uint32_t> payload(4u + totalCells, 0u);
+    payload[0] = width;
+    payload[1] = rows;
+    payload[2] = stride;
+    payload[3] = totalCells;
+    for (uint32_t r = 0; r < rows; ++r) {
+        const std::string& line = sanitized[r];
+        for (uint32_t c = 0; c < stride; ++c) {
+            unsigned char ch = (c < line.size()) ? static_cast<unsigned char>(line[c]) : static_cast<unsigned char>(' ');
+            payload[4u + r * stride + c] = static_cast<uint32_t>(ch);
+        }
+    }
+
+    VkDeviceSize bytes = static_cast<VkDeviceSize>(payload.size() * sizeof(uint32_t));
+    bytes = std::min<VkDeviceSize>(bytes, overlayCapacity_);
+    void* mapped = nullptr;
+    bool wrote = false;
+    if (vkMapMemory(vk.device(), overlayMem_, 0, overlayCapacity_, 0, &mapped) == VK_SUCCESS && mapped) {
+        std::memset(mapped, 0, static_cast<size_t>(overlayCapacity_));
+        std::memcpy(mapped, payload.data(), static_cast<size_t>(bytes));
+        vkUnmapMemory(vk.device(), overlayMem_);
+        wrote = true;
+    }
+
+    overlayCharsX_ = wrote ? width : 0u;
+    overlayCharsY_ = wrote ? rows : 0u;
+    overlayPixelWidth_ = wrote ? width * (kOverlayFontWidth + kOverlayPadX) : 0u;
+    overlayPixelHeight_ = wrote ? rows * (kOverlayFontHeight + kOverlayPadY) : 0u;
+    overlayActive_ = wrote;
+}
+
 void Raytracer::readDebug(platform::VulkanContext& vk, uint32_t frameIdx) {
     // Poll infrequently and debounce identical frames to avoid log spam.
     // Temporarily read back every frame for profiling
@@ -1082,11 +1423,7 @@ void Raytracer::readDebug(platform::VulkanContext& vk, uint32_t frameIdx) {
             gpuTimingsMs_[1] = diffMs(2, 3);
             gpuTimingsMs_[2] = diffMs(4, 5);
             gpuTimingsMs_[3] = diffMs(6, 7);
-            if ((frameIdx % 60u) == 0u) {
-                spdlog::info("GPU timings (ms): generate={:.3f} traverse={:.3f} shade={:.3f} composite={:.3f}",
-                             gpuTimingsMs_[0], gpuTimingsMs_[1], gpuTimingsMs_[2], gpuTimingsMs_[3]);
-                lastTimingFrame_ = frameIdx;
-            }
+            lastTimingFrame_ = frameIdx;
         }
     }
 
@@ -1113,7 +1450,6 @@ void Raytracer::shutdown(platform::VulkanContext& vk) {
     destroyWorld(vk);
     uploadCtx_.shutdown();
     brickStore_.reset();
-    currentSelectionCoords_.clear();
 }
 
 }

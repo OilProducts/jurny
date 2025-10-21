@@ -13,10 +13,14 @@
 #include <cstdlib>
 #include <chrono>
 #include <cmath>
+#include <sstream>
+#include <iomanip>
 #include <glm/glm.hpp>
+#include <glm/geometric.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <spdlog/spdlog.h>
 #include "math/Spherical.h"
+#include "core/FrameGraph.h"
 #include "core/Jobs.h"
 #include "world/Streaming.h"
 #include <atomic>
@@ -55,17 +59,7 @@ int App::run() {
     core::Jobs jobs;
     jobs.start();
     world::Streaming streaming;
-    std::vector<glm::ivec3> currentGpuSelection;
-    struct PendingUpload {
-        std::atomic<bool> jobRunning{false};
-        std::atomic<bool> ready{false};
-        std::atomic<bool> cancel{false};
-        std::mutex mutex;
-        std::vector<glm::ivec3> selection;
-        std::vector<glm::ivec3> toUpload;
-        std::vector<glm::ivec3> toDrop;
-        world::CpuWorld cpu;
-    } pending;
+    core::FrameGraph frameGraph;
 
     // Shell-visualization compute pipeline (UBO + storage image)
     VkDescriptorSetLayoutBinding bUbo{}; bUbo.binding = 0; bUbo.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; bUbo.descriptorCount = 1; bUbo.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -155,10 +149,14 @@ int App::run() {
         world::Streaming::Config streamCfg;
         streamCfg.shellInner = planetRadius - 25.0f;
         streamCfg.shellOuter = planetRadius + 75.0f;
+        streamCfg.shellInner = 0.0f; // use planet defaults from store
+        streamCfg.shellOuter = 0.0f;
         streamCfg.keepRadius = 70.0f;
         streamCfg.loadRadius = 110.0f;
-        streamCfg.simRadius  = 90.0f;
+        streamCfg.simRadius  = 80.0f;
         streamCfg.regionDimBricks = 16;
+        streamCfg.maxRegionSelectionsPerFrame = 4;
+        streamCfg.maxConcurrentGenerations = std::max(2, static_cast<int>(jobs.workerCount()));
         streaming.initialize(*store, streamCfg, &jobs);
         spdlog::debug("Streaming initialized");
     } else {
@@ -183,31 +181,46 @@ int App::run() {
     glfwSetInputMode(window.handle(), GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 #endif
     while (!window.shouldClose()) {
-        window.poll(); uint32_t idx=0; if (vkAcquireNextImageKHR(vk.device(), swap.handle(), UINT64_MAX, acquireSem, VK_NULL_HANDLE, &idx) != VK_SUCCESS) break;
+        window.poll();
+        uint32_t idx = 0;
+        VkResult acquireRes = vkAcquireNextImageKHR(vk.device(), swap.handle(), UINT64_MAX, acquireSem, VK_NULL_HANDLE, &idx);
+        if (acquireRes != VK_SUCCESS) {
+            break;
+        }
+
+        frameGraph.beginFrame();
+
 #if VOXEL_ENABLE_WINDOW
+        if (glfwGetKey(window.handle(), GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+            frameGraph.endFrame();
+            break;
+        }
+
         if (glfwGetKey(window.handle(), GLFW_KEY_V) == GLFW_PRESS) useShell = true;
         if (glfwGetKey(window.handle(), GLFW_KEY_B) == GLFW_PRESS) useShell = false;
-        if (glfwGetKey(window.handle(), GLFW_KEY_1) == GLFW_PRESS) { debugFlags = 1u; }   // probe overlay (red)
-        if (glfwGetKey(window.handle(), GLFW_KEY_2) == GLFW_PRESS) { debugFlags = 2u; }   // coarse DDA overlay (yellow)
-        if (glfwGetKey(window.handle(), GLFW_KEY_3) == GLFW_PRESS) { debugFlags = 4u; }   // shade at first brick hit
-        if (glfwGetKey(window.handle(), GLFW_KEY_4) == GLFW_PRESS) { debugFlags = 16u; }  // macro presence overlay
+        if (glfwGetKey(window.handle(), GLFW_KEY_1) == GLFW_PRESS) { debugFlags = 1u; }
+        if (glfwGetKey(window.handle(), GLFW_KEY_2) == GLFW_PRESS) { debugFlags = 2u; }
+        if (glfwGetKey(window.handle(), GLFW_KEY_3) == GLFW_PRESS) { debugFlags = 4u; }
+        if (glfwGetKey(window.handle(), GLFW_KEY_4) == GLFW_PRESS) { debugFlags = 16u; }
+        if (glfwGetKey(window.handle(), GLFW_KEY_0) == GLFW_PRESS) debugFlags = 0u;
         int mState = glfwGetKey(window.handle(), GLFW_KEY_M);
         bool mDown = (mState == GLFW_PRESS);
-        if (mDown && !mPrevDown) { debugFlags ^= 8u; spdlog::info("macro-skip {}", (debugFlags & 8u) ? "ON" : "OFF"); }
+        if (mDown && !mPrevDown) {
+            debugFlags ^= 8u;
+            spdlog::info("macro-skip {}", (debugFlags & 8u) ? "ON" : "OFF");
+        }
         mPrevDown = mDown;
-        if (glfwGetKey(window.handle(), GLFW_KEY_0) == GLFW_PRESS) debugFlags = 0u;   // disable debug overlays
 #endif
-        // Update UBO (orbit camera for eyeballing)
+
         GlobalsUBO data{};
         auto now = std::chrono::steady_clock::now();
         float dt = std::chrono::duration<float>(now - last).count();
         last = now;
-        const float R = planetRadius; // planet radius (200 m diameter)
+
+        const float R = planetRadius;
         glm::vec3 forward;
         glm::vec3 up(0.0f, 0.0f, 1.0f);
 #if VOXEL_ENABLE_WINDOW
-        if (glfwGetKey(window.handle(), GLFW_KEY_ESCAPE) == GLFW_PRESS) break;
-
         double mouseX, mouseY;
         glfwGetCursorPos(window.handle(), &mouseX, &mouseY);
         if (firstMouse) {
@@ -216,7 +229,7 @@ int App::run() {
             firstMouse = false;
         }
         double xoffset = mouseX - lastX;
-        double yoffset = mouseY - lastY; // inverted vertical look: move mouse up to pitch down
+        double yoffset = mouseY - lastY;
         lastX = mouseX;
         lastY = mouseY;
         const float sensitivity = 0.08f;
@@ -250,119 +263,54 @@ int App::run() {
 #else
         forward = glm::vec3(-1.0f, 0.0f, 0.0f);
 #endif
+
         glm::vec3 camPosF = glm::vec3(camWorld);
         streaming.update(camPosF, frameCounter);
+        const auto statsBefore = streaming.stats();
         if ((frameCounter % 120u) == 0u) {
-            const auto& st = streaming.stats();
-            spdlog::info("Streaming stats: keep={} load={} drop={} sim={}", st.keepCount, st.loadCount, st.dropCount, st.simCount);
+            spdlog::info("Streaming stats: selected={} queued={} building={} ready={}",
+                         statsBefore.selectedRegions, statsBefore.queuedRegions, statsBefore.buildingRegions, statsBefore.readyRegions);
         }
-        auto diff = streaming.collectSelectionDiff(currentGpuSelection);
-        bool selectionChanged = (diff.toUpload.size() || diff.toRemove.size());
-        if (selectionChanged) {
-            bool scheduled = pending.jobRunning.load(std::memory_order_acquire) || pending.ready.load(std::memory_order_acquire);
-            if (!scheduled) {
-                const auto* store = ray.worldStore();
-                if (store) {
-                    spdlog::info("Streaming job queued: target={} adds={} drops={} currentResident={}",
-                                 diff.target.size(), diff.toUpload.size(), diff.toRemove.size(), currentGpuSelection.size());
-                    pending.jobRunning.store(true, std::memory_order_release);
-                    pending.ready.store(false, std::memory_order_release);
-                    pending.cancel.store(false, std::memory_order_release);
-                    auto targetCopy = diff.target;
-                    auto addsCopy = diff.toUpload;
-                    auto dropsCopy = diff.toRemove;
-                    jobs.schedule([&, store,
-                                   selection = std::move(targetCopy),
-                                   adds = std::move(addsCopy),
-                                   drops = std::move(dropsCopy)]() mutable {
-                        if (pending.cancel.load(std::memory_order_acquire)) {
-                            pending.jobRunning.store(false, std::memory_order_release);
-                            return;
-                        }
-                        auto cpu = store->buildCpuWorld(selection, &pending.cancel);
-                        if (pending.cancel.load(std::memory_order_acquire)) {
-                            pending.jobRunning.store(false, std::memory_order_release);
-                            return;
-                        }
-                        std::vector<glm::ivec3> finalSelection;
-                        finalSelection.reserve(cpu.headers.size());
-                        for (const auto& h : cpu.headers) {
-                            finalSelection.emplace_back(h.bx, h.by, h.bz);
-                        }
-                        if (pending.cancel.load(std::memory_order_acquire)) {
-                            pending.jobRunning.store(false, std::memory_order_release);
-                            return;
-                        }
-                        auto contains = [&](const glm::ivec3& coord) {
-                            return std::binary_search(finalSelection.begin(), finalSelection.end(), coord, [](const glm::ivec3& a, const glm::ivec3& b){
-                                if (a.x != b.x) return a.x < b.x;
-                                if (a.y != b.y) return a.y < b.y;
-                                return a.z < b.z;
-                            });
-                        };
-                        std::vector<glm::ivec3> filteredAdds;
-                        filteredAdds.reserve(adds.size());
-                        std::sort(finalSelection.begin(), finalSelection.end(), [](const glm::ivec3& a, const glm::ivec3& b){
-                            if (a.x != b.x) return a.x < b.x;
-                            if (a.y != b.y) return a.y < b.y;
-                            return a.z < b.z;
-                        });
-                        if (pending.cancel.load(std::memory_order_acquire)) {
-                            pending.jobRunning.store(false, std::memory_order_release);
-                            return;
-                        }
-                        for (const auto& c : adds) {
-                            if (contains(c)) filteredAdds.push_back(c);
-                        }
-                        {
-                            std::lock_guard<std::mutex> lock(pending.mutex);
-                            pending.selection = std::move(finalSelection);
-                            pending.toUpload = std::move(filteredAdds);
-                            pending.toDrop = std::move(drops);
-                            pending.cpu = std::move(cpu);
-                        }
-                        spdlog::info("Streaming job completed (target bricks={})", pending.selection.size());
-                        pending.ready.store(true, std::memory_order_release);
-                        pending.jobRunning.store(false, std::memory_order_release);
-                    });
+
+        std::vector<world::Streaming::ReadyRegion> readyRegionsFrame;
+        world::Streaming::ReadyRegion readyRegion{};
+        while (streaming.popReadyRegion(readyRegion)) {
+            readyRegionsFrame.push_back(std::move(readyRegion));
+        }
+
+        if (!readyRegionsFrame.empty()) {
+            size_t uploadedRegions = 0;
+            size_t uploadedBricks = 0;
+            for (auto& region : readyRegionsFrame) {
+                const size_t bricksInRegion = region.bricks.headers.size();
+                if (ray.addRegion(vk, region.regionCoord, std::move(region.bricks))) {
+                    streaming.markRegionUploaded(region.regionCoord);
+                    uploadedRegions++;
+                    uploadedBricks += bricksInRegion;
                 }
+            }
+            if (uploadedRegions > 0) {
+                spdlog::info("Streaming commit applied: regions={} bricks={} (total resident={})",
+                             uploadedRegions,
+                             uploadedBricks,
+                             ray.brickCount());
             }
         }
 
-        if (pending.ready.load(std::memory_order_acquire) && !pending.cancel.load(std::memory_order_acquire)) {
-            std::vector<glm::ivec3> readySelection;
-            std::vector<glm::ivec3> readyAdds;
-            std::vector<glm::ivec3> readyDrops;
-            world::CpuWorld readyCpu;
-            {
-                std::lock_guard<std::mutex> lock(pending.mutex);
-                readySelection = std::move(pending.selection);
-                readyAdds = std::move(pending.toUpload);
-                readyDrops = std::move(pending.toDrop);
-                readyCpu = std::move(pending.cpu);
-                pending.selection.clear();
-                pending.toUpload.clear();
-                pending.toDrop.clear();
+        glm::ivec3 evictCoord;
+        while (streaming.popEvictedRegion(evictCoord)) {
+            if (ray.removeRegion(vk, evictCoord)) {
+                streaming.markRegionEvicted(evictCoord);
             }
-            if (pending.cancel.load(std::memory_order_acquire)) {
-                pending.ready.store(false, std::memory_order_release);
-                continue;
-            }
-            bool committed = ray.commitWorldSubset(vk, readyCpu, readySelection);
-            if (committed) {
-                currentGpuSelection = std::move(readySelection);
-                spdlog::info("Streaming commit applied: +{} / -{} bricks (resident={})",
-                             readyAdds.size(), readyDrops.size(), currentGpuSelection.size());
-            }
-            pending.ready.store(false, std::memory_order_release);
         }
+
         glm::mat4 V = glm::lookAt(camPosF, camPosF + forward, up);
-        float aspect = float(swap.extent().width)/float(swap.extent().height);
+        float aspect = float(swap.extent().width) / float(swap.extent().height);
         glm::mat4 P = glm::perspective(glm::radians(45.0f), aspect, 0.05f, 2000.0f);
-        std::memcpy(data.currView, &V[0][0], sizeof(float)*16);
-        std::memcpy(data.currProj, &P[0][0], sizeof(float)*16);
-        std::memcpy(data.prevView, &prevViewMat[0][0], sizeof(float)*16);
-        std::memcpy(data.prevProj, &prevProjMat[0][0], sizeof(float)*16);
+        std::memcpy(data.currView, &V[0][0], sizeof(float) * 16);
+        std::memcpy(data.currProj, &P[0][0], sizeof(float) * 16);
+        std::memcpy(data.prevView, &prevViewMat[0][0], sizeof(float) * 16);
+        std::memcpy(data.prevProj, &prevProjMat[0][0], sizeof(float) * 16);
         data.renderOrigin[0] = camPosF.x;
         data.renderOrigin[1] = camPosF.y;
         data.renderOrigin[2] = camPosF.z;
@@ -385,71 +333,193 @@ int App::run() {
         data.height = swap.extent().height;
         data.raysPerPixel = 1;
         data.flags = debugFlags;
-        void* mapped=nullptr; vkMapMemory(vk.device(), uboMem, 0, sizeof(GlobalsUBO), 0, &mapped);
+        void* mapped = nullptr;
+        vkMapMemory(vk.device(), uboMem, 0, sizeof(GlobalsUBO), 0, &mapped);
         std::memcpy(mapped, &data, sizeof(GlobalsUBO));
         vkUnmapMemory(vk.device(), uboMem);
+
+        uint32_t currentFrameIdx = data.frameIdx;
         ++frameCounter;
         prevViewMat = V;
         prevProjMat = P;
         prevRenderOrigin = camWorld;
 
-        // One-time debug logging for the center and a corner ray (first few frames only)
+        constexpr size_t kOverlayMaxCols = 64;
+        const auto statsOverlay = streaming.stats();
+        std::vector<std::string> overlayLines;
+        overlayLines.reserve(6);
+        float fps = (dt > 1e-4f) ? (1.0f / dt) : 0.0f;
+        float dtMs = dt * 1000.0f;
+        auto clampLine = [&](std::string line) {
+            if (line.size() > kOverlayMaxCols) {
+                line.resize(kOverlayMaxCols);
+            }
+            overlayLines.push_back(std::move(line));
+        };
+        {
+            std::ostringstream ss;
+            ss << std::fixed << std::setprecision(1)
+               << "FPS " << std::setw(6) << fps
+               << "  DT " << std::setw(6) << dtMs << "MS";
+            clampLine(ss.str());
+        }
+        {
+            auto timings = ray.gpuTimingsMs();
+            std::ostringstream ss;
+            ss << std::fixed << std::setprecision(2)
+               << "GPU MS G:" << std::setw(5) << timings[0]
+               << " T:" << std::setw(5) << timings[1]
+               << " S:" << std::setw(5) << timings[2]
+               << " C:" << std::setw(5) << timings[3];
+            clampLine(ss.str());
+        }
+        {
+            std::ostringstream ss;
+            ss << "BRICKS " << ray.brickCount()
+               << " REG " << ray.residentRegionCount()
+               << " READY " << statsOverlay.readyRegions
+               << " QUE " << statsOverlay.queuedRegions
+               << " BUILD " << statsOverlay.buildingRegions;
+            clampLine(ss.str());
+        }
+        {
+            double altitude = glm::length(camPosF) - double(planetRadius);
+            std::ostringstream ss;
+            ss << std::fixed << std::setprecision(1)
+               << "CAM X " << camPosF.x
+               << " Y " << camPosF.y
+               << " Z " << camPosF.z
+               << " ALT " << altitude;
+            clampLine(ss.str());
+        }
+        ray.updateOverlayHUD(vk, overlayLines);
+
         if (data.frameIdx < 3) {
             auto invV = glm::inverse(V);
             auto invP = glm::inverse(P);
-            auto makeRayCPU = [&](int px, int py){
+            auto makeRayCPU = [&](int px, int py) {
                 float w = float(swap.extent().width), h = float(swap.extent().height);
-                glm::vec2 uv = (glm::vec2(px + 0.5f, py + 0.5f)) / glm::vec2(w,h);
+                glm::vec2 uv = (glm::vec2(px + 0.5f, py + 0.5f)) / glm::vec2(w, h);
                 glm::vec2 ndc = glm::vec2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
                 glm::vec4 pView = invP * glm::vec4(ndc, 1.0f, 1.0f);
                 pView /= std::max(pView.w, 1e-6f);
-                glm::vec3 ro = glm::vec3(invV * glm::vec4(0,0,0,1));
+                glm::vec3 ro = glm::vec3(invV * glm::vec4(0, 0, 0, 1));
                 glm::vec3 dirWorld = glm::vec3(invV * glm::vec4(glm::normalize(glm::vec3(pView)), 0));
                 glm::vec3 rd = glm::normalize(dirWorld);
                 return std::pair<glm::vec3, glm::vec3>(ro, rd);
             };
-            auto [ro0, rd0] = makeRayCPU(swap.extent().width/2, swap.extent().height/2);
+            auto [ro0, rd0] = makeRayCPU(swap.extent().width / 2, swap.extent().height / 2);
             auto [ro1, rd1] = makeRayCPU(0, 0);
-            float tEnter=0, tExit=0;
+            float tEnter = 0, tExit = 0;
             bool hit = math::IntersectSphereShell(ro0, rd0, data.Rin, data.Rout, tEnter, tExit);
             spdlog::info("Extent={}x{} Rin={} Rout={} eye=({:.1f},{:.1f},{:.1f})",
                          swap.extent().width, swap.extent().height, data.Rin, data.Rout, camPosF.x, camPosF.y, camPosF.z);
             spdlog::info("Center ray ro=({:.1f},{:.1f},{:.1f}) rd=({:.3f},{:.3f},{:.3f}) hit={} t=[{:.1f},{:.1f}]",
-                         ro0.x, ro0.y, ro0.z, rd0.x, rd0.y, rd0.z, hit?1:0, tEnter, tExit);
+                         ro0.x, ro0.y, ro0.z, rd0.x, rd0.y, rd0.z, hit ? 1 : 0, tEnter, tExit);
             spdlog::info("Corner ray  ro=({:.1f},{:.1f},{:.1f}) rd=({:.3f},{:.3f},{:.3f})",
                          ro1.x, ro1.y, ro1.z, rd1.x, rd1.y, rd1.z);
             float dotDirs = glm::dot(rd0, rd1);
             spdlog::info("dot(center,corner)={:.3f} (expect < 1)", dotDirs);
         }
 
-        VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO }; vkBeginCommandBuffer(cb, &bi);
-        VkImageMemoryBarrier toGeneral{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        toGeneral.srcAccessMask = 0; toGeneral.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT; toGeneral.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR; toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL; toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; toGeneral.image = swap.image(idx); toGeneral.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; toGeneral.subresourceRange.levelCount = 1; toGeneral.subresourceRange.layerCount = 1;
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,nullptr, 0,nullptr, 1, &toGeneral);
-        if (useShell) {
-            // Dispatch the shell visualize pipeline (UBO already updated above)
-            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &sets[idx], 0, nullptr);
-            uint32_t gx = (swap.extent().width + 7u)/8u, gy = (swap.extent().height + 7u)/8u; vkCmdDispatch(cb, gx, gy, 1);
-        } else {
-            // Use Raytracer skeleton (shade sky -> composite)
-            render::GlobalsUBOData gd{};
-            std::memcpy(&gd, &data, sizeof(GlobalsUBO));
+        render::GlobalsUBOData gd = data;
+        if (!useShell) {
             ray.updateGlobals(vk, gd);
-            ray.record(vk, swap, cb, idx);
         }
-        VkImageMemoryBarrier toPresent{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        toPresent.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; toPresent.dstAccessMask = 0; toPresent.oldLayout = VK_IMAGE_LAYOUT_GENERAL; toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR; toPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; toPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; toPresent.image = swap.image(idx); toPresent.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; toPresent.subresourceRange.levelCount = 1; toPresent.subresourceRange.layerCount = 1;
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,nullptr, 0,nullptr, 1, &toPresent);
+
+        frameGraph.addPass("PrepareSwapImage", [&, idx](VkCommandBuffer cmd) {
+            VkImageMemoryBarrier barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = swap.image(idx);
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.layerCount = 1;
+            vkCmdPipelineBarrier(cmd,
+                                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0,
+                                 0, nullptr,
+                                 0, nullptr,
+                                 1, &barrier);
+        });
+
+        if (useShell) {
+            frameGraph.addPass("ShellVisualize", [&, idx](VkCommandBuffer cmd) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &sets[idx], 0, nullptr);
+                uint32_t gx = (swap.extent().width + 7u) / 8u;
+                uint32_t gy = (swap.extent().height + 7u) / 8u;
+                vkCmdDispatch(cmd, gx, gy, 1);
+            });
+        } else {
+            frameGraph.addPass("Raytrace", [&, idx](VkCommandBuffer cmd) {
+                ray.record(vk, swap, cmd, idx);
+            });
+        }
+
+        frameGraph.addPass("OverlayHUD", [&, idx](VkCommandBuffer cmd) {
+            ray.recordOverlay(cmd, idx);
+        });
+
+        frameGraph.addPass("TransitionToPresent", [&, idx](VkCommandBuffer cmd) {
+            VkImageMemoryBarrier barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.dstAccessMask = 0;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = swap.image(idx);
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.layerCount = 1;
+            vkCmdPipelineBarrier(cmd,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                 0,
+                                 0, nullptr,
+                                 0, nullptr,
+                                 1, &barrier);
+        });
+
+        VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        vkBeginCommandBuffer(cb, &bi);
+        frameGraph.execute(cb);
         vkEndCommandBuffer(cb);
-        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT; VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.waitSemaphoreCount=1; si.pWaitSemaphores=&acquireSem; si.pWaitDstStageMask=&waitStage; si.commandBufferCount=1; si.pCommandBuffers=&cb; si.signalSemaphoreCount=1; si.pSignalSemaphores=&finishSem; vkQueueSubmit(vk.graphicsQueue(), 1, &si, VK_NULL_HANDLE);
-        VkPresentInfoKHR pi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR }; VkSwapchainKHR sc=swap.handle(); pi.waitSemaphoreCount=1; pi.pWaitSemaphores=&finishSem; pi.swapchainCount=1; pi.pSwapchains=&sc; pi.pImageIndices=&idx; vkQueuePresentKHR(vk.graphicsQueue(), &pi); vkQueueWaitIdle(vk.graphicsQueue());
-        // After GPU work finishes, read debug buffer (every ~30 frames)
-        ray.readDebug(vk, data.frameIdx);
+
+        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        si.waitSemaphoreCount = 1;
+        si.pWaitSemaphores = &acquireSem;
+        si.pWaitDstStageMask = &waitStage;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cb;
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &finishSem;
+        vkQueueSubmit(vk.graphicsQueue(), 1, &si, VK_NULL_HANDLE);
+
+        VkPresentInfoKHR pi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+        VkSwapchainKHR sc = swap.handle();
+        pi.waitSemaphoreCount = 1;
+        pi.pWaitSemaphores = &finishSem;
+        pi.swapchainCount = 1;
+        pi.pSwapchains = &sc;
+        pi.pImageIndices = &idx;
+        vkQueuePresentKHR(vk.graphicsQueue(), &pi);
+        vkQueueWaitIdle(vk.graphicsQueue());
+
+        frameGraph.endFrame();
+
+        ray.readDebug(vk, currentFrameIdx);
     }
 
     vkDestroySemaphore(vk.device(), finishSem, nullptr); vkDestroySemaphore(vk.device(), acquireSem, nullptr);
-    pending.cancel.store(true, std::memory_order_release);
+    streaming.shutdown();
     jobs.stop();
     ray.shutdown(vk);
     vkDestroyPipeline(vk.device(), pipe, nullptr); vkDestroyShaderModule(vk.device(), sm, nullptr);

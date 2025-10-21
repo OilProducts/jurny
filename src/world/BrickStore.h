@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -47,16 +48,24 @@ public:
     const WorldGen& worldGen() const { return worldGen_; }
 
 private:
+    struct BrickPayload {
+        std::vector<uint64_t> occ;
+        std::vector<uint16_t> materials;
+    };
+
     static uint64_t packKey(int bx, int by, int bz);
     static void buildHash(CpuWorld& world);
     static void buildMacroHash(CpuWorld& world, uint32_t macroDimBricks);
-    bool buildBrickOccupancy(const glm::ivec3& bc,
-                             const math::PlanetParams& P,
-                             float voxelSize,
-                             int brickDim,
-                             float brickSize,
-                             std::vector<uint64_t>& outOcc,
-                             std::vector<uint16_t>& outMaterials) const;
+    bool computeBrickData(const glm::ivec3& bc,
+                          const math::PlanetParams& P,
+                          float voxelSize,
+                          int brickDim,
+                          float brickSize,
+                          std::vector<uint64_t>& outOcc,
+                          std::vector<uint16_t>& outMaterials) const;
+    bool acquireBrick(const glm::ivec3& bc,
+                      std::shared_ptr<const BrickPayload>& payload,
+                      std::atomic<bool>* cancel) const;
 
 private:
     int brickDim_ = 8;
@@ -66,12 +75,7 @@ private:
     std::vector<MaterialGpu> materialTable_;
     void initMaterialTable();
     uint32_t classifyMaterial(const glm::vec3& p) const;
-    struct CachedBrick {
-        bool solid = false;
-        std::vector<uint64_t> occ;
-        std::vector<uint16_t> materials;
-    };
-    mutable std::unordered_map<uint64_t, CachedBrick> brickCache_;
+    mutable std::unordered_map<uint64_t, std::shared_ptr<const BrickPayload>> brickCache_;
     mutable std::mutex cacheMutex_;
     WorldGen worldGen_{};
 };

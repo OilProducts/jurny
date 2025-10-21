@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <memory>
 #include <array>
+#include <string>
+#include <unordered_map>
 #include <glm/vec3.hpp>
  
 #include "core/Upload.h"
@@ -42,11 +44,17 @@ public:
     void resize(platform::VulkanContext& vk, platform::Swapchain& swap);
     void updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData& data);
     void record(platform::VulkanContext& vk, platform::Swapchain& swap, VkCommandBuffer cb, uint32_t swapIndex);
+    void recordOverlay(VkCommandBuffer cb, uint32_t swapIndex);
     void readDebug(platform::VulkanContext& vk, uint32_t frameIdx);
     void shutdown(platform::VulkanContext& vk);
 
     const world::BrickStore* worldStore() const { return brickStore_.get(); }
-    bool commitWorldSubset(platform::VulkanContext& vk, const world::CpuWorld& cpu, const std::vector<glm::ivec3>& coords);
+    bool addRegion(platform::VulkanContext& vk, const glm::ivec3& regionCoord, world::CpuWorld&& cpu);
+    bool removeRegion(platform::VulkanContext& vk, const glm::ivec3& regionCoord);
+    uint32_t brickCount() const { return brickCount_; }
+    size_t residentRegionCount() const { return regionWorlds_.size(); }
+    std::array<double, 4> gpuTimingsMs() const;
+    void updateOverlayHUD(platform::VulkanContext& vk, const std::vector<std::string>& lines);
 
 private:
     bool createPipelines(platform::VulkanContext& vk);
@@ -85,6 +93,7 @@ private:
     VkPipeline            pipeTemporal_{};
     VkPipeline            pipeTraverse_{};
     VkPipeline            pipeComposite_{};
+    VkPipeline            pipeOverlay_{};
     VkDescriptorPool      descPool_{};
     std::vector<VkDescriptorSet> sets_;
 
@@ -150,17 +159,26 @@ private:
     uint32_t lastDbgFrame_{}; int lastMcX_{}; int lastMcY_{}; int lastMcZ_{}; int lastPresent_{};
     uint32_t currFrameIdx_{};
     glm::vec3 renderOrigin_{0.0f};
+    VkBuffer overlayBuf_{}; VkDeviceMemory overlayMem_{}; VkDeviceSize overlayCapacity_{};
+    uint32_t overlayCharsX_ = 0;
+    uint32_t overlayCharsY_ = 0;
+    uint32_t overlayPixelWidth_ = 0;
+    uint32_t overlayPixelHeight_ = 0;
+    bool overlayActive_ = false;
 
     std::unique_ptr<world::BrickStore> brickStore_;
-    std::vector<glm::ivec3> currentSelectionCoords_;
+    world::CpuWorld aggregateWorld_;
     bool descriptorsReady_ = false;
     bool worldDescriptorsDirty_ = false;
 
     bool uploadWorld(platform::VulkanContext& vk, const world::CpuWorld& cpu);
+    bool rebuildGpuWorld(platform::VulkanContext& vk);
+    static uint64_t packRegionKey(const glm::ivec3& coord);
     core::UploadContext uploadCtx_;
     uint32_t materialCount_ = 0;
     world::WorldGen::NoiseParams noiseParams_{};
     uint32_t worldSeed_ = 1337u;
+    std::unordered_map<uint64_t, world::CpuWorld> regionWorlds_;
 };
 
 }

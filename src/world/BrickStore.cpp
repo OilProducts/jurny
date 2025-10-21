@@ -156,18 +156,18 @@ uint32_t BrickStore::classifyMaterial(const glm::vec3& p) const {
     return 0u;
 }
 
-bool BrickStore::buildBrickOccupancy(const glm::ivec3& bc,
-                                     const math::PlanetParams& P,
-                                     float voxelSize,
-                                     int brickDim,
-                                     float brickSize,
-                                     std::vector<uint64_t>& outOcc,
-                                     std::vector<uint16_t>& outMaterials) const {
-    static std::atomic<uint32_t> logged{0};
-    uint32_t count = logged.load(std::memory_order_relaxed);
+bool BrickStore::computeBrickData(const glm::ivec3& bc,
+                                  const math::PlanetParams& P,
+                                  float voxelSize,
+                                  int brickDim,
+                                  float brickSize,
+                                  std::vector<uint64_t>& outOcc,
+                                  std::vector<uint16_t>& outMaterials) const {
+    static std::atomic<uint32_t> firstLogs{0};
+    uint32_t count = firstLogs.load(std::memory_order_relaxed);
     if (count < 32) {
-        if (logged.compare_exchange_strong(count, count + 1, std::memory_order_relaxed)) {
-            spdlog::info("BrickStore::buildBrickOccupancy begin bc=({}, {}, {}) voxelSize={} brickSize={}",
+        if (firstLogs.compare_exchange_strong(count, count + 1, std::memory_order_relaxed)) {
+            spdlog::info("BrickStore::computeBrickData begin bc=({}, {}, {}) voxelSize={} brickSize={}",
                          bc.x, bc.y, bc.z, voxelSize, brickSize);
         }
     }
@@ -175,26 +175,9 @@ bool BrickStore::buildBrickOccupancy(const glm::ivec3& bc,
     const size_t voxelsPerBrick = static_cast<size_t>(brickDim) * static_cast<size_t>(brickDim) * static_cast<size_t>(brickDim);
     const size_t wordsPerBrick = (voxelsPerBrick + 63u) / 64u;
 
-    const uint64_t key = packKey(bc.x, bc.y, bc.z);
-    std::lock_guard<std::mutex> lock(cacheMutex_);
-    auto it = brickCache_.find(key);
-    if (it != brickCache_.end()) {
-        const CachedBrick& cached = it->second;
-        if (!cached.solid) {
-            outOcc.clear();
-            outMaterials.clear();
-            return false;
-        }
-        outOcc = cached.occ;
-        outMaterials = cached.materials;
-        return true;
-    }
+    outOcc.assign(wordsPerBrick, 0ull);
+    outMaterials.assign(voxelsPerBrick, 0u);
 
-    // Build brick occupancy while holding the cache lock. This avoids rehash
-    // races with other threads; the streaming system currently tolerates the
-    // reduced parallelism better than a crash.
-    std::vector<uint64_t> occ(wordsPerBrick, 0ull);
-    std::vector<uint16_t> mats(voxelsPerBrick, 0u);
     bool any = false;
     const glm::vec3 brickOrigin = glm::vec3(bc) * brickSize;
     for (int vz = 0; vz < brickDim; ++vz) {
@@ -206,33 +189,69 @@ bool BrickStore::buildBrickOccupancy(const glm::ivec3& bc,
                 if (f < 0.0f) {
                     uint32_t w = idx >> 6u;
                     uint32_t b = idx & 63u;
-                    occ[w] |= (1ull << b);
+                    outOcc[w] |= (1ull << b);
                     any = true;
                 }
-                mats[idx] = static_cast<uint16_t>(classifyMaterial(p));
+                outMaterials[idx] = static_cast<uint16_t>(classifyMaterial(p));
             }
         }
     }
 
     if (!any) {
-        uint32_t cnt = logged.load(std::memory_order_relaxed);
+        uint32_t cnt = firstLogs.load(std::memory_order_relaxed);
         if (cnt < 64) {
-            if (logged.compare_exchange_strong(cnt, cnt + 1, std::memory_order_relaxed)) {
-                spdlog::info("BrickStore::buildBrickOccupancy empty bc=({}, {}, {})", bc.x, bc.y, bc.z);
+            if (firstLogs.compare_exchange_strong(cnt, cnt + 1, std::memory_order_relaxed)) {
+                spdlog::info("BrickStore::computeBrickData empty bc=({}, {}, {})", bc.x, bc.y, bc.z);
             }
         }
         outOcc.clear();
         outMaterials.clear();
-        brickCache_[key] = CachedBrick{false, {}, {}};
         return false;
     }
 
-    outOcc = occ;
-    outMaterials = mats;
-
-    brickCache_[key] = CachedBrick{true, std::move(occ), std::move(mats)};
-
     return true;
+}
+
+bool BrickStore::acquireBrick(const glm::ivec3& bc,
+                              std::shared_ptr<const BrickPayload>& payload,
+                              std::atomic<bool>* cancel) const {
+    const uint64_t key = packKey(bc.x, bc.y, bc.z);
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex_);
+        auto it = brickCache_.find(key);
+        if (it != brickCache_.end()) {
+            payload = it->second;
+            return payload != nullptr;
+        }
+    }
+
+    if (cancel && cancel->load(std::memory_order_relaxed)) {
+        return false;
+    }
+
+    std::vector<uint64_t> occ;
+    std::vector<uint16_t> mats;
+    bool solid = computeBrickData(bc, params_, voxelSize_, brickDim_, brickSize_, occ, mats);
+
+    std::shared_ptr<const BrickPayload> newPayload;
+    if (solid) {
+        auto owned = std::make_shared<BrickPayload>();
+        owned->occ = std::move(occ);
+        owned->materials = std::move(mats);
+        newPayload = std::move(owned);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex_);
+        auto [it, inserted] = brickCache_.emplace(key, newPayload);
+        if (!inserted) {
+            payload = it->second;
+            return payload != nullptr;
+        }
+    }
+
+    payload = std::move(newPayload);
+    return payload != nullptr;
 }
 
 CpuWorld BrickStore::buildCpuWorld(const std::vector<glm::ivec3>& brickCoords,
@@ -254,12 +273,18 @@ CpuWorld BrickStore::buildCpuWorld(const std::vector<glm::ivec3>& brickCoords,
             aborted = true;
             break;
         }
-        std::vector<uint64_t> occ;
-        std::vector<uint16_t> materials;
-        if (!buildBrickOccupancy(bc, params_, voxelSize_, brickDim_, brickSize_, occ, materials)) {
+
+        std::shared_ptr<const BrickPayload> payload;
+        if (!acquireBrick(bc, payload, cancel)) {
             continue;
         }
 
+        if (!payload) {
+            continue;
+        }
+
+        const std::vector<uint64_t>& occ = payload->occ;
+        const std::vector<uint16_t>& materials = payload->materials;
         const size_t voxelCount = materials.size();
         std::array<uint16_t, 16> palette{};
         std::vector<uint8_t> paletteIndices(voxelCount);
