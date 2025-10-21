@@ -107,12 +107,15 @@ Math
   - Key functions:
     - IntersectSphere(o,d,R) → (t0,t1,hit): clamp rays to spherical bounds.
     - IntersectSphereShell(o,d,Rin,Rout) → (tEnter,tExit,hit): restrict traversal to content shell.
-    - F_crust(p, params) → float: signed field (neg = solid).
-    - gradF(p, params, eps) → vec3: finite‑difference gradient for smooth normals/collision.
+    - SampleCrust(p, planet, noise, seed) → { field, height } shared with renderer/WorldGen.
+    - F_crust(p, planet, noise, seed) → float: signed field (neg = solid).
+    - gradF(p, planet, noise, seed, eps) → vec3: finite‑difference gradient for smooth normals/collision.
+    - ApplyDomainWarp(dir, noise, seed) → vec3: shared warp used for continents/moisture.
     - ENU(p) → (east,north,up): local tangent frame at p (radial up).
     - gravity(p, g0) → vec3: radial gravity; clamp magnitude near surface.
   - Types:
-    - PlanetParams { double R, T, sea, Hmax; noise params }.
+    - PlanetParams { double R, T, sea, Hmax; }
+    - NoiseParams { continent/detail/warp/cave/moisture frequencies, amplitudes, octaves }.
     - OriginRebase { dvec3 worldOriginPrev, worldOriginCurr; vec3 originDeltaPrevToCurr }.
   - Precision: CPU doubles for accumulation; GPU floats in origin‑relative frame.
 
@@ -293,10 +296,13 @@ Initial Class Headers (Sketch)
 
 - math/Spherical.h
   - struct PlanetParams { double R,T,sea,Hmax; };
+  - struct NoiseParams { … }; inline constexpr int kNoiseCaveOctaves = 4;
   - struct OriginRebase { glm::dvec3 worldOriginPrev, worldOriginCurr; glm::vec3 originDeltaPrevToCurr; };
+  - CrustSample SampleCrust(glm::vec3 p, const PlanetParams&, const NoiseParams&, uint32_t seed);
+  - float F_crust(glm::vec3 p, const PlanetParams&, const NoiseParams&, uint32_t seed);
+  - glm::vec3 gradF(glm::vec3 p, const PlanetParams&, const NoiseParams&, uint32_t seed, float eps);
   - bool IntersectSphereShell(glm::vec3 o, glm::vec3 d, float Rin, float Rout, float& tEnter, float& tExit);
-  - float F_crust(glm::vec3 p, const PlanetParams&);
-  - glm::vec3 gradF(glm::vec3 p, const PlanetParams&, float eps);
+  - glm::vec3 ApplyDomainWarp(glm::vec3 dir, const NoiseParams&, uint32_t seed);
   - void ENU(const glm::vec3& p, glm::vec3& east, glm::vec3& north, glm::vec3& up);
 
 - world/BrickStore.h
@@ -313,4 +319,3 @@ Glossary
 - DDA: Digital Differential Analyzer; grid stepping algorithm
 - TSDF: Truncated Signed Distance Field; local micro‑SDF per edited/dynamic brick
 - ENU: East‑North‑Up; local tangent frame aligned to radial up
-

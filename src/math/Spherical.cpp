@@ -1,18 +1,179 @@
 #include "Spherical.h"
-#include <glm/geometric.hpp>
+
 #include <algorithm>
 #include <cmath>
+#include <glm/common.hpp>
+#include <glm/geometric.hpp>
 
 namespace math {
 namespace {
+constexpr float kPersistenceContinent = 0.55f;
+constexpr float kPersistenceDetail    = 0.5f;
+constexpr float kPersistenceCave      = 0.5f;
+
+inline float fade(float t) {
+    return t * t * (3.0f - 2.0f * t);
+}
+
+inline glm::vec3 fade3(const glm::vec3& v) {
+    return glm::vec3(fade(v.x), fade(v.y), fade(v.z));
+}
+
+inline float hash(const glm::vec3& p, std::uint32_t seed) {
+    constexpr glm::vec3 kHashVec(12.9898f, 78.233f, 37.719f);
+    const float n = glm::dot(p, kHashVec) + static_cast<float>(seed) * 0.001953125f; // /512
+    return glm::fract(std::sin(n) * 43758.5453f);
+}
+
+float valueNoise(const glm::vec3& p, std::uint32_t seed) {
+    const glm::vec3 i = glm::floor(p);
+    const glm::vec3 f = glm::fract(p);
+    const glm::vec3 u = fade3(f);
+
+    const auto corner = [&](int ox, int oy, int oz) {
+        const glm::vec3 offset(static_cast<float>(ox),
+                               static_cast<float>(oy),
+                               static_cast<float>(oz));
+        const std::uint32_t cornerSeed =
+            seed + static_cast<std::uint32_t>(ox + oy * 17 + oz * 131);
+        return hash(i + offset, cornerSeed);
+    };
+
+    const float n000 = corner(0, 0, 0);
+    const float n100 = corner(1, 0, 0);
+    const float n010 = corner(0, 1, 0);
+    const float n110 = corner(1, 1, 0);
+    const float n001 = corner(0, 0, 1);
+    const float n101 = corner(1, 0, 1);
+    const float n011 = corner(0, 1, 1);
+    const float n111 = corner(1, 1, 1);
+
+    const float nx00 = glm::mix(n000, n100, u.x);
+    const float nx10 = glm::mix(n010, n110, u.x);
+    const float nx01 = glm::mix(n001, n101, u.x);
+    const float nx11 = glm::mix(n011, n111, u.x);
+    const float nxy0 = glm::mix(nx00, nx10, u.y);
+    const float nxy1 = glm::mix(nx01, nx11, u.y);
+    return glm::mix(nxy0, nxy1, u.z);
+}
+
+float fbmInternal(const glm::vec3& p,
+                  float baseFrequency,
+                  int octaves,
+                  float persistence,
+                  std::uint32_t seed) {
+    if (baseFrequency <= 0.0f || octaves <= 0) {
+        return 0.0f;
+    }
+    float amplitude = 1.0f;
+    float frequency = baseFrequency;
+    float sum = 0.0f;
+    float norm = 0.0f;
+    for (int i = 0; i < octaves; ++i) {
+        const std::uint32_t octaveSeed =
+            seed + static_cast<std::uint32_t>(i) * 97u;
+        sum += amplitude * valueNoise(p * frequency, octaveSeed);
+        norm += amplitude;
+        frequency *= 2.0f;
+        amplitude *= persistence;
+    }
+    if (norm <= 0.0f) return 0.0f;
+    const float result = sum / norm;
+    return result * 2.0f - 1.0f; // [-1, 1]
+}
+
+glm::vec3 applyDomainWarpInternal(const glm::vec3& dir,
+                                  const NoiseParams& noise,
+                                  std::uint32_t seed) {
+    if (noise.warpAmplitude <= 0.0f || noise.warpFrequency <= 0.0f) {
+        return dir;
+    }
+    const int detailOct = std::max(noise.detailOctaves, 1);
+    const glm::vec3 offX(31.7f, 17.3f, 13.1f);
+    const glm::vec3 offY(11.1f, 53.2f, 27.8f);
+    const glm::vec3 offZ(91.7f, 45.3f, 67.1f);
+    const float fx = fbmInternal(dir + offX, noise.warpFrequency,
+                                 detailOct, kPersistenceDetail,
+                                 seed + 233u);
+    const float fy = fbmInternal(dir + offY, noise.warpFrequency,
+                                 detailOct, kPersistenceDetail,
+                                 seed + 389u);
+    const float fz = fbmInternal(dir + offZ, noise.warpFrequency,
+                                 detailOct, kPersistenceDetail,
+                                 seed + 521u);
+    const glm::vec3 warp(fx, fy, fz);
+    return dir + warp * noise.warpAmplitude;
+}
+
+CrustSample evaluateCrust(const glm::vec3& p,
+                          const PlanetParams& planet,
+                          const NoiseParams& noise,
+                          std::uint32_t seed) {
+    CrustSample sample{};
+
+    const float r = glm::length(p);
+    if (r <= 0.0f) {
+        const float floor = -static_cast<float>(planet.T);
+        sample.field = floor;
+        sample.height = floor;
+        return sample;
+    }
+
+    const glm::vec3 dir = p / r;
+    const glm::vec3 warped = applyDomainWarpInternal(dir, noise, seed);
+
+    const int contOct = std::max(noise.continentOctaves, 1);
+    const int detailOct = std::max(noise.detailOctaves, 1);
+    const float continents = fbmInternal(
+        warped,
+        noise.continentFrequency,
+        contOct,
+        kPersistenceContinent,
+        seed);
+    const float detail = fbmInternal(
+        warped * 2.0f,
+        noise.detailFrequency,
+        detailOct,
+        kPersistenceDetail,
+        seed + 613u);
+
+    float height = noise.continentAmplitude * continents +
+                   noise.detailAmplitude * detail;
+    const float minHeight = -static_cast<float>(planet.T);
+    const float maxHeight = static_cast<float>(planet.Hmax);
+    height = std::clamp(height, minHeight, maxHeight);
+
+    const float surfaceRadius = static_cast<float>(planet.R) + height;
+    float field = r - surfaceRadius;
+
+    if (field < 0.0f && noise.caveAmplitude > 0.0f &&
+        noise.caveFrequency > 0.0f) {
+        const int caveOct = std::max(kNoiseCaveOctaves, 1);
+        const float cave = fbmInternal(
+            p,
+            noise.caveFrequency,
+            caveOct,
+            kPersistenceCave,
+            seed + 997u);
+        const float cavity = cave - noise.caveThreshold;
+        if (cavity > 0.0f) {
+            field += -noise.caveAmplitude * cavity;
+        }
+    }
+
+    sample.field = field;
+    sample.height = height;
+    return sample;
+}
+
 // Solve |o + t d|^2 = R^2. Allows non-normalized d. Returns t0<=t1 on hit.
 inline bool intersectSphere(const glm::vec3& o, const glm::vec3& d, float R,
                             float& t0, float& t1) {
     const float a = glm::dot(d, d);
     if (a <= 0.0f) return false; // degenerate direction
-    const float b = glm::dot(o, d);              // note: quadratic uses 2b, we keep b and adjust disc
+    const float b = glm::dot(o, d);              // quadratic uses 2b; keep b and adjust disc
     const float c = glm::dot(o, o) - R * R;
-    const float disc = b * b - a * c;           // discriminant of a t^2 + 2b t + c = 0
+    const float disc = b * b - a * c;
     if (disc < 0.0f) return false;
     const float s = std::sqrt(std::max(disc, 0.0f));
     const float invA = 1.0f / a;
@@ -24,65 +185,118 @@ inline bool intersectSphere(const glm::vec3& o, const glm::vec3& d, float R,
 }
 } // namespace
 
-// Base continuous crust field (negative = solid). For M0 we implement a smooth sphere
-// with radius R: F(p) = |p| - R. Height/caves can be layered later without changing the API.
-float F_crust(const glm::vec3& p, const PlanetParams& P) {
-    const float r = glm::length(p);
-    return r - static_cast<float>(P.R);
+NoiseParams NoiseParams::disabled() {
+    NoiseParams n{};
+    n.continentFrequency = 0.0f;
+    n.continentAmplitude = 0.0f;
+    n.continentOctaves   = 0;
+    n.detailFrequency    = 0.0f;
+    n.detailAmplitude    = 0.0f;
+    n.detailOctaves      = 0;
+    n.warpFrequency      = 0.0f;
+    n.warpAmplitude      = 0.0f;
+    n.caveFrequency      = 0.0f;
+    n.caveAmplitude      = 0.0f;
+    n.caveThreshold      = 1.0f;
+    n.moistureFrequency  = 0.0f;
+    n.moistureOctaves    = 0;
+    return n;
 }
 
-// Gradient of F. For the base sphere, grad is simply p/|p|. The eps parameter is reserved
-// for future finite-difference evaluation when F includes noise/warps.
-glm::vec3 gradF(const glm::vec3& p, const PlanetParams&, float /*eps*/) {
-    const float r = glm::length(p);
-    if (r > 0.0f) return p * (1.0f / r);
-    // Arbitrary up when at center (shouldn’t happen for surface hits)
-    return glm::vec3(0.0f, 1.0f, 0.0f);
+glm::vec3 ApplyDomainWarp(const glm::vec3& unitDir,
+                          const NoiseParams& noise,
+                          std::uint32_t seed) {
+    return applyDomainWarpInternal(unitDir, noise, seed);
 }
 
-// Intersect a ray with the spherical shell Rin..Rout (outside Rin, inside Rout).
-// Returns the nearest non-empty positive segment [tEnter, tExit) in shell space.
+float FractalBrownianMotion(const glm::vec3& p, float baseFrequency,
+                            int octaves, float persistence,
+                            std::uint32_t seed) {
+    return fbmInternal(p, baseFrequency, octaves, persistence, seed);
+}
+
+CrustSample SampleCrust(const glm::vec3& p, const PlanetParams& planet,
+                        const NoiseParams& noise, std::uint32_t seed) {
+    return evaluateCrust(p, planet, noise, seed);
+}
+
+float F_crust(const glm::vec3& p, const PlanetParams& planet,
+              const NoiseParams& noise, std::uint32_t seed) {
+    return evaluateCrust(p, planet, noise, seed).field;
+}
+
+glm::vec3 gradF(const glm::vec3& p, const PlanetParams& planet,
+                const NoiseParams& noise, std::uint32_t seed, float eps) {
+    float step = eps;
+    if (step <= 0.0f) {
+        step = 0.5f; // fallback; caller should provide voxel-scale epsilon
+    }
+    const glm::vec3 dx(step, 0.0f, 0.0f);
+    const glm::vec3 dy(0.0f, step, 0.0f);
+    const glm::vec3 dz(0.0f, 0.0f, step);
+
+    const float fx1 = F_crust(p + dx, planet, noise, seed);
+    const float fx0 = F_crust(p - dx, planet, noise, seed);
+    const float fy1 = F_crust(p + dy, planet, noise, seed);
+    const float fy0 = F_crust(p - dy, planet, noise, seed);
+    const float fz1 = F_crust(p + dz, planet, noise, seed);
+    const float fz0 = F_crust(p - dz, planet, noise, seed);
+
+    glm::vec3 g(fx1 - fx0, fy1 - fy0, fz1 - fz0);
+    if (glm::dot(g, g) <= 0.0f) {
+        return glm::vec3(0.0f, 1.0f, 0.0f);
+    }
+    return glm::normalize(g);
+}
+
 bool IntersectSphereShell(const glm::vec3& o, const glm::vec3& d,
                           float Rin, float Rout,
                           float& tEnter, float& tExit) {
-    // Preconditions
     if (!(Rout > Rin && Rin >= 0.0f)) return false;
 
-    float to0, to1; // outer sphere interval
+    float to0, to1;
     if (!intersectSphere(o, d, Rout, to0, to1)) return false;
 
-    // Clamp to t >= 0 (we only care about forward intersections)
     const float eps = 1e-6f;
     const float outerStart = std::max(to0, eps);
     const float outerEnd   = to1;
     if (outerEnd <= outerStart) return false;
 
-    float ti0, ti1; // inner sphere interval
+    float ti0, ti1;
     const bool hitInner = intersectSphere(o, d, Rin, ti0, ti1);
 
     if (!hitInner) {
-        tEnter = outerStart; tExit = outerEnd;
+        tEnter = outerStart;
+        tExit  = outerEnd;
         return tExit > tEnter;
     }
 
-    // Shell intervals are [outerStart, min(outerEnd, ti0)] and [max(outerStart, ti1), outerEnd]
     const float c1Start = outerStart;
     const float c1End   = std::min(outerEnd, ti0);
-    if (c1End > c1Start) { tEnter = c1Start; tExit = c1End; return true; }
+    if (c1End > c1Start) {
+        tEnter = c1Start;
+        tExit  = c1End;
+        return true;
+    }
 
     const float c2Start = std::max(outerStart, ti1);
     const float c2End   = outerEnd;
-    if (c2End > c2Start) { tEnter = c2Start; tExit = c2End; return true; }
+    if (c2End > c2Start) {
+        tEnter = c2Start;
+        tExit  = c2End;
+        return true;
+    }
 
     return false;
 }
 
 void ENU(const glm::vec3& p, glm::vec3& east, glm::vec3& north, glm::vec3& up) {
     up = glm::normalize(p);
-    // Reference axis for east: global Z. Handle polar degeneracy.
     const glm::vec3 z(0.0f, 0.0f, 1.0f);
     east = glm::normalize(glm::cross(z, up));
-    if (glm::dot(east, east) < 1e-6f) east = glm::vec3(1.0f, 0.0f, 0.0f);
+    if (glm::dot(east, east) < 1e-6f) {
+        east = glm::vec3(1.0f, 0.0f, 0.0f);
+    }
     north = glm::cross(up, east);
 }
-}
+} // namespace math

@@ -99,7 +99,9 @@ bool glyphMask(uint ascii, uint x, uint y) {
     return false;
   }
   uint row = FONT_TABLE[idx * FONT_HEIGHT + y];
-  uint bit = (row >> (FONT_WIDTH - 1u - x)) & 0x1u;
+  // Font rows are stored left-aligned in the high bits of the byte.
+  // Sample bit (7 - x) so all six columns are visible instead of trimming the left edge.
+  uint bit = (row >> (7u - x)) & 0x1u;
   return bit != 0u;
 }
 

@@ -1,17 +1,23 @@
 // Minimal assertions for spherical math M0.
 #include <cassert>
 #include <cmath>
+#include <glm/vec3.hpp>
+
 #include "math/Spherical.h"
 
-using math::PlanetParams;
+using math::CrustSample;
 using math::F_crust;
 using math::gradF;
 using math::IntersectSphereShell;
+using math::NoiseParams;
+using math::PlanetParams;
+using math::SampleCrust;
 
 static bool approx(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) <= eps; }
 
 int main() {
     PlanetParams P{ /*R*/10'000.0, /*T*/300.0, /*sea*/10'000.0, /*Hmax*/2'000.0 };
+    NoiseParams disabled = NoiseParams::disabled();
 
     // F_crust on the sphere
     {
@@ -27,6 +33,15 @@ int main() {
         // g should be unit length and parallel to p
         float len = std::sqrt(g.x*g.x + g.y*g.y + g.z*g.z);
         assert(std::fabs(len - 1.0f) < 1e-3f);
+    }
+
+    // SampleCrust with disabled noise should match the analytic sphere
+    {
+        glm::vec3 p{static_cast<float>(P.R) + 25.0f, 12.0f, -3.0f};
+        CrustSample s = SampleCrust(p, P, disabled, /*seed*/1337u);
+        float analytic = F_crust(p, P);
+        assert(approx(s.field, analytic, 1e-5f));
+        assert(approx(s.height, 0.0f, 1e-5f));
     }
 
     // Shell intersection basics (use small radii for simple numbers)

@@ -1,5 +1,6 @@
 #include "Raytracer.h"
 #include "world/BrickStore.h"
+#include "math/Spherical.h"
 #include <spdlog/spdlog.h>
 #include <cstdio>
 #include <cstring>
@@ -1048,7 +1049,7 @@ void Raytracer::updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData&
         d.noiseSeed          = wg.seed();
         d.noiseContinentOctaves = static_cast<uint32_t>(np.continentOctaves);
         d.noiseDetailOctaves    = static_cast<uint32_t>(np.detailOctaves);
-        d.noiseCaveOctaves      = static_cast<uint32_t>(world::WorldGen::kCaveOctaves);
+        d.noiseCaveOctaves      = static_cast<uint32_t>(math::kNoiseCaveOctaves);
     } else {
         d.noiseContinentFreq = d.noiseContinentAmp = 0.0f;
         d.noiseDetailFreq = d.noiseDetailAmp = 0.0f;

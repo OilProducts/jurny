@@ -168,12 +168,18 @@ Recommended Defaults (dev scale “small moon”)
 Core APIs (headers you’ll implement)
 // C++ (src/math/Spherical.h)
 - struct PlanetParams { double R, T, sea, Hmax, atmosphereTop; };
-- float  F_crust(glm::vec3 p_local, const PlanetParams& P);
-- glm::vec3 gradF(glm::vec3 p_local, const PlanetParams& P, float epsMeters);
+- struct NoiseParams { … };  // shared with WorldGen + renderer (continents, detail, warp, caves, moisture)
+- inline constexpr int kNoiseCaveOctaves = 4;
+- struct CrustSample { float field; float height; };
+- CrustSample SampleCrust(glm::vec3 p_local, const PlanetParams&, const NoiseParams&, uint32_t seed);
+- float  F_crust(glm::vec3 p_local, const PlanetParams&, const NoiseParams&, uint32_t seed);
+- glm::vec3 gradF(glm::vec3 p_local, const PlanetParams&, const NoiseParams&, uint32_t seed, float epsMeters);
 - bool IntersectSphereShell(glm::vec3 o_local, glm::vec3 d_local,
                             float Rin, float Rout,
                             float& tEnter, float& tExit);
 - void ENU(const glm::vec3& p_local, glm::vec3& east, glm::vec3& north, glm::vec3& up);
+- glm::vec3 ApplyDomainWarp(glm::vec3 unitDir, const NoiseParams&, uint32_t seed);
+- float FractalBrownianMotion(glm::vec3 p, float baseFrequency, int octaves, float persistence, uint32_t seed);
 
 // GLSL (shaders/common.glsl)
 - bool intersectSphere(vec3 o, vec3 d, float R, out float t0, out float t1);
@@ -284,4 +290,3 @@ Checklist (before shipping M2–M4)
 - [ ] Motion vectors account for rebase; ghosts clamped with variance.
 - [ ] CPU streaming uses AABB vs shell + angular scoring.
 - [ ] Unit tests for intersections, gradients, and reprojection pass.
-
