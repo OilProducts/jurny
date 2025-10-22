@@ -13,6 +13,7 @@ Build
 - Build: `cmake --build build -j`
 - Notes:
   - Shaders compile to `build/shaders/*.spv` (also copied next to the app under `assets/shaders`).
+  - `build/assets/assets.pak` contains packed data from the `data/` folder; see “Toolchain” below.
   - Populate `extern/` with submodules (glm, spdlog, volk, VMA, tracy, stb, xxhash) or point CMake to your local installs. Placeholders are present but headers/libs are not vendored.
 
 Controls (planned)
@@ -22,6 +23,12 @@ Controls (planned)
 Key ideas
 - World is axis-aligned bricks in Cartesian space; spherical behavior comes from analytic shell clamp and planet signed field F(p).
 - Shaders are placeholders for now.
+
+Toolchain
+- `glslc` (from the Vulkan SDK) is required at configure time. CMake locates it via `$GLSLC`, `$VULKAN_SDK`, or the system PATH.
+- Shaders compile through `tools/shaderc_build/compile_shaders.py` (Python 3). The script writes SPIR-V into `build/shaders` and mirrors the same layout under `build/assets/shaders`. A manifest is emitted to `build/shaders/manifest.json`.
+- All runtime data in `data/` is packed by `tools/pack_assets` into `build/assets/assets.pak` plus `build/assets/assets_manifest.json`. Both are copied next to the executable automatically.
+- Rebuild shaders/assets manually with `cmake --build build --target shaders_spv assets_packed`.
 
 Useful CMake options (ON/OFF)
 - `VOXEL_BUILD_TESTS` (default ON)

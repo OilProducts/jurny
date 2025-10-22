@@ -147,17 +147,17 @@ Top‑Level CMake (outline)
 - Add `cmake/Warnings.cmake`, `cmake/Sanitizers.cmake`, `cmake/Shaders.cmake` and include them.
 - Add subdirectories: `src`, `shaders`, `tools`, `tests` (guarded by options).
 
-Shaders CMake (custom command pattern)
-- For each `*.comp` file, generate a command:
-  - Inputs: source, all includes (use `DEPFILE` or glob + `BYPRODUCTS` carefully).
-  - Command: `glslc -c -g -O --target-env=vulkan1.3 -I shaders/include -o <out.spv> <in.comp>` (+ `-D` flags based on options).
-  - Output: `<build>/shaders/<relpath>.spv`.
-- Create an `add_custom_target(shaders ALL DEPENDS <all_spv>)` so IDEs rebuild shaders.
-- Install step (if needed later): copy SPIR‑V into an `assets/` directory alongside the binary.
+Shader & Asset Toolchain
+- `voxel_compile_shaders()` invokes the Python helper `tools/shaderc_build/compile_shaders.py`:
+  - Scans `shaders/` for `*.comp` sources.
+  - Calls `glslc` with the project feature macros; outputs live in `build/shaders/<rel>.spv`.
+  - Copies the same layout into `build/assets/shaders/` and writes `build/shaders/manifest.json` (hashes, sizes, compile times).
+  - Requires Python 3 and a Vulkan SDK providing `glslc` (resolved via `$GLSLC`, `$VULKAN_SDK`, or PATH). Outputs are tracked via a single `.stamp` target to keep Ninja happy.
+- `tools/pack_assets` merges the entire `data/` tree into `build/assets/assets.pak` with a JSON manifest `build/assets/assets_manifest.json` (offsets, sizes, XXHash64 checksums). The `assets_packed` custom target runs automatically and `voxel_app` depends on it.
 
 Install & Runtime Layout
 - `bin/` — executables and shared libs.
-- `assets/` — SPIR‑V (`.spv`), materials PAK, envmaps.
+- `assets/` — generated build artifacts (SPIR‑V, packed data blobs, manifests).
 - `config/` — runtime config (optional).
 
 Vulkan Validation & Debugging
@@ -181,10 +181,11 @@ Continuous Integration (CI) Skeleton
   - Use VS2022 image with Vulkan SDK installed.
   - Same configure/build steps; ensure `glslc.exe` is in PATH.
 
-Environment & Developer Experience
+-Environment & Developer Experience
 - Scripts
   - `tools/dev_watch.py` — file watcher that rebuilds shaders and restarts the app on change.
-  - `tools/pack_assets` — packs `data/materials.json`, envmaps into a single blob (`.pak`).
+  - `tools/shaderc_build/compile_shaders.py` — helper around `glslc`; accepts `--source`, `--output-dir`, `--copy-dir`, `--manifest`, `--define`, etc. The CMake function `voxel_compile_shaders()` invokes it automatically.
+  - `tools/pack_assets` — packs the entire `data/` directory into `assets.pak` plus `assets_manifest.json`. Supports `--data-dir`, `--out-dir`, `--pak`, `--manifest`, and `--verbose`.
 - Local run
   - Set `VK_LAYER_PATH` and `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` in Debug if SDK doesn’t auto‑register.
   - Ensure `assets/` folder is next to the executable or configure a search path.
@@ -288,4 +289,3 @@ Appendix C — Shared Compile Definitions
   - `VOXEL_BRICK_SIZE=8`
   - `VOXEL_USE_TSDF=1` (toggle)
   - `VOXEL_SHADER_DEBUG=1` in Debug
-

@@ -28,9 +28,9 @@ voxel-planet/
 ├─ tools/                        # Host-side tooling (no engine runtime deps)
 │  ├─ shaderc_build/             # Offline GLSL→SPIR-V compile scripts/wrapper
 │  │  ├─ CMakeLists.txt
-│  │  ├─ compile_shaders.py      # Scans shaders/, emits build/shaders/*.spv
+│  │  ├─ compile_shaders.py      # Scans shaders/, runs glslc, mirrors to build/assets/shaders, emits manifest
 │  │  └─ shader_pch.glsl         # Common #includes injected during compile
-│  ├─ pack_assets/               # Packs JSON/materials/envmaps → binary blobs
+│  ├─ pack_assets/               # Packs everything in data/ into assets.pak + JSON manifest
 │  │  ├─ CMakeLists.txt
 │  │  └─ pack_assets.cpp
 │  └─ telemetry/                 # Post-process Tracy captures / frame stats
@@ -245,4 +245,3 @@ Getting Started Checklist (repo bootstrap)
 - Clone extern/ deps (submodules or FetchContent). Configure CMake options.
 - Build tools/shaderc_build to compile shaders → build/shaders/.
 - Build voxel-planet; run. Expect a sky-only image (M0). Enable validation layers and Tracy in Debug.
-
