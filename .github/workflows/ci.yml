@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: 4
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libvulkan-dev vulkan-tools shaderc python3
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVOXEL_BUILD_TESTS=ON -DVOXEL_ENABLE_SANITIZERS=ON
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Run tests
+        run: cmake --build build --target run_tests

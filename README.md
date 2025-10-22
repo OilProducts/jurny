@@ -16,6 +16,10 @@ Build
   - `build/assets/assets.pak` contains packed data from the `data/` folder; see “Toolchain” below.
   - Populate `extern/` with submodules (glm, spdlog, volk, VMA, tracy, stb, xxhash) or point CMake to your local installs. Placeholders are present but headers/libs are not vendored.
 
+Tests
+- After configuring the build directory, run `cmake --build build --target run_tests` (wraps `ctest --output-on-failure`).
+- Address/UB sanitizers are enabled in Debug builds by default; LeakSanitizer is disabled for tests to keep CI stable.
+
 Controls (planned)
 - Free-fly camera (WASD + mouse).
 - Surface walk aligned to local ENU frame.

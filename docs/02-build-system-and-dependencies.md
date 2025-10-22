@@ -173,13 +173,11 @@ Static Analysis (optional but recommended)
 - Cppcheck: optional target.
 
 Continuous Integration (CI) Skeleton
-- Linux job
-  - Install Vulkan SDK (runner image that already has it, or cache a local SDK path).
-  - `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVOXEL_BUILD_TESTS=ON`
-  - `cmake --build build -j` and `ctest --test-dir build`.
-- Windows job
-  - Use VS2022 image with Vulkan SDK installed.
-  - Same configure/build steps; ensure `glslc.exe` is in PATH.
+- GitHub Actions workflow (`.github/workflows/ci.yml`) builds and tests every push/PR on Ubuntu:
+  - Installs Ninja, Vulkan headers, and `shaderc` (for `glslc`).
+  - Configures with tests + sanitizers enabled.
+  - Builds via Ninja and executes `run_tests` (ctest with leak detection disabled).
+- Windows job *(future work)* — use VS2022 image with Vulkan SDK installed; mirror the Linux steps once dependencies are scripted.
 
 -Environment & Developer Experience
 - Scripts
