@@ -78,6 +78,44 @@ if(BUILD_TOOLS)
   add_subdirectory(tools/shaderc_build)
   add_subdirectory(tools/pack_assets)
 endif()
+
+set(VOXEL_ASSET_DATA_DIR "${CMAKE_SOURCE_DIR}/data")
+file(GLOB_RECURSE VOXEL_ASSET_INPUTS CONFIGURE_DEPENDS "${VOXEL_ASSET_DATA_DIR}/*")
+set(VOXEL_ASSET_FILES)
+foreach(item ${VOXEL_ASSET_INPUTS})
+  if(NOT IS_DIRECTORY "${item}")
+    list(APPEND VOXEL_ASSET_FILES "${item}")
+  endif()
+endforeach()
+set(VOXEL_ASSET_OUTPUT_DIR "${CMAKE_BINARY_DIR}/assets")
+set(VOXEL_ASSET_PAK "${VOXEL_ASSET_OUTPUT_DIR}/assets.pak")
+set(VOXEL_ASSET_MANIFEST "${VOXEL_ASSET_OUTPUT_DIR}/assets_manifest.json")
+
+if(BUILD_TOOLS)
+  add_custom_command(
+    OUTPUT "${VOXEL_ASSET_PAK}" "${VOXEL_ASSET_MANIFEST}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${VOXEL_ASSET_OUTPUT_DIR}"
+    COMMAND $<TARGET_FILE:pack_assets>
+            --data-dir "${VOXEL_ASSET_DATA_DIR}"
+            --out-dir "${VOXEL_ASSET_OUTPUT_DIR}"
+            --pak "${VOXEL_ASSET_PAK}"
+            --manifest "${VOXEL_ASSET_MANIFEST}"
+    DEPENDS ${VOXEL_ASSET_FILES} pack_assets
+    COMMENT "Packing assets (materials, envmaps, data)"
+    VERBATIM
+  )
+  add_custom_target(assets_packed ALL DEPENDS "${VOXEL_ASSET_PAK}" "${VOXEL_ASSET_MANIFEST}")
+  add_dependencies(assets_packed pack_assets)
+else()
+  add_custom_target(assets_packed
+    COMMAND ${CMAKE_COMMAND} -E echo "Asset packing disabled (BUILD_TOOLS=OFF)"
+  )
+endif()
+
+if(TARGET voxel_app)
+  add_dependencies(voxel_app shaders_spv assets_packed)
+endif()
+
 if(VOXEL_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
