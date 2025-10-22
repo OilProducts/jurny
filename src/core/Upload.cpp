@@ -112,6 +112,19 @@ uint32_t UploadContext::findMemoryType(uint32_t bits, VkMemoryPropertyFlags flag
 }
 
 bool UploadContext::uploadBuffer(const void* data, VkDeviceSize bytes, VkBuffer dstBuffer) {
+    return uploadBufferRegion(data, bytes, dstBuffer, 0);
+}
+
+void UploadContext::flush() {
+    if (queue_ != VK_NULL_HANDLE && vk_) {
+        vkQueueWaitIdle(queue_);
+    }
+}
+
+bool UploadContext::uploadBufferRegion(const void* data,
+                                       VkDeviceSize bytes,
+                                       VkBuffer dstBuffer,
+                                       VkDeviceSize dstOffset) {
     if (bytes == 0 || dstBuffer == VK_NULL_HANDLE) {
         return true;
     }
@@ -139,7 +152,7 @@ bool UploadContext::uploadBuffer(const void* data, VkDeviceSize bytes, VkBuffer 
     vkBeginCommandBuffer(commandBuffer_, &bi);
     VkBufferCopy region{};
     region.srcOffset = 0;
-    region.dstOffset = 0;
+    region.dstOffset = dstOffset;
     region.size = bytes;
     vkCmdCopyBuffer(commandBuffer_, stagingBuffer_, dstBuffer, 1, &region);
     vkEndCommandBuffer(commandBuffer_);
@@ -157,12 +170,6 @@ bool UploadContext::uploadBuffer(const void* data, VkDeviceSize bytes, VkBuffer 
         return false;
     }
     return true;
-}
-
-void UploadContext::flush() {
-    if (queue_ != VK_NULL_HANDLE && vk_) {
-        vkQueueWaitIdle(queue_);
-    }
 }
 
 void UploadContext::shutdown() {

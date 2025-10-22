@@ -7,6 +7,7 @@
 #include <array>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <glm/vec3.hpp>
 
 #include "core/Upload.h"
@@ -56,7 +57,7 @@ public:
     bool addRegion(platform::VulkanContext& vk, const glm::ivec3& regionCoord, world::CpuWorld&& cpu);
     bool removeRegion(platform::VulkanContext& vk, const glm::ivec3& regionCoord);
     uint32_t brickCount() const { return brickCount_; }
-    size_t residentRegionCount() const { return regionWorlds_.size(); }
+    size_t residentRegionCount() const { return regionResidents_.size(); }
     std::array<double, 4> gpuTimingsMs() const;
     void updateOverlayHUD(platform::VulkanContext& vk, const std::vector<std::string>& lines);
 
@@ -76,13 +77,23 @@ private:
         VkDeviceSize size = 0;
         VkBufferUsageFlags usage = 0;
     };
-    bool ensureBuffer(platform::VulkanContext& vk, BufferResource& buf, VkDeviceSize requiredBytes, VkBufferUsageFlags usage);
+    bool ensureBuffer(platform::VulkanContext& vk, BufferResource& buf, VkDeviceSize requiredBytes, VkBufferUsageFlags usage, bool* reallocated = nullptr);
     void destroyBuffer(platform::VulkanContext& vk, BufferResource& buf);
     void markWorldDescriptorsDirty();
     void refreshWorldDescriptors(platform::VulkanContext& vk);
     bool createQueues(platform::VulkanContext& vk);
     void destroyQueues(platform::VulkanContext& vk);
     void writeQueueHeaders(VkCommandBuffer cb);
+    bool appendRegion(platform::VulkanContext& vk, world::CpuWorld&& cpu, const glm::ivec3& regionCoord);
+    bool removeRegionInternal(platform::VulkanContext& vk, const glm::ivec3& regionCoord);
+    void rebuildHashesAndMacro(platform::VulkanContext& vk);
+    void uploadAllWorldBuffers(platform::VulkanContext& vk);
+    void uploadHeadersRange(platform::VulkanContext& vk, uint32_t first, uint32_t count);
+    void uploadOccupancyRange(platform::VulkanContext& vk, uint32_t first, uint32_t count);
+    void uploadMaterialRange(platform::VulkanContext& vk, uint32_t first, uint32_t count);
+    void uploadPaletteRange(platform::VulkanContext& vk, uint32_t first, uint32_t count);
+    void updateBrickHeader(uint32_t index);
+    void fixupBrickHeader(uint32_t index);
     bool createProfilingResources(platform::VulkanContext& vk);
    void destroyProfilingResources(platform::VulkanContext& vk);
    bool createStatsBuffer(platform::VulkanContext& vk);
@@ -150,10 +161,9 @@ private:
         uint32_t pad2;
     } statsHost_{};
     uint32_t hashCapacity_{}; uint32_t brickCount_{};
-    uint32_t macroCapacity_{}; uint32_t macroDimBricks_{};
+    uint32_t macroCapacity_{};
     std::vector<uint64_t> macroKeysHost_;
     std::vector<uint32_t> macroValsHost_;
-    std::vector<uint32_t> paletteHost_;
     std::vector<world::MaterialGpu> materialTableHost_;
     VkQueryPool timestampPool_{};
     double timestampPeriodNs_{}; // GPU timestamp period in nanoseconds
@@ -172,19 +182,40 @@ private:
     uint32_t overlayPixelHeight_ = 0;
     bool overlayActive_ = false;
 
+    struct BrickRecord {
+        uint64_t key = 0;
+        glm::ivec3 coord{0};
+        uint16_t paletteCount = 0;
+        uint16_t flags = 0;
+    };
+
+    struct RegionResident {
+        glm::ivec3 coord{0};
+        std::vector<uint64_t> brickKeys;
+    };
+
     std::unique_ptr<world::BrickStore> brickStore_;
-    world::CpuWorld aggregateWorld_;
     bool descriptorsReady_ = false;
     bool worldDescriptorsDirty_ = false;
 
-    bool uploadWorld(platform::VulkanContext& vk, const world::CpuWorld& cpu);
-    bool rebuildGpuWorld(platform::VulkanContext& vk);
     static uint64_t packRegionKey(const glm::ivec3& coord);
     core::UploadContext uploadCtx_;
     uint32_t materialCount_ = 0;
     world::WorldGen::NoiseParams noiseParams_{};
     uint32_t worldSeed_ = 1337u;
-    std::unordered_map<uint64_t, world::CpuWorld> regionWorlds_;
+    std::unordered_map<uint64_t, RegionResident> regionResidents_;
+    std::unordered_map<uint64_t, uint32_t> brickLookup_;
+    std::vector<BrickRecord> brickRecords_;
+    std::vector<world::BrickHeader> headersHost_;
+    std::vector<uint64_t> occWordsHost_;
+    std::vector<uint32_t> matWordsHost_;
+    std::vector<uint32_t> paletteHost_;
+    std::vector<uint64_t> hashKeysHost_;
+    std::vector<uint32_t> hashValsHost_;
+    uint32_t macroDimBricks_ = 8;
+    static constexpr uint32_t kOccWordsPerBrick = 8;
+    static constexpr uint32_t kMaterialWordsPerBrick = 128;
+    static constexpr uint32_t kPaletteEntriesPerBrick = 16;
 };
 
 }

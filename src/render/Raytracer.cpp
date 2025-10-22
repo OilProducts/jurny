@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <numeric>
 #include <cctype>
+#include <utility>
+#include <unordered_map>
 
 namespace render {
 
@@ -87,11 +89,13 @@ static bool macroTilePresentCpu(const std::vector<uint64_t>& keys,
 bool Raytracer::ensureBuffer(platform::VulkanContext& vk,
                              BufferResource& buf,
                              VkDeviceSize requiredBytes,
-                             VkBufferUsageFlags usage) {
+                             VkBufferUsageFlags usage,
+                             bool* reallocated) {
     VkDeviceSize allocSize = std::max<VkDeviceSize>(requiredBytes, static_cast<VkDeviceSize>(16));
     VkBufferUsageFlags requiredUsage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (buf.buffer != VK_NULL_HANDLE && buf.capacity >= allocSize && buf.usage == requiredUsage) {
         buf.capacity = std::max(buf.capacity, allocSize);
+        if (reallocated) *reallocated = false;
         return true;
     }
     destroyBuffer(vk, buf);
@@ -107,6 +111,7 @@ bool Raytracer::ensureBuffer(platform::VulkanContext& vk,
     buf.capacity = allocSize;
     buf.size = 0;
     buf.usage = requiredUsage;
+    if (reallocated) *reallocated = true;
     return true;
 }
 
@@ -457,13 +462,13 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
         vkUnmapMemory(vk.device(), overlayMem_);
     }
     if (matIdxBuf_.buffer == VK_NULL_HANDLE) {
-        if (!ensureBuffer(vk, matIdxBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) return false;
+    if (!ensureBuffer(vk, matIdxBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
     }
     if (paletteBuf_.buffer == VK_NULL_HANDLE) {
-        if (!ensureBuffer(vk, paletteBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) return false;
+    if (!ensureBuffer(vk, paletteBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
     }
     if (materialTableBuf_.buffer == VK_NULL_HANDLE) {
-        if (!ensureBuffer(vk, materialTableBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) return false;
+    if (!ensureBuffer(vk, materialTableBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
     }
 
     // Write descriptors per swapchain image
@@ -561,61 +566,24 @@ bool Raytracer::createWorld(platform::VulkanContext& vk) {
     worldSeed_ = 1337u;
     store.configure(P, /*voxelSize*/0.5f, /*brickDim*/VOXEL_BRICK_SIZE, noiseParams_, worldSeed_, assets_);
 
-    aggregateWorld_ = {};
+    brickRecords_.clear();
+    headersHost_.clear();
+    occWordsHost_.clear();
+    matWordsHost_.clear();
+    paletteHost_.clear();
+    brickLookup_.clear();
+    regionResidents_.clear();
+    macroKeysHost_.clear();
+    macroValsHost_.clear();
+    macroCapacity_ = 0;
+    hashCapacity_ = 0;
+    brickCount_ = 0;
+    materialCount_ = 0;
+    macroDimBricks_ = 8;
     spdlog::info("Initial world bricks: 0 (0 MiB occupancy)");
-    return true;
-}
-
-bool Raytracer::uploadWorld(platform::VulkanContext& vk, const world::CpuWorld& cpu) {
-    brickCount_ = static_cast<uint32_t>(cpu.headers.size());
-    hashCapacity_ = cpu.hashCapacity;
-    macroCapacity_ = cpu.macroCapacity;
-    macroDimBricks_ = cpu.macroDimBricks;
-    macroKeysHost_ = cpu.macroKeys;
-    macroValsHost_ = cpu.macroVals;
-
-    auto uploadBuffer = [&](BufferResource& dst, const auto& src, VkDeviceSize elementSize, const char* label) -> bool {
-        VkDeviceSize bytes = static_cast<VkDeviceSize>(src.size()) * elementSize;
-        if (!ensureBuffer(vk, dst, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
-            spdlog::error("uploadWorld: ensure buffer failed for {} ({} bytes)", label, bytes);
-            return false;
-        }
-        dst.size = bytes;
-        if (bytes == 0 || src.empty()) {
-            return true;
-        }
-        if (!uploadCtx_.uploadBuffer(static_cast<const void*>(src.data()), bytes, dst.buffer)) {
-            spdlog::error("uploadWorld: upload failed for {} ({} bytes)", label, bytes);
-            return false;
-        }
-        return true;
-    };
-
-    if (!uploadBuffer(bhBuf_, cpu.headers, sizeof(world::BrickHeader), "headers")) return false;
-    if (!uploadBuffer(occBuf_, cpu.occWords, sizeof(uint64_t), "occupancy")) return false;
-    if (!uploadBuffer(hkBuf_, cpu.hashKeys, sizeof(uint64_t), "hashKeys")) return false;
-    if (!uploadBuffer(hvBuf_, cpu.hashVals, sizeof(uint32_t), "hashVals")) return false;
-    if (!uploadBuffer(mkBuf_, cpu.macroKeys, sizeof(uint64_t), "macroKeys")) return false;
-    if (!uploadBuffer(mvBuf_, cpu.macroVals, sizeof(uint32_t), "macroVals")) return false;
-    if (!uploadBuffer(paletteBuf_, cpu.palettes, sizeof(uint32_t), "palettes")) return false;
-    if (!uploadBuffer(matIdxBuf_, cpu.materialIndices, sizeof(uint32_t), "materialIndices")) return false;
-    if (!uploadBuffer(materialTableBuf_, cpu.materialTable, sizeof(world::MaterialGpu), "materialTable")) return false;
-
-    materialTableHost_ = cpu.materialTable;
-    paletteHost_ = cpu.palettes;
-    materialCount_ = static_cast<uint32_t>(cpu.materialTable.size());
-
     markWorldDescriptorsDirty();
-    if (descriptorsReady_) {
-        refreshWorldDescriptors(vk);
-    }
-
+    (void)vk;
     return true;
-}
-
-namespace {
-void buildHash(world::CpuWorld& world);
-void buildMacroHash(world::CpuWorld& world, uint32_t macroDimBricks);
 }
 
 uint64_t Raytracer::packRegionKey(const glm::ivec3& coord) {
@@ -625,102 +593,431 @@ uint64_t Raytracer::packRegionKey(const glm::ivec3& coord) {
             static_cast<uint64_t>(coord.z + static_cast<int>(B));
 }
 
+namespace {
+uint64_t packBrickKey(int bx, int by, int bz) {
+    const uint64_t B = 1ull << 20;
+    return (static_cast<uint64_t>(bx + static_cast<int>(B)) << 42) |
+           (static_cast<uint64_t>(by + static_cast<int>(B)) << 21) |
+            static_cast<uint64_t>(bz + static_cast<int>(B));
+}
+
+int divFloor(int a, int b) {
+    int q = a / b;
+    int r = a - q * b;
+    if (((a ^ b) < 0) && (r != 0)) --q;
+    return q;
+}
+}
+
 bool Raytracer::addRegion(platform::VulkanContext& vk, const glm::ivec3& regionCoord, world::CpuWorld&& cpu) {
-    uint64_t key = packRegionKey(regionCoord);
-    regionWorlds_[key] = std::move(cpu);
-    bool rebuilt = rebuildGpuWorld(vk);
-    if (rebuilt) {
-        historyReadIndex_ = 0;
-        historyWriteIndex_ = 1;
-        historyInitialized_ = false;
+    if (cpu.headers.empty()) {
+        return true;
     }
-    return rebuilt;
+    if (!appendRegion(vk, std::move(cpu), regionCoord)) {
+        return false;
+    }
+    historyInitialized_ = false;
+    historyReadIndex_ = 0;
+    historyWriteIndex_ = 1;
+    return true;
 }
 
 bool Raytracer::removeRegion(platform::VulkanContext& vk, const glm::ivec3& regionCoord) {
-    uint64_t key = packRegionKey(regionCoord);
-    auto it = regionWorlds_.find(key);
-    if (it == regionWorlds_.end()) {
-        return true; // nothing to remove
+    if (!removeRegionInternal(vk, regionCoord)) {
+        return false;
     }
-    regionWorlds_.erase(it);
-    bool rebuilt = rebuildGpuWorld(vk);
-    if (rebuilt) {
-        historyReadIndex_ = 0;
-        historyWriteIndex_ = 1;
-        historyInitialized_ = false;
-    }
-    return rebuilt;
+    historyInitialized_ = false;
+    historyReadIndex_ = 0;
+    historyWriteIndex_ = 1;
+    return true;
 }
 
-bool Raytracer::rebuildGpuWorld(platform::VulkanContext& vk) {
-    if (regionWorlds_.empty()) {
-        destroyWorld(vk);
-        aggregateWorld_ = {};
+bool Raytracer::appendRegion(platform::VulkanContext& vk, world::CpuWorld&& cpu, const glm::ivec3& regionCoord) {
+    const uint32_t oldCount = static_cast<uint32_t>(headersHost_.size());
+    const uint32_t requested = static_cast<uint32_t>(cpu.headers.size());
+    if (requested == 0u) {
+        regionResidents_.emplace(packRegionKey(regionCoord), RegionResident{regionCoord, {}});
         return true;
     }
 
-    world::CpuWorld combined;
+    const uint32_t voxelCount = VOXEL_BRICK_SIZE * VOXEL_BRICK_SIZE * VOXEL_BRICK_SIZE;
+    const uint32_t words4Bit = (voxelCount + 7u) / 8u;
+    const uint32_t words8Bit = (voxelCount + 3u) / 4u;
 
-    size_t totalHeaders = 0;
-    size_t totalOcc = 0;
-    size_t totalMatIdx = 0;
-    size_t totalPalettes = 0;
-    for (const auto& entry : regionWorlds_) {
-        const world::CpuWorld& cpu = entry.second;
-        totalHeaders += cpu.headers.size();
-        totalOcc += cpu.occWords.size();
-        totalMatIdx += cpu.materialIndices.size();
-        totalPalettes += cpu.palettes.size();
-        if (combined.materialTable.empty() && !cpu.materialTable.empty()) {
-            combined.materialTable = cpu.materialTable;
-        }
+    if (cpu.macroDimBricks > 0u) {
+        macroDimBricks_ = cpu.macroDimBricks;
     }
 
-    combined.headers.reserve(totalHeaders);
-    combined.occWords.reserve(totalOcc);
-    combined.materialIndices.reserve(totalMatIdx);
-    combined.palettes.reserve(totalPalettes);
+    headersHost_.resize(static_cast<size_t>(oldCount + requested));
+    brickRecords_.resize(static_cast<size_t>(oldCount + requested));
+    occWordsHost_.resize(static_cast<size_t>(oldCount + requested) * kOccWordsPerBrick);
+    matWordsHost_.resize(static_cast<size_t>(oldCount + requested) * kMaterialWordsPerBrick);
+    paletteHost_.resize(static_cast<size_t>(oldCount + requested) * kPaletteEntriesPerBrick);
 
-    for (const auto& entry : regionWorlds_) {
-        const world::CpuWorld& cpu = entry.second;
-        if (cpu.headers.empty()) {
+    RegionResident resident;
+    resident.coord = regionCoord;
+    resident.brickKeys.reserve(requested);
+
+    for (uint32_t i = 0; i < requested; ++i) {
+        uint32_t dstIndex = oldCount + i;
+        const world::BrickHeader& srcHeader = cpu.headers[i];
+        uint64_t key = packBrickKey(srcHeader.bx, srcHeader.by, srcHeader.bz);
+        if (brickLookup_.find(key) != brickLookup_.end()) {
+            spdlog::warn("Skipping duplicate brick at ({}, {}, {})", srcHeader.bx, srcHeader.by, srcHeader.bz);
             continue;
         }
 
-        size_t headerStart = combined.headers.size();
-        size_t occStart = combined.occWords.size();
-        size_t matStart = combined.materialIndices.size();
-        size_t paletteStart = combined.palettes.size();
+        BrickRecord record;
+        record.key = key;
+        record.coord = glm::ivec3(srcHeader.bx, srcHeader.by, srcHeader.bz);
+        record.paletteCount = srcHeader.paletteCount;
+        record.flags = srcHeader.flags;
+        brickRecords_[dstIndex] = record;
+        brickLookup_[key] = dstIndex;
+        resident.brickKeys.push_back(key);
 
-        combined.headers.insert(combined.headers.end(), cpu.headers.begin(), cpu.headers.end());
-        combined.occWords.insert(combined.occWords.end(), cpu.occWords.begin(), cpu.occWords.end());
-        combined.materialIndices.insert(combined.materialIndices.end(), cpu.materialIndices.begin(), cpu.materialIndices.end());
-        combined.palettes.insert(combined.palettes.end(), cpu.palettes.begin(), cpu.palettes.end());
+        world::BrickHeader header{};
+        header.bx = srcHeader.bx;
+        header.by = srcHeader.by;
+        header.bz = srcHeader.bz;
+        header.flags = srcHeader.flags;
+        header.paletteCount = srcHeader.paletteCount;
+        header.occOffset = dstIndex * kOccWordsPerBrick * sizeof(uint64_t);
+        header.matIdxOffset = dstIndex * kMaterialWordsPerBrick * sizeof(uint32_t);
+        header.paletteOffset = (header.paletteCount > 0) ? dstIndex * kPaletteEntriesPerBrick * sizeof(uint32_t) : world::kInvalidOffset;
+        header.tsdfOffset = world::kInvalidOffset;
+        headersHost_[dstIndex] = header;
 
-        uint32_t occOffsetBytes = static_cast<uint32_t>(occStart * sizeof(uint64_t));
-        uint32_t matOffsetBytes = static_cast<uint32_t>(matStart * sizeof(uint32_t));
-        uint32_t paletteOffsetBytes = static_cast<uint32_t>(paletteStart * sizeof(uint32_t));
+        const uint64_t* occSrc = cpu.occWords.data() + (srcHeader.occOffset / sizeof(uint64_t));
+        uint64_t* occDst = occWordsHost_.data() + static_cast<size_t>(dstIndex) * kOccWordsPerBrick;
+        std::copy_n(occSrc, kOccWordsPerBrick, occDst);
 
-        for (size_t i = 0; i < cpu.headers.size(); ++i) {
-            world::BrickHeader& h = combined.headers[headerStart + i];
-            h.occOffset += occOffsetBytes;
-            h.matIdxOffset += matOffsetBytes;
-            if (h.paletteOffset != world::kInvalidOffset) {
-                h.paletteOffset += paletteOffsetBytes;
+        const uint32_t* matSrc = cpu.materialIndices.data() + (srcHeader.matIdxOffset / sizeof(uint32_t));
+        uint32_t* matDst = matWordsHost_.data() + static_cast<size_t>(dstIndex) * kMaterialWordsPerBrick;
+        std::fill(matDst, matDst + kMaterialWordsPerBrick, 0u);
+        const bool uses4bit = (srcHeader.flags & world::kBrickUses4Bit) != 0;
+        const uint32_t wordCount = uses4bit ? words4Bit : words8Bit;
+        std::copy_n(matSrc, wordCount, matDst);
+
+        uint32_t* paletteDst = paletteHost_.data() + static_cast<size_t>(dstIndex) * kPaletteEntriesPerBrick;
+        std::fill(paletteDst, paletteDst + kPaletteEntriesPerBrick, 0u);
+        if (srcHeader.paletteCount > 0 && srcHeader.paletteOffset != world::kInvalidOffset) {
+            const uint32_t* paletteSrc = cpu.palettes.data() + (srcHeader.paletteOffset / sizeof(uint32_t));
+            std::copy_n(paletteSrc, srcHeader.paletteCount, paletteDst);
+        }
+        fixupBrickHeader(dstIndex);
+    }
+
+    const uint32_t appended = static_cast<uint32_t>(resident.brickKeys.size());
+    const uint32_t newCount = oldCount + appended;
+    headersHost_.resize(newCount);
+    brickRecords_.resize(newCount);
+    occWordsHost_.resize(static_cast<size_t>(newCount) * kOccWordsPerBrick);
+    matWordsHost_.resize(static_cast<size_t>(newCount) * kMaterialWordsPerBrick);
+    paletteHost_.resize(static_cast<size_t>(newCount) * kPaletteEntriesPerBrick);
+
+    if (materialTableHost_.empty() && !cpu.materialTable.empty()) {
+        materialTableHost_ = cpu.materialTable;
+        materialCount_ = static_cast<uint32_t>(materialTableHost_.size());
+        bool reallocated = false;
+        VkDeviceSize totalBytes = materialTableHost_.size() * sizeof(world::MaterialGpu);
+        if (!ensureBuffer(vk, materialTableBuf_, totalBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &reallocated)) {
+            return false;
+        }
+        materialTableBuf_.size = totalBytes;
+        if (totalBytes > 0) {
+            uploadCtx_.uploadBufferRegion(materialTableHost_.data(), totalBytes, materialTableBuf_.buffer, 0);
+        }
+    }
+
+    regionResidents_.emplace(packRegionKey(regionCoord), std::move(resident));
+    brickCount_ = newCount;
+
+    if (appended > 0) {
+        uploadHeadersRange(vk, oldCount, appended);
+        uploadOccupancyRange(vk, oldCount, appended);
+        uploadMaterialRange(vk, oldCount, appended);
+        uploadPaletteRange(vk, oldCount, appended);
+    }
+    rebuildHashesAndMacro(vk);
+    markWorldDescriptorsDirty();
+    return true;
+}
+
+bool Raytracer::removeRegionInternal(platform::VulkanContext& vk, const glm::ivec3& regionCoord) {
+    const uint64_t regionKey = packRegionKey(regionCoord);
+    auto it = regionResidents_.find(regionKey);
+    if (it == regionResidents_.end()) {
+        return true;
+    }
+
+    for (uint64_t key : it->second.brickKeys) {
+        auto lookup = brickLookup_.find(key);
+        if (lookup == brickLookup_.end()) {
+            continue;
+        }
+        uint32_t idx = lookup->second;
+        uint32_t last = static_cast<uint32_t>(headersHost_.size() - 1);
+        if (idx != last) {
+            headersHost_[idx] = headersHost_[last];
+            brickRecords_[idx] = brickRecords_[last];
+            brickLookup_[brickRecords_[idx].key] = idx;
+
+            std::copy_n(occWordsHost_.data() + static_cast<size_t>(last) * kOccWordsPerBrick,
+                        kOccWordsPerBrick,
+                        occWordsHost_.data() + static_cast<size_t>(idx) * kOccWordsPerBrick);
+            std::copy_n(matWordsHost_.data() + static_cast<size_t>(last) * kMaterialWordsPerBrick,
+                        kMaterialWordsPerBrick,
+                        matWordsHost_.data() + static_cast<size_t>(idx) * kMaterialWordsPerBrick);
+            std::copy_n(paletteHost_.data() + static_cast<size_t>(last) * kPaletteEntriesPerBrick,
+                        kPaletteEntriesPerBrick,
+                        paletteHost_.data() + static_cast<size_t>(idx) * kPaletteEntriesPerBrick);
+            fixupBrickHeader(idx);
+        }
+
+        headersHost_.pop_back();
+        brickRecords_.pop_back();
+        brickLookup_.erase(lookup);
+        occWordsHost_.resize(static_cast<size_t>(brickRecords_.size()) * kOccWordsPerBrick);
+        matWordsHost_.resize(static_cast<size_t>(brickRecords_.size()) * kMaterialWordsPerBrick);
+        paletteHost_.resize(static_cast<size_t>(brickRecords_.size()) * kPaletteEntriesPerBrick);
+    }
+
+    regionResidents_.erase(it);
+    brickCount_ = static_cast<uint32_t>(headersHost_.size());
+    uploadAllWorldBuffers(vk);
+    rebuildHashesAndMacro(vk);
+    markWorldDescriptorsDirty();
+    return true;
+}
+
+void Raytracer::uploadHeadersRange(platform::VulkanContext& vk, uint32_t first, uint32_t count) {
+    VkDeviceSize totalBytes = static_cast<VkDeviceSize>(headersHost_.size()) * sizeof(world::BrickHeader);
+    bool reallocated = false;
+    if (!ensureBuffer(vk, bhBuf_, totalBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &reallocated)) {
+        return;
+    }
+    bhBuf_.size = totalBytes;
+    if (totalBytes == 0) {
+        return;
+    }
+    if (reallocated || count == headersHost_.size()) {
+        uploadCtx_.uploadBufferRegion(headersHost_.data(), totalBytes, bhBuf_.buffer, 0);
+    } else if (count > 0) {
+        const world::BrickHeader* src = headersHost_.data() + first;
+        VkDeviceSize offset = static_cast<VkDeviceSize>(first) * sizeof(world::BrickHeader);
+        VkDeviceSize bytes = static_cast<VkDeviceSize>(count) * sizeof(world::BrickHeader);
+        uploadCtx_.uploadBufferRegion(src, bytes, bhBuf_.buffer, offset);
+    }
+}
+
+void Raytracer::uploadOccupancyRange(platform::VulkanContext& vk, uint32_t first, uint32_t count) {
+    VkDeviceSize totalBytes = static_cast<VkDeviceSize>(occWordsHost_.size()) * sizeof(uint64_t);
+    bool reallocated = false;
+    if (!ensureBuffer(vk, occBuf_, totalBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &reallocated)) {
+        return;
+    }
+    occBuf_.size = totalBytes;
+    if (totalBytes == 0) {
+        return;
+    }
+    if (reallocated || count == brickCount_) {
+        uploadCtx_.uploadBufferRegion(occWordsHost_.data(), totalBytes, occBuf_.buffer, 0);
+    } else if (count > 0) {
+        const uint64_t* src = occWordsHost_.data() + static_cast<size_t>(first) * kOccWordsPerBrick;
+        VkDeviceSize offset = static_cast<VkDeviceSize>(first) * kOccWordsPerBrick * sizeof(uint64_t);
+        VkDeviceSize bytes = static_cast<VkDeviceSize>(count) * kOccWordsPerBrick * sizeof(uint64_t);
+        uploadCtx_.uploadBufferRegion(src, bytes, occBuf_.buffer, offset);
+    }
+}
+
+void Raytracer::uploadMaterialRange(platform::VulkanContext& vk, uint32_t first, uint32_t count) {
+    VkDeviceSize totalBytes = static_cast<VkDeviceSize>(matWordsHost_.size()) * sizeof(uint32_t);
+    bool reallocated = false;
+    if (!ensureBuffer(vk, matIdxBuf_, totalBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &reallocated)) {
+        return;
+    }
+    matIdxBuf_.size = totalBytes;
+    if (totalBytes == 0) {
+        return;
+    }
+    if (reallocated || count == brickCount_) {
+        uploadCtx_.uploadBufferRegion(matWordsHost_.data(), totalBytes, matIdxBuf_.buffer, 0);
+    } else if (count > 0) {
+        const uint32_t* src = matWordsHost_.data() + static_cast<size_t>(first) * kMaterialWordsPerBrick;
+        VkDeviceSize offset = static_cast<VkDeviceSize>(first) * kMaterialWordsPerBrick * sizeof(uint32_t);
+        VkDeviceSize bytes = static_cast<VkDeviceSize>(count) * kMaterialWordsPerBrick * sizeof(uint32_t);
+        uploadCtx_.uploadBufferRegion(src, bytes, matIdxBuf_.buffer, offset);
+    }
+}
+
+void Raytracer::uploadPaletteRange(platform::VulkanContext& vk, uint32_t first, uint32_t count) {
+    VkDeviceSize totalBytes = static_cast<VkDeviceSize>(paletteHost_.size()) * sizeof(uint32_t);
+    bool reallocated = false;
+    if (!ensureBuffer(vk, paletteBuf_, totalBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &reallocated)) {
+        return;
+    }
+    paletteBuf_.size = totalBytes;
+    if (totalBytes == 0) {
+        return;
+    }
+    if (reallocated || count == brickCount_) {
+        uploadCtx_.uploadBufferRegion(paletteHost_.data(), totalBytes, paletteBuf_.buffer, 0);
+    } else if (count > 0) {
+        const uint32_t* src = paletteHost_.data() + static_cast<size_t>(first) * kPaletteEntriesPerBrick;
+        VkDeviceSize offset = static_cast<VkDeviceSize>(first) * kPaletteEntriesPerBrick * sizeof(uint32_t);
+        VkDeviceSize bytes = static_cast<VkDeviceSize>(count) * kPaletteEntriesPerBrick * sizeof(uint32_t);
+        uploadCtx_.uploadBufferRegion(src, bytes, paletteBuf_.buffer, offset);
+    }
+}
+
+void Raytracer::uploadAllWorldBuffers(platform::VulkanContext& vk) {
+    if (brickCount_ == 0u) {
+        bhBuf_.size = 0;
+        occBuf_.size = 0;
+        matIdxBuf_.size = 0;
+        paletteBuf_.size = 0;
+        return;
+    }
+    uploadHeadersRange(vk, 0, brickCount_);
+    uploadOccupancyRange(vk, 0, brickCount_);
+    uploadMaterialRange(vk, 0, brickCount_);
+    uploadPaletteRange(vk, 0, brickCount_);
+}
+
+void Raytracer::rebuildHashesAndMacro(platform::VulkanContext& vk) {
+    hashKeysHost_.clear();
+    hashValsHost_.clear();
+    macroKeysHost_.clear();
+    macroValsHost_.clear();
+
+    if (brickCount_ == 0u) {
+        hashCapacity_ = 0;
+        macroCapacity_ = 0;
+        hkBuf_.size = 0;
+        hvBuf_.size = 0;
+        mkBuf_.size = 0;
+        mvBuf_.size = 0;
+        return;
+    }
+
+    hashCapacity_ = 1u;
+    while (hashCapacity_ < brickCount_ * 2u) hashCapacity_ <<= 1u;
+    if (hashCapacity_ < 8u) hashCapacity_ = 8u;
+
+    hashKeysHost_.assign(hashCapacity_, 0ull);
+    hashValsHost_.assign(hashCapacity_, 0u);
+    const uint32_t mask = hashCapacity_ - 1u;
+    const uint64_t A = 0xff51afd7ed558ccdULL;
+    for (uint32_t i = 0; i < brickCount_; ++i) {
+        uint64_t key = brickRecords_[i].key;
+        uint64_t kx = key ^ (key >> 33);
+        uint32_t h = static_cast<uint32_t>((kx * A) >> 32) & mask;
+        for (uint32_t probe = 0; probe < hashCapacity_; ++probe) {
+            uint32_t idx = (h + probe) & mask;
+            if (hashKeysHost_[idx] == 0ull) {
+                hashKeysHost_[idx] = key;
+                hashValsHost_[idx] = i;
+                break;
             }
         }
     }
 
-    buildHash(combined);
-    buildMacroHash(combined, 8);
-
-    if (!uploadWorld(vk, combined)) {
-        return false;
+    bool reallocated = false;
+    VkDeviceSize hashKeyBytes = static_cast<VkDeviceSize>(hashKeysHost_.size()) * sizeof(uint64_t);
+    if (!ensureBuffer(vk, hkBuf_, hashKeyBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &reallocated)) {
+        return;
+    }
+    hkBuf_.size = hashKeyBytes;
+    if (hashKeyBytes > 0) {
+        uploadCtx_.uploadBufferRegion(hashKeysHost_.data(), hashKeyBytes, hkBuf_.buffer, 0);
     }
 
-    aggregateWorld_ = std::move(combined);
-    return true;
+    reallocated = false;
+    VkDeviceSize hashValBytes = static_cast<VkDeviceSize>(hashValsHost_.size()) * sizeof(uint32_t);
+    if (!ensureBuffer(vk, hvBuf_, hashValBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &reallocated)) {
+        return;
+    }
+    hvBuf_.size = hashValBytes;
+    if (hashValBytes > 0) {
+        uploadCtx_.uploadBufferRegion(hashValsHost_.data(), hashValBytes, hvBuf_.buffer, 0);
+    }
+
+    std::unordered_map<uint64_t, uint32_t> macroCounts;
+    macroCounts.reserve(brickCount_);
+    for (const auto& record : brickRecords_) {
+        int mx = divFloor(record.coord.x, static_cast<int>(macroDimBricks_));
+        int my = divFloor(record.coord.y, static_cast<int>(macroDimBricks_));
+        int mz = divFloor(record.coord.z, static_cast<int>(macroDimBricks_));
+        ++macroCounts[packMacroKey(mx, my, mz)];
+    }
+
+    if (macroCounts.empty()) {
+        macroCapacity_ = 0;
+        mkBuf_.size = 0;
+        mvBuf_.size = 0;
+        macroKeysHost_.clear();
+        macroValsHost_.clear();
+        return;
+    }
+
+    macroCapacity_ = 1u;
+    while (macroCapacity_ < macroCounts.size() * 2u) macroCapacity_ <<= 1u;
+    if (macroCapacity_ < 8u) macroCapacity_ = 8u;
+    macroKeysHost_.assign(macroCapacity_, 0ull);
+    macroValsHost_.assign(macroCapacity_, 0u);
+    const uint32_t macroMask = macroCapacity_ - 1u;
+    for (const auto& kv : macroCounts) {
+        uint64_t key = kv.first;
+        uint64_t kx = key ^ (key >> 33);
+        uint32_t h = static_cast<uint32_t>((kx * A) >> 32) & macroMask;
+        for (uint32_t probe = 0; probe < macroCapacity_; ++probe) {
+            uint32_t idx = (h + probe) & macroMask;
+            if (macroKeysHost_[idx] == 0ull) {
+                macroKeysHost_[idx] = key;
+                macroValsHost_[idx] = kv.second;
+                break;
+            }
+        }
+    }
+
+    reallocated = false;
+    VkDeviceSize macroKeyBytes = static_cast<VkDeviceSize>(macroKeysHost_.size()) * sizeof(uint64_t);
+    if (!ensureBuffer(vk, mkBuf_, macroKeyBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &reallocated)) {
+        return;
+    }
+    mkBuf_.size = macroKeyBytes;
+    if (macroKeyBytes > 0) {
+        uploadCtx_.uploadBufferRegion(macroKeysHost_.data(), macroKeyBytes, mkBuf_.buffer, 0);
+    }
+
+    reallocated = false;
+    VkDeviceSize macroValBytes = static_cast<VkDeviceSize>(macroValsHost_.size()) * sizeof(uint32_t);
+    if (!ensureBuffer(vk, mvBuf_, macroValBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &reallocated)) {
+        return;
+    }
+    mvBuf_.size = macroValBytes;
+    if (macroValBytes > 0) {
+        uploadCtx_.uploadBufferRegion(macroValsHost_.data(), macroValBytes, mvBuf_.buffer, 0);
+    }
+}
+
+void Raytracer::updateBrickHeader(uint32_t index) {
+    fixupBrickHeader(index);
+}
+
+void Raytracer::fixupBrickHeader(uint32_t index) {
+    if (index >= headersHost_.size() || index >= brickRecords_.size()) {
+        return;
+    }
+    world::BrickHeader& header = headersHost_[index];
+    const BrickRecord& record = brickRecords_[index];
+    header.occOffset = index * kOccWordsPerBrick * sizeof(uint64_t);
+    header.matIdxOffset = index * kMaterialWordsPerBrick * sizeof(uint32_t);
+    header.paletteCount = record.paletteCount;
+    header.flags = record.flags;
+    header.paletteOffset = (record.paletteCount > 0) ? index * kPaletteEntriesPerBrick * sizeof(uint32_t) : world::kInvalidOffset;
+    header.tsdfOffset = world::kInvalidOffset;
 }
 
 void Raytracer::destroyWorld(platform::VulkanContext& vk) {
@@ -735,16 +1032,22 @@ void Raytracer::destroyWorld(platform::VulkanContext& vk) {
     destroyBuffer(vk, materialTableBuf_);
     macroKeysHost_.clear();
     macroValsHost_.clear();
+    hashKeysHost_.clear();
+    hashValsHost_.clear();
     paletteHost_.clear();
     materialTableHost_.clear();
+    brickRecords_.clear();
+    headersHost_.clear();
+    occWordsHost_.clear();
+    matWordsHost_.clear();
+    brickLookup_.clear();
+    regionResidents_.clear();
     brickCount_ = 0;
     hashCapacity_ = 0;
     macroCapacity_ = 0;
     macroDimBricks_ = 0;
     materialCount_ = 0;
     markWorldDescriptorsDirty();
-    aggregateWorld_ = {};
-    regionWorlds_.clear();
 }
 
 namespace {
@@ -752,82 +1055,6 @@ constexpr VkDeviceSize kQueueHeaderBytes = sizeof(uint32_t) * 4;
 constexpr VkDeviceSize kRayPayloadBytes  = 80;
 constexpr VkDeviceSize kHitPayloadBytes  = 96;
 constexpr VkDeviceSize kMissPayloadBytes = 80;
-
-void buildHash(world::CpuWorld& world) {
-    const size_t n = world.headers.size();
-    uint32_t cap = 1u;
-    while (cap < n * 2u) cap <<= 1u;
-    if (cap < 8u) cap = 8u;
-    world.hashKeys.assign(cap, 0ull);
-    world.hashVals.assign(cap, 0u);
-
-    auto put = [&](uint64_t key, uint32_t val) {
-        const uint32_t mask = cap - 1u;
-        uint32_t h = static_cast<uint32_t>(((key ^ (key >> 33)) * 0xff51afd7ed558ccdULL) >> 32) & mask;
-        for (uint32_t probe = 0; probe < cap; ++probe) {
-            uint32_t idx = (h + probe) & mask;
-            if (world.hashKeys[idx] == 0ull) {
-                world.hashKeys[idx] = key;
-                world.hashVals[idx] = val;
-                return;
-            }
-        }
-    };
-
-    for (uint32_t i = 0; i < world.headers.size(); ++i) {
-        const auto& h = world.headers[i];
-        const uint64_t B = 1ull << 20;
-        uint64_t key = ((uint64_t)(h.bx + (int)B) << 42) |
-                       ((uint64_t)(h.by + (int)B) << 21) |
-                        (uint64_t)(h.bz + (int)B);
-        put(key, i);
-    }
-    world.hashCapacity = cap;
-}
-
-void buildMacroHash(world::CpuWorld& world, uint32_t macroDimBricks) {
-    world.macroDimBricks = macroDimBricks;
-    std::vector<uint64_t> unique;
-    unique.reserve(world.headers.size());
-    const auto divFloor = [](int a, int b) {
-        int q = a / b;
-        int r = a - q * b;
-        if (((a ^ b) < 0) && r != 0) --q;
-        return q;
-    };
-    for (const auto& h : world.headers) {
-        int mx = divFloor(h.bx, static_cast<int>(macroDimBricks));
-        int my = divFloor(h.by, static_cast<int>(macroDimBricks));
-        int mz = divFloor(h.bz, static_cast<int>(macroDimBricks));
-        const uint64_t B = 1ull << 20;
-        unique.push_back(((uint64_t)(mx + (int)B) << 42) |
-                         ((uint64_t)(my + (int)B) << 21) |
-                          (uint64_t)(mz + (int)B));
-    }
-    std::sort(unique.begin(), unique.end());
-    unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
-    uint32_t cap = 1u;
-    while (cap < unique.size() * 2u) cap <<= 1u;
-    if (cap < 8u) cap = 8u;
-    world.macroKeys.assign(cap, 0ull);
-    world.macroVals.assign(cap, 0u);
-    auto put = [&](uint64_t key, uint32_t val) {
-        const uint32_t mask = cap - 1u;
-        uint64_t kx = key ^ (key >> 33);
-        const uint64_t A = 0xff51afd7ed558ccdULL;
-        uint32_t h = static_cast<uint32_t>((kx * A) >> 32) & mask;
-        for (uint32_t probe = 0; probe < cap; ++probe) {
-            uint32_t idx = (h + probe) & mask;
-            if (world.macroKeys[idx] == 0ull) {
-                world.macroKeys[idx] = key;
-                world.macroVals[idx] = val;
-                return;
-            }
-        }
-    };
-    for (auto key : unique) put(key, 1u);
-    world.macroCapacity = cap;
-}
 
 uint32_t nextPow2(uint32_t v) {
     if (v <= 1u) return 1u;

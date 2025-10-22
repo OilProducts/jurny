@@ -12,6 +12,7 @@ class UploadContext {
 public:
     bool init(platform::VulkanContext& vk, VkDeviceSize initialStagingBytes = 4 * 1024 * 1024);
     bool uploadBuffer(const void* data, VkDeviceSize bytes, VkBuffer dstBuffer);
+    bool uploadBufferRegion(const void* data, VkDeviceSize bytes, VkBuffer dstBuffer, VkDeviceSize dstOffset);
     void flush();
     void shutdown();
 
