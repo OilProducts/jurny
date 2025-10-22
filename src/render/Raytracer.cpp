@@ -1,6 +1,7 @@
 #include "Raytracer.h"
 #include "world/BrickStore.h"
 #include "math/Spherical.h"
+#include "core/Assets.h"
 #include <spdlog/spdlog.h>
 #include <cstdio>
 #include <cstring>
@@ -558,7 +559,7 @@ bool Raytracer::createWorld(platform::VulkanContext& vk) {
     noiseParams_.caveAmplitude      = 5.0f;
     noiseParams_.caveThreshold      = 0.3f;
     worldSeed_ = 1337u;
-    store.configure(P, /*voxelSize*/0.5f, /*brickDim*/VOXEL_BRICK_SIZE, noiseParams_, worldSeed_);
+    store.configure(P, /*voxelSize*/0.5f, /*brickDim*/VOXEL_BRICK_SIZE, noiseParams_, worldSeed_, assets_);
 
     aggregateWorld_ = {};
     spdlog::info("Initial world bricks: 0 (0 MiB occupancy)");

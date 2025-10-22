@@ -12,9 +12,10 @@ Build
 - Configure: `cmake -S . -B build -G "Ninja" -DCMAKE_BUILD_TYPE=RelWithDebInfo`
 - Build: `cmake --build build -j`
 - Notes:
-  - Shaders compile to `build/shaders/*.spv` (also copied next to the app under `assets/shaders`).
-  - `build/assets/assets.pak` contains packed data from the `data/` folder; see “Toolchain” below.
-  - Populate `extern/` with submodules (glm, spdlog, volk, VMA, tracy, stb, xxhash) or point CMake to your local installs. Placeholders are present but headers/libs are not vendored.
+- Shaders compile to `build/shaders/*.spv` (also copied next to the app under `assets/shaders`).
+- `build/assets/assets.pak` contains packed data from the `data/` folder; see “Toolchain” below.
+- `build/assets/assets_index.txt` (tab-separated) mirrors the manifest for quick runtime lookup.
+- Populate `extern/` with submodules (glm, spdlog, volk, VMA, tracy, stb, xxhash) or point CMake to your local installs. Placeholders are present but headers/libs are not vendored.
 
 Tests
 - After configuring the build directory, run `cmake --build build --target run_tests` (wraps `ctest --output-on-failure`).
@@ -30,8 +31,9 @@ Key ideas
 
 Toolchain
 - `glslc` (from the Vulkan SDK) is required at configure time. CMake locates it via `$GLSLC`, `$VULKAN_SDK`, or the system PATH.
-- Shaders compile through `tools/shaderc_build/compile_shaders.py` (Python 3). The script writes SPIR-V into `build/shaders` and mirrors the same layout under `build/assets/shaders`. A manifest is emitted to `build/shaders/manifest.json`.
-- All runtime data in `data/` is packed by `tools/pack_assets` into `build/assets/assets.pak` plus `build/assets/assets_manifest.json`. Both are copied next to the executable automatically.
+- Shaders compile through `tools/shaderc_build/compile_shaders.py` (Python 3). The script writes SPIR-V into `build/shaders`, mirrors the layout under `build/assets/shaders`, and emits `build/shaders/manifest.json`.
+- All runtime data in `data/` is packed by `tools/pack_assets` into `build/assets/assets.pak`, alongside `build/assets/assets_manifest.json` and `build/assets/assets_index.txt`. The index is a simple tab-separated table (`path`, `offset`, `size`, `hash`) used by the runtime loader.
+- The app uses `core::AssetRegistry` to memory-map `assets.pak`, parse the index, and load files such as `materials.json` at startup.
 - Rebuild shaders/assets manually with `cmake --build build --target shaders_spv assets_packed`.
 
 Useful CMake options (ON/OFF)

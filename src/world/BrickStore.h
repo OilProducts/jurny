@@ -13,6 +13,8 @@
 #include "math/Spherical.h"
 #include "world/WorldGen.h"
 
+namespace core { class AssetRegistry; }
+
 // BrickStore — CPU brick generation & packing for a test slab near +X.
 // GPU upload is handled by the renderer for M2.
 namespace world {
@@ -36,7 +38,8 @@ struct CpuWorld {
 class BrickStore {
 public:
     void configure(const math::PlanetParams& P, float voxelSize, int brickDim,
-                   const WorldGen::NoiseParams& noise, std::uint32_t seed);
+                   const WorldGen::NoiseParams& noise, std::uint32_t seed,
+                   const core::AssetRegistry* assets = nullptr);
 
     CpuWorld buildCpuWorld(const std::vector<glm::ivec3>& brickCoords,
                            std::atomic<bool>* cancel = nullptr) const;
@@ -73,7 +76,7 @@ private:
     float voxelSize_ = 0.5f;
     math::PlanetParams params_{};
     std::vector<MaterialGpu> materialTable_;
-    void initMaterialTable();
+    void initMaterialTable(const core::AssetRegistry* assets);
     uint32_t classifyMaterial(const glm::vec3& p) const;
     mutable std::unordered_map<uint64_t, std::shared_ptr<const BrickPayload>> brickCache_;
     mutable std::mutex cacheMutex_;

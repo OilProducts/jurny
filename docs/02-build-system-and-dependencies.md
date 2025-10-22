@@ -153,7 +153,7 @@ Shader & Asset Toolchain
   - Calls `glslc` with the project feature macros; outputs live in `build/shaders/<rel>.spv`.
   - Copies the same layout into `build/assets/shaders/` and writes `build/shaders/manifest.json` (hashes, sizes, compile times).
   - Requires Python 3 and a Vulkan SDK providing `glslc` (resolved via `$GLSLC`, `$VULKAN_SDK`, or PATH). Outputs are tracked via a single `.stamp` target to keep Ninja happy.
-- `tools/pack_assets` merges the entire `data/` tree into `build/assets/assets.pak` with a JSON manifest `build/assets/assets_manifest.json` (offsets, sizes, XXHash64 checksums). The `assets_packed` custom target runs automatically and `voxel_app` depends on it.
+- `tools/pack_assets` merges the entire `data/` tree into `build/assets/assets.pak`, emits `build/assets/assets_manifest.json`, and writes a tab-separated index `build/assets/assets_index.txt` (path, offset, size, hash). The `assets_packed` custom target runs automatically and `voxel_app` depends on it.
 
 Install & Runtime Layout
 - `bin/` — executables and shared libs.

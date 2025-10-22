@@ -8,13 +8,15 @@
 #include <string>
 #include <unordered_map>
 #include <glm/vec3.hpp>
- 
+
 #include "core/Upload.h"
 #include "platform/VulkanContext.h"
 #include "platform/Swapchain.h"
 #include "world/BrickStore.h"
 
 // Raytracer — compute skeleton (shade sky → composite). M1 scaffolding.
+namespace core { class AssetRegistry; }
+
 namespace render {
 
 struct GlobalsUBOData {
@@ -47,6 +49,8 @@ public:
     void recordOverlay(VkCommandBuffer cb, uint32_t swapIndex);
     void readDebug(platform::VulkanContext& vk, uint32_t frameIdx);
     void shutdown(platform::VulkanContext& vk);
+
+    void setAssetRegistry(const core::AssetRegistry* assets) { assets_ = assets; }
 
     const world::BrickStore* worldStore() const { return brickStore_.get(); }
     bool addRegion(platform::VulkanContext& vk, const glm::ivec3& regionCoord, world::CpuWorld&& cpu);
@@ -115,6 +119,8 @@ private:
     uint32_t historyReadIndex_ = 0;
     uint32_t historyWriteIndex_ = 1;
     bool historyInitialized_ = false;
+
+    const core::AssetRegistry* assets_ = nullptr;
 
     // World buffers
     BufferResource bhBuf_{};

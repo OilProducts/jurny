@@ -22,6 +22,7 @@
 #include "math/Spherical.h"
 #include "core/FrameGraph.h"
 #include "core/Jobs.h"
+#include "core/Assets.h"
 #include "world/Streaming.h"
 #include <atomic>
 #include <mutex>
@@ -81,6 +82,23 @@ int App::run() {
 #else
         "assets";
 #endif
+    std::string assetRoot = assetsDir ? assetsDir : std::string{};
+    core::AssetRegistry assetRegistry;
+    bool assetsReady = false;
+    if (!assetRoot.empty()) {
+        if (assetRegistry.initialize(assetRoot)) {
+            assetsReady = true;
+            spdlog::info("Asset pack loaded: {} entries", assetRegistry.assetList().size());
+            if (!assetRegistry.contains("materials.json")) {
+                spdlog::warn("materials.json not found in asset pack");
+            }
+        } else {
+            spdlog::warn("Failed to initialize asset registry at '{}'", assetRoot);
+        }
+    } else {
+        spdlog::warn("Asset directory not specified; proceeding without packed assets");
+    }
+
     std::string spvPath = std::string(assetsDir) + "/shaders/shell_visual.comp.spv";
     std::vector<uint32_t> spv = readFile(spvPath.c_str());
     if (spv.empty()) { spdlog::error("Failed to load %s. You may need to build shaders.", spvPath.c_str()); return 1; }
@@ -139,6 +157,9 @@ int App::run() {
 
     // Initialize Raytracer M1 skeleton
     render::Raytracer ray;
+    if (assetsReady) {
+        ray.setAssetRegistry(&assetRegistry);
+    }
     if (!ray.init(vk, swap)) {
         spdlog::error("Raytracer init failed.");
         return 1;

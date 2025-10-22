@@ -7,6 +7,10 @@
 #include <cstring>
 #include <atomic>
 #include <spdlog/spdlog.h>
+#include <sstream>
+#include <cctype>
+
+#include "core/Assets.h"
 
 namespace world {
 
@@ -88,12 +92,13 @@ void BrickStore::buildMacroHash(CpuWorld& world, uint32_t macroDimBricks) {
 }
 
 void BrickStore::configure(const math::PlanetParams& P, float voxelSize, int brickDim,
-                           const WorldGen::NoiseParams& noise, std::uint32_t seed) {
+                           const WorldGen::NoiseParams& noise, std::uint32_t seed,
+                           const core::AssetRegistry* assets) {
     params_ = P;
     voxelSize_ = voxelSize;
     brickDim_ = brickDim;
     brickSize_ = voxelSize * static_cast<float>(brickDim_);
-    initMaterialTable();
+    initMaterialTable(assets);
     worldGen_.configure(P, noise, seed);
     {
         std::lock_guard<std::mutex> lock(cacheMutex_);
@@ -101,26 +106,118 @@ void BrickStore::configure(const math::PlanetParams& P, float voxelSize, int bri
     }
 }
 
-void BrickStore::initMaterialTable() {
+namespace {
+MaterialGpu makeMaterial(glm::vec3 baseColor, float roughness, float metalness, float emission) {
+    MaterialGpu m{};
+    m.baseColor[0] = baseColor.x;
+    m.baseColor[1] = baseColor.y;
+    m.baseColor[2] = baseColor.z;
+    m.roughness = roughness;
+    m.emission = emission;
+    m.metalness = metalness;
+    m.pad[0] = 0.0f;
+    m.pad[1] = 0.0f;
+    return m;
+}
+
+bool parseArray3(std::string_view obj, std::string_view key, glm::vec3& out) {
+    size_t pos = obj.find(key);
+    if (pos == std::string_view::npos) return false;
+    pos = obj.find('[', pos);
+    if (pos == std::string_view::npos) return false;
+    size_t end = obj.find(']', pos);
+    if (end == std::string_view::npos) return false;
+    std::string values(obj.substr(pos + 1, end - pos - 1));
+    std::stringstream ss(values);
+    float v0 = out.x, v1 = out.y, v2 = out.z;
+    char comma = 0;
+    if (!(ss >> v0)) return false;
+    ss >> comma;
+    if (!(ss >> v1)) return false;
+    ss >> comma;
+    if (!(ss >> v2)) return false;
+    out = glm::vec3(v0, v1, v2);
+    return true;
+}
+
+bool parseFloat(std::string_view obj, std::string_view key, float& out) {
+    size_t pos = obj.find(key);
+    if (pos == std::string_view::npos) return false;
+    pos = obj.find(':', pos);
+    if (pos == std::string_view::npos) return false;
+    pos = obj.find_first_of("-0123456789", pos);
+    if (pos == std::string_view::npos) return false;
+    size_t end = pos;
+    while (end < obj.size()) {
+        char c = obj[end];
+        if (!(std::isdigit(static_cast<unsigned char>(c)) || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-')) {
+            break;
+        }
+        ++end;
+    }
+    try {
+        out = std::stof(std::string(obj.substr(pos, end - pos)));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool loadMaterialsFromJson(std::string_view json, std::vector<MaterialGpu>& out) {
+    size_t arrayPos = json.find("\"materials\"");
+    if (arrayPos == std::string_view::npos) return false;
+    arrayPos = json.find('[', arrayPos);
+    if (arrayPos == std::string_view::npos) return false;
+    size_t pos = arrayPos;
+    std::vector<MaterialGpu> materials;
+    while (true) {
+        size_t objStart = json.find('{', pos);
+        if (objStart == std::string_view::npos) break;
+        size_t objEnd = json.find('}', objStart);
+        if (objEnd == std::string_view::npos) break;
+        std::string_view obj = json.substr(objStart, objEnd - objStart + 1);
+        glm::vec3 baseColor(0.8f);
+        float emission = 0.0f;
+        float roughness = 0.6f;
+        float metalness = 0.0f;
+        parseArray3(obj, "\"baseColor\"", baseColor);
+        parseFloat(obj, "\"emission\"", emission);
+        parseFloat(obj, "\"roughness\"", roughness);
+        parseFloat(obj, "\"metalness\"", metalness);
+        materials.push_back(makeMaterial(baseColor, roughness, metalness, emission));
+        pos = objEnd + 1;
+    }
+    if (!materials.empty()) {
+        out = std::move(materials);
+        return true;
+    }
+    return false;
+}
+} // namespace
+
+void BrickStore::initMaterialTable(const core::AssetRegistry* assets) {
     materialTable_.clear();
-    auto makeMaterial = [](glm::vec3 baseColor, float roughness, float metalness, float emission = 0.0f) {
-        MaterialGpu m{};
-        m.baseColor[0] = baseColor.x;
-        m.baseColor[1] = baseColor.y;
-        m.baseColor[2] = baseColor.z;
-        m.roughness = roughness;
-        m.emission = emission;
-        m.metalness = metalness;
-        m.pad[0] = 0.0f;
-        m.pad[1] = 0.0f;
-        return m;
+    if (assets) {
+        std::string json;
+        if (assets->loadText("materials.json", json)) {
+            if (loadMaterialsFromJson(json, materialTable_)) {
+                spdlog::info("Loaded {} materials from assets", materialTable_.size());
+                return;
+            }
+            spdlog::warn("Failed to parse materials.json; falling back to defaults");
+        } else {
+            spdlog::warn("materials.json not found in asset pack");
+        }
+    }
+    auto addDefault = [&](glm::vec3 baseColor, float roughness, float metalness, float emission = 0.0f) {
+        materialTable_.push_back(makeMaterial(baseColor, roughness, metalness, emission));
     };
-    materialTable_.push_back(makeMaterial(glm::vec3(0.36f, 0.34f, 0.33f), 0.85f, 0.0f)); // 0 rock
-    materialTable_.push_back(makeMaterial(glm::vec3(0.43f, 0.28f, 0.16f), 0.75f, 0.0f)); // 1 dirt
-    materialTable_.push_back(makeMaterial(glm::vec3(0.18f, 0.45f, 0.17f), 0.52f, 0.0f)); // 2 grass
-    materialTable_.push_back(makeMaterial(glm::vec3(0.92f, 0.92f, 0.96f), 0.20f, 0.0f)); // 3 snow
-    materialTable_.push_back(makeMaterial(glm::vec3(0.76f, 0.68f, 0.45f), 0.55f, 0.0f)); // 4 sand
-    materialTable_.push_back(makeMaterial(glm::vec3(0.20f, 0.22f, 0.25f), 0.35f, 0.0f)); // 5 basalt cliff
+    addDefault(glm::vec3(0.36f, 0.34f, 0.33f), 0.85f, 0.0f); // rock
+    addDefault(glm::vec3(0.43f, 0.28f, 0.16f), 0.75f, 0.0f); // dirt
+    addDefault(glm::vec3(0.18f, 0.45f, 0.17f), 0.52f, 0.0f); // grass
+    addDefault(glm::vec3(0.92f, 0.92f, 0.96f), 0.20f, 0.0f); // snow
+    addDefault(glm::vec3(0.76f, 0.68f, 0.45f), 0.55f, 0.0f); // sand
+    addDefault(glm::vec3(0.20f, 0.22f, 0.25f), 0.35f, 0.0f); // basalt cliff
 }
 
 uint32_t BrickStore::classifyMaterial(const glm::vec3& p) const {

@@ -20,6 +20,7 @@ struct Options {
     fs::path outDir;
     fs::path pakFile;
     fs::path manifestFile;
+    fs::path indexFile;
     bool verbose = false;
 };
 
@@ -65,11 +66,13 @@ struct AssetEntry {
             opts.pakFile = fs::path(argv[++i]);
         } else if (arg == "--manifest" && i + 1 < argc) {
             opts.manifestFile = fs::path(argv[++i]);
+        } else if (arg == "--index" && i + 1 < argc) {
+            opts.indexFile = fs::path(argv[++i]);
         } else if (arg == "--verbose") {
             opts.verbose = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: pack_assets --data-dir DIR --out-dir DIR [--pak FILE] "
-                         "[--manifest FILE] [--verbose]\n";
+                         "[--manifest FILE] [--index FILE] [--verbose]\n";
             std::exit(0);
         } else {
             std::cerr << "Unknown argument: " << arg << "\n";
@@ -90,6 +93,9 @@ struct AssetEntry {
     }
     if (opts.manifestFile.empty()) {
         opts.manifestFile = opts.outDir / "assets_manifest.json";
+    }
+    if (opts.indexFile.empty()) {
+        opts.indexFile = opts.outDir / "assets_index.txt";
     }
     return opts;
 }
@@ -184,6 +190,21 @@ void write_manifest(const fs::path& manifestPath, const std::vector<AssetEntry>&
     out << "}\n";
 }
 
+void write_index(const fs::path& indexPath, const std::vector<AssetEntry>& assets) {
+    fs::create_directories(indexPath.parent_path());
+    std::ofstream out(indexPath, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("Failed to open index for writing: " + indexPath.string());
+    }
+    out << "# path\toffset\tsize\thash_xxhash64\n";
+    for (const auto& asset : assets) {
+        out << asset.logicalPath << '\t'
+            << asset.offset << '\t'
+            << asset.size << '\t'
+            << "0x" << hex64(asset.hash) << '\n';
+    }
+}
+
 int main(int argc, char** argv) {
     try {
         Options opts = parse_cli(argc, argv);
@@ -191,12 +212,14 @@ int main(int argc, char** argv) {
         opts.outDir = fs::absolute(opts.outDir);
         opts.pakFile = fs::absolute(opts.pakFile);
         opts.manifestFile = fs::absolute(opts.manifestFile);
+        opts.indexFile = fs::absolute(opts.indexFile);
 
         auto assets = gather_assets(opts.dataDir);
         if (assets.empty()) {
             fs::create_directories(opts.outDir);
             std::ofstream(opts.pakFile, std::ios::binary | std::ios::trunc).close();
             write_manifest(opts.manifestFile, assets);
+            write_index(opts.indexFile, assets);
             if (opts.verbose) {
                 std::cout << "No assets found; wrote empty pack.\n";
             }
@@ -205,6 +228,7 @@ int main(int argc, char** argv) {
 
         write_pak(opts.pakFile, assets);
         write_manifest(opts.manifestFile, assets);
+        write_index(opts.indexFile, assets);
 
         if (opts.verbose) {
             std::cout << "Packed " << assets.size() << " assets into " << opts.pakFile << "\n";

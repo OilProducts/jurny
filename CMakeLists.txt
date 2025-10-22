@@ -90,21 +90,23 @@ endforeach()
 set(VOXEL_ASSET_OUTPUT_DIR "${CMAKE_BINARY_DIR}/assets")
 set(VOXEL_ASSET_PAK "${VOXEL_ASSET_OUTPUT_DIR}/assets.pak")
 set(VOXEL_ASSET_MANIFEST "${VOXEL_ASSET_OUTPUT_DIR}/assets_manifest.json")
+set(VOXEL_ASSET_INDEX "${VOXEL_ASSET_OUTPUT_DIR}/assets_index.txt")
 
 if(BUILD_TOOLS)
   add_custom_command(
-    OUTPUT "${VOXEL_ASSET_PAK}" "${VOXEL_ASSET_MANIFEST}"
+    OUTPUT "${VOXEL_ASSET_PAK}" "${VOXEL_ASSET_MANIFEST}" "${VOXEL_ASSET_INDEX}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${VOXEL_ASSET_OUTPUT_DIR}"
     COMMAND $<TARGET_FILE:pack_assets>
             --data-dir "${VOXEL_ASSET_DATA_DIR}"
             --out-dir "${VOXEL_ASSET_OUTPUT_DIR}"
             --pak "${VOXEL_ASSET_PAK}"
             --manifest "${VOXEL_ASSET_MANIFEST}"
+            --index "${VOXEL_ASSET_INDEX}"
     DEPENDS ${VOXEL_ASSET_FILES} pack_assets
     COMMENT "Packing assets (materials, envmaps, data)"
     VERBATIM
   )
-  add_custom_target(assets_packed ALL DEPENDS "${VOXEL_ASSET_PAK}" "${VOXEL_ASSET_MANIFEST}")
+  add_custom_target(assets_packed ALL DEPENDS "${VOXEL_ASSET_PAK}" "${VOXEL_ASSET_MANIFEST}" "${VOXEL_ASSET_INDEX}")
   add_dependencies(assets_packed pack_assets)
 else()
   add_custom_target(assets_packed
