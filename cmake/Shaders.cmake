@@ -80,18 +80,21 @@ function(voxel_compile_shaders)
       list(APPEND python_cmd --source "${src}")
     endforeach()
 
+    set(SHADER_STAMP "${SHADER_OUTPUT_DIR}/shader_compile.stamp")
+
     add_custom_command(
-      OUTPUT ${OUT_SVPS} ${OUT_ASSET_SVPS} "${SHADER_MANIFEST}"
+      OUTPUT "${SHADER_STAMP}"
+      BYPRODUCTS ${OUT_SVPS} ${OUT_ASSET_SVPS} "${SHADER_MANIFEST}"
       COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUTPUT_DIR}"
       COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_ASSET_DIR}"
       COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_DEP_DIR}"
       COMMAND ${python_cmd}
+      COMMAND ${CMAKE_COMMAND} -E touch "${SHADER_STAMP}"
       DEPENDS ${GLSL_SOURCES} ${GLSL_INCLUDES} "${SHADER_SCRIPT}"
-      BYPRODUCTS ${OUT_SVPS} ${OUT_ASSET_SVPS} "${SHADER_MANIFEST}"
       COMMENT "Compiling GLSL shaders via compile_shaders.py"
       VERBATIM
     )
-    add_custom_target(shaders_spv ALL DEPENDS ${OUT_SVPS} ${OUT_ASSET_SVPS})
+    add_custom_target(shaders_spv ALL DEPENDS "${SHADER_STAMP}")
     set(${VOXEL_SHADERS_OUT_VAR} ${OUT_SVPS} PARENT_SCOPE)
   else()
     add_custom_target(shaders_spv)
