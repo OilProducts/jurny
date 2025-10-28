@@ -1126,6 +1126,7 @@ void Raytracer::updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData&
 }
 
 void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, VkCommandBuffer cb, uint32_t swapIndex) {
+    refreshWorldDescriptors(vk);
     updateFrameDescriptors(vk, swap, swapIndex);
     gpuBuffers_.writeQueueHeaders(cb);
     gpuBuffers_.zeroStats(cb);
