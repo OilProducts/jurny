@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <chrono>
 #include <cmath>
+#include <utility>
 #include <sstream>
 #include <iomanip>
 #include <glm/glm.hpp>
@@ -99,7 +100,9 @@ int App::run() {
     }
     spdlog::debug("Raytracer initialized");
     const float planetRadius = 100.0f;
-    if (const auto* store = ray.worldStore()) {
+    const float eyeHeight = 1.7f;
+    const world::BrickStore* brickStore = ray.worldStore();
+    if (brickStore) {
         world::Streaming::Config streamCfg;
         streamCfg.shellInner = planetRadius - 25.0f;
         streamCfg.shellOuter = planetRadius + 75.0f;
@@ -111,7 +114,7 @@ int App::run() {
         streamCfg.regionDimBricks = 16;
         streamCfg.maxRegionSelectionsPerFrame = 4;
         streamCfg.maxConcurrentGenerations = std::max(2, static_cast<int>(jobs.workerCount()));
-        streaming.initialize(*store, streamCfg, &jobs);
+        streaming.initialize(*brickStore, streamCfg, &jobs);
         spdlog::debug("Streaming initialized");
     } else {
         spdlog::warn("Streaming not initialized: no brick store available");
@@ -128,6 +131,34 @@ int App::run() {
     glm::mat4 prevProjMat(1.0f);
     float yawDeg = 180.0f;
     float pitchDeg = 0.0f;
+    enum class CameraMode { FreeFly, SurfaceWalk };
+    CameraMode cameraMode = CameraMode::FreeFly;
+    bool surfaceTogglePrev = false;
+    glm::dvec3 walkPos = camWorld;
+    bool walkPosValid = false;
+    auto sampleSurface = [&](const glm::dvec3& guess) -> std::pair<glm::dvec3, glm::dvec3> {
+        if (!brickStore) {
+            glm::dvec3 dir = glm::length(guess) > 1e-6 ? glm::normalize(guess) : glm::dvec3(0.0, 0.0, 1.0);
+            glm::dvec3 pos = dir * double(planetRadius);
+            return {pos, dir};
+        }
+        glm::vec3 p = glm::vec3(guess);
+        const float eps = brickStore->voxelSize();
+        glm::vec3 normal = glm::normalize(brickStore->worldGen().crustNormal(p, eps));
+        for (int i = 0; i < 8; ++i) {
+            float field = brickStore->worldGen().crustField(p);
+            if (!std::isfinite(field)) break;
+            if (std::abs(field) < 0.01f) break;
+            normal = glm::normalize(brickStore->worldGen().crustNormal(p, eps));
+            p -= normal * field;
+        }
+        normal = glm::normalize(brickStore->worldGen().crustNormal(p, eps));
+        if (glm::length(normal) < 1e-4f) {
+            glm::vec3 dir = glm::length(p) > 1e-6f ? glm::normalize(p) : glm::vec3(0.0f, 0.0f, 1.0f);
+            normal = dir;
+        }
+        return {glm::dvec3(p), glm::dvec3(normal)};
+    };
     bool firstMouse = true;
     double lastX = 0.0, lastY = 0.0;
 #if VOXEL_ENABLE_WINDOW
@@ -190,27 +221,92 @@ int App::run() {
 
         const float yawRad = glm::radians(yawDeg);
         const float pitchRad = glm::radians(pitchDeg);
-        forward.x = std::cos(pitchRad) * std::cos(yawRad);
-        forward.y = std::cos(pitchRad) * std::sin(yawRad);
-        forward.z = std::sin(pitchRad);
-        forward = glm::normalize(forward);
-        glm::vec3 worldUp(0.0f, 0.0f, 1.0f);
-        glm::vec3 right = glm::normalize(glm::cross(forward, worldUp));
-        if (glm::dot(right, right) < 1e-4f) {
-            right = glm::vec3(1.0f, 0.0f, 0.0f);
-        }
-        up = glm::normalize(glm::cross(right, forward));
 
-        float moveSpeed = 5.0f;
-        if (glfwGetKey(window.handle(), GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS || glfwGetKey(window.handle(), GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
-            moveSpeed *= 2.0f;
+        int surfaceKeyState = glfwGetKey(window.handle(), GLFW_KEY_F);
+        bool surfacePressed = (surfaceKeyState == GLFW_PRESS);
+        if (surfacePressed && !surfaceTogglePrev) {
+            if (cameraMode == CameraMode::FreeFly) {
+                cameraMode = CameraMode::SurfaceWalk;
+                auto surfaceSample = sampleSurface(camWorld);
+                walkPos = surfaceSample.first;
+                walkPosValid = true;
+            } else {
+                cameraMode = CameraMode::FreeFly;
+                camWorld = walkPos;
+                walkPosValid = false;
+            }
         }
-        if (glfwGetKey(window.handle(), GLFW_KEY_W) == GLFW_PRESS) camWorld += glm::dvec3(forward) * double(moveSpeed * dt);
-        if (glfwGetKey(window.handle(), GLFW_KEY_S) == GLFW_PRESS) camWorld -= glm::dvec3(forward) * double(moveSpeed * dt);
-        if (glfwGetKey(window.handle(), GLFW_KEY_A) == GLFW_PRESS) camWorld -= glm::dvec3(right)   * double(moveSpeed * dt);
-        if (glfwGetKey(window.handle(), GLFW_KEY_D) == GLFW_PRESS) camWorld += glm::dvec3(right)   * double(moveSpeed * dt);
-        if (glfwGetKey(window.handle(), GLFW_KEY_SPACE) == GLFW_PRESS) camWorld += glm::dvec3(up) * double(moveSpeed * dt);
-        if (glfwGetKey(window.handle(), GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS) camWorld -= glm::dvec3(up) * double(moveSpeed * dt);
+        surfaceTogglePrev = surfacePressed;
+
+        glm::vec3 worldUp(0.0f, 0.0f, 1.0f);
+        if (cameraMode == CameraMode::FreeFly) {
+            forward.x = std::cos(pitchRad) * std::cos(yawRad);
+            forward.y = std::cos(pitchRad) * std::sin(yawRad);
+            forward.z = std::sin(pitchRad);
+            forward = glm::normalize(forward);
+            glm::vec3 right = glm::normalize(glm::cross(forward, worldUp));
+            if (glm::dot(right, right) < 1e-4f) {
+                right = glm::vec3(1.0f, 0.0f, 0.0f);
+            }
+            up = glm::normalize(glm::cross(right, forward));
+
+            float moveSpeed = 5.0f;
+            if (glfwGetKey(window.handle(), GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS || glfwGetKey(window.handle(), GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
+                moveSpeed *= 2.0f;
+            }
+            if (glfwGetKey(window.handle(), GLFW_KEY_W) == GLFW_PRESS) camWorld += glm::dvec3(forward) * double(moveSpeed * dt);
+            if (glfwGetKey(window.handle(), GLFW_KEY_S) == GLFW_PRESS) camWorld -= glm::dvec3(forward) * double(moveSpeed * dt);
+            if (glfwGetKey(window.handle(), GLFW_KEY_A) == GLFW_PRESS) camWorld -= glm::dvec3(right)   * double(moveSpeed * dt);
+            if (glfwGetKey(window.handle(), GLFW_KEY_D) == GLFW_PRESS) camWorld += glm::dvec3(right)   * double(moveSpeed * dt);
+            if (glfwGetKey(window.handle(), GLFW_KEY_SPACE) == GLFW_PRESS) camWorld += glm::dvec3(up) * double(moveSpeed * dt);
+            if (glfwGetKey(window.handle(), GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS) camWorld -= glm::dvec3(up) * double(moveSpeed * dt);
+        } else {
+            if (!walkPosValid) {
+                auto surfaceSample = sampleSurface(camWorld);
+                walkPos = surfaceSample.first;
+                walkPosValid = true;
+            }
+            auto surfaceSample = sampleSurface(walkPos);
+            walkPos = surfaceSample.first;
+            glm::dvec3 upD = glm::normalize(surfaceSample.second);
+            if (glm::length(upD) < 1e-6) {
+                upD = glm::dvec3(0.0, 0.0, 1.0);
+            }
+            glm::dvec3 east = glm::cross(glm::dvec3(0.0, 0.0, 1.0), upD);
+            if (glm::length(east) < 1e-6) {
+                east = glm::dvec3(1.0, 0.0, 0.0);
+            }
+            east = glm::normalize(east);
+            glm::dvec3 north = glm::normalize(glm::cross(upD, east));
+            double cosYaw = std::cos(static_cast<double>(yawRad));
+            double sinYaw = std::sin(static_cast<double>(yawRad));
+            glm::dvec3 heading = glm::normalize(east * cosYaw + north * sinYaw);
+            glm::dvec3 moveRight = glm::normalize(glm::cross(heading, upD));
+
+            float moveSpeed = 5.0f;
+            if (glfwGetKey(window.handle(), GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS || glfwGetKey(window.handle(), GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
+                moveSpeed *= 2.0f;
+            }
+            if (glfwGetKey(window.handle(), GLFW_KEY_W) == GLFW_PRESS) walkPos += heading * double(moveSpeed * dt);
+            if (glfwGetKey(window.handle(), GLFW_KEY_S) == GLFW_PRESS) walkPos -= heading * double(moveSpeed * dt);
+            if (glfwGetKey(window.handle(), GLFW_KEY_A) == GLFW_PRESS) walkPos -= moveRight * double(moveSpeed * dt);
+            if (glfwGetKey(window.handle(), GLFW_KEY_D) == GLFW_PRESS) walkPos += moveRight * double(moveSpeed * dt);
+
+            surfaceSample = sampleSurface(walkPos);
+            walkPos = surfaceSample.first;
+            upD = glm::normalize(surfaceSample.second);
+            if (glm::length(upD) < 1e-6) {
+                upD = glm::dvec3(0.0, 0.0, 1.0);
+            }
+            glm::dvec3 cameraPosD = walkPos + upD * double(eyeHeight);
+            camWorld = cameraPosD;
+
+            double cosPitch = std::cos(static_cast<double>(pitchRad));
+            double sinPitch = std::sin(static_cast<double>(pitchRad));
+            glm::dvec3 viewForwardD = glm::normalize(heading * cosPitch + upD * sinPitch);
+            forward = glm::vec3(viewForwardD);
+            up = glm::vec3(upD);
+        }
 #else
         forward = glm::vec3(-1.0f, 0.0f, 0.0f);
 #endif
