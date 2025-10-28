@@ -14,6 +14,10 @@
 #include "platform/VulkanContext.h"
 #include "platform/Swapchain.h"
 #include "world/BrickStore.h"
+#include "render/GpuBuffers.h"
+#include "render/Denoiser.h"
+#include "render/Tonemap.h"
+#include "render/Overlays.h"
 
 // Raytracer — compute skeleton (shade sky → composite). M1 scaffolding.
 namespace core { class AssetRegistry; }
@@ -81,9 +85,6 @@ private:
     void destroyBuffer(platform::VulkanContext& vk, BufferResource& buf);
     void markWorldDescriptorsDirty();
     void refreshWorldDescriptors(platform::VulkanContext& vk);
-    bool createQueues(platform::VulkanContext& vk);
-    void destroyQueues(platform::VulkanContext& vk);
-    void writeQueueHeaders(VkCommandBuffer cb);
     bool appendRegion(platform::VulkanContext& vk, world::CpuWorld&& cpu, const glm::ivec3& regionCoord);
     bool removeRegionInternal(platform::VulkanContext& vk, const glm::ivec3& regionCoord);
     void rebuildHashesAndMacro(platform::VulkanContext& vk);
@@ -96,8 +97,6 @@ private:
     void fixupBrickHeader(uint32_t index);
     bool createProfilingResources(platform::VulkanContext& vk);
    void destroyProfilingResources(platform::VulkanContext& vk);
-   bool createStatsBuffer(platform::VulkanContext& vk);
-   void destroyStatsBuffer(platform::VulkanContext& vk);
     void updateFrameDescriptors(platform::VulkanContext& vk, platform::Swapchain& swap, uint32_t swapIndex);
 
 private:
@@ -113,23 +112,7 @@ private:
     std::vector<VkDescriptorSet> sets_;
 
     VkBuffer ubo_{}; VkDeviceMemory uboMem_{};
-    VkImage currColorImage_{}; VkDeviceMemory currColorMem_{}; VkImageView currColorView_{};
-    VkFormat currColorFormat_{}; VkExtent2D extent_{};
-    VkImage motionImage_{}; VkDeviceMemory motionMem_{}; VkImageView motionView_{};
-    VkFormat motionFormat_{};
-    VkImage albedoImage_{}; VkDeviceMemory albedoMem_{}; VkImageView albedoView_{};
-    VkImage normalImage_{}; VkDeviceMemory normalMem_{}; VkImageView normalView_{};
-    VkImage momentsImage_{}; VkDeviceMemory momentsMem_{}; VkImageView momentsView_{};
-    struct HistoryImage {
-        VkImage image = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        VkImageView view = VK_NULL_HANDLE;
-    };
-    std::array<HistoryImage, 2> history_{};
-    std::array<HistoryImage, 2> historyMoments_{};
-    uint32_t historyReadIndex_ = 0;
-    uint32_t historyWriteIndex_ = 1;
-    bool historyInitialized_ = false;
+    VkExtent2D extent_{};
 
     const core::AssetRegistry* assets_ = nullptr;
 
@@ -143,13 +126,6 @@ private:
     BufferResource paletteBuf_{};
     BufferResource matIdxBuf_{};
     BufferResource materialTableBuf_{};
-    // Ray/hit/miss queues
-    VkBuffer rayQueueBuf_{};      VkDeviceMemory rayQueueMem_{};
-    VkBuffer hitQueueBuf_{};      VkDeviceMemory hitQueueMem_{};
-    VkBuffer missQueueBuf_{};     VkDeviceMemory missQueueMem_{};
-    VkBuffer secondaryQueueBuf_{};VkDeviceMemory secondaryQueueMem_{};
-    uint32_t queueCapacity_{};
-    VkBuffer statsBuf_{}; VkDeviceMemory statsMem_{};
     struct TraversalStatsHost {
         uint32_t macroVisited;
         uint32_t macroSkipped;
@@ -175,12 +151,10 @@ private:
     uint32_t lastDbgFrame_{}; int lastMcX_{}; int lastMcY_{}; int lastMcZ_{}; int lastPresent_{};
     uint32_t currFrameIdx_{};
     glm::vec3 renderOrigin_{0.0f};
-    VkBuffer overlayBuf_{}; VkDeviceMemory overlayMem_{}; VkDeviceSize overlayCapacity_{};
-    uint32_t overlayCharsX_ = 0;
-    uint32_t overlayCharsY_ = 0;
-    uint32_t overlayPixelWidth_ = 0;
-    uint32_t overlayPixelHeight_ = 0;
-    bool overlayActive_ = false;
+    GpuBuffers gpuBuffers_;
+    Denoiser denoiser_;
+    Tonemap tonemap_;
+    Overlays overlays_;
 
     struct BrickRecord {
         uint64_t key = 0;

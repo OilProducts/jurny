@@ -183,65 +183,21 @@ void Raytracer::refreshWorldDescriptors(platform::VulkanContext& vk) {
 
 bool Raytracer::createImages(platform::VulkanContext& vk, platform::Swapchain& swap) {
     extent_ = swap.extent();
-    currColorFormat_ = VK_FORMAT_R16G16B16A16_SFLOAT;
-    motionFormat_ = VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (!gpuBuffers_.init(vk, extent_)) return false;
+    if (!denoiser_.init(vk, extent_)) return false;
 
-    auto createStorageImage = [&](VkFormat fmt, VkImage& image, VkDeviceMemory& memory, VkImageView& view) -> bool {
-        VkImageCreateInfo ici{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-        ici.imageType = VK_IMAGE_TYPE_2D;
-        ici.format = fmt;
-        ici.extent = { extent_.width, extent_.height, 1 };
-        ici.mipLevels = 1; ici.arrayLayers = 1;
-        ici.samples = VK_SAMPLE_COUNT_1_BIT;
-        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        if (vkCreateImage(vk.device(), &ici, nullptr, &image) != VK_SUCCESS) return false;
-        VkMemoryRequirements mr{}; vkGetImageMemoryRequirements(vk.device(), image, &mr);
-        uint32_t typeIndex = findMemoryType(vk.physicalDevice(), mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        mai.allocationSize = mr.size; mai.memoryTypeIndex = typeIndex;
-        if (vkAllocateMemory(vk.device(), &mai, nullptr, &memory) != VK_SUCCESS) return false;
-        vkBindImageMemory(vk.device(), image, memory, 0);
-        VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        vci.image = image;
-        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vci.format = fmt;
-        vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        vci.subresourceRange.levelCount = 1;
-        vci.subresourceRange.layerCount = 1;
-        if (vkCreateImageView(vk.device(), &vci, nullptr, &view) != VK_SUCCESS) return false;
-        return true;
-    };
-
-    if (!createStorageImage(currColorFormat_, currColorImage_, currColorMem_, currColorView_)) return false;
-    if (!createStorageImage(motionFormat_, motionImage_, motionMem_, motionView_)) return false;
-    if (!createStorageImage(currColorFormat_, albedoImage_, albedoMem_, albedoView_)) return false;
-    if (!createStorageImage(currColorFormat_, normalImage_, normalMem_, normalView_)) return false;
-    if (!createStorageImage(currColorFormat_, momentsImage_, momentsMem_, momentsView_)) return false;
-    for (size_t i = 0; i < history_.size(); ++i) {
-        if (!createStorageImage(currColorFormat_, history_[i].image, history_[i].memory, history_[i].view)) return false;
-    }
-    for (size_t i = 0; i < historyMoments_.size(); ++i) {
-        if (!createStorageImage(currColorFormat_, historyMoments_[i].image, historyMoments_[i].memory, historyMoments_[i].view)) return false;
-    }
-    historyReadIndex_ = 0;
-    historyWriteIndex_ = 1;
-    historyInitialized_ = false;
-
-    // Transition all images to GENERAL layout
     VkCommandBufferAllocateInfo cbai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     cbai.commandPool = vk.commandPool();
     cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cbai.commandBufferCount = 1;
     VkCommandBuffer cb{};
     vkAllocateCommandBuffers(vk.device(), &cbai, &cb);
+
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cb, &bi);
 
-    std::vector<VkImageMemoryBarrier2> barriers;
-    auto addBarrier = [&](VkImage image) {
+    auto addBarrier = [](VkImage image, std::vector<VkImageMemoryBarrier2>& barriers) {
         VkImageMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
         barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
         barrier.srcAccessMask = 0;
@@ -255,15 +211,18 @@ bool Raytracer::createImages(platform::VulkanContext& vk, platform::Swapchain& s
         barrier.image = image;
         barriers.push_back(barrier);
     };
-    addBarrier(currColorImage_);
-    addBarrier(motionImage_);
-    addBarrier(albedoImage_);
-    addBarrier(normalImage_);
-    addBarrier(momentsImage_);
-    addBarrier(history_[0].image);
-    addBarrier(history_[1].image);
-    addBarrier(historyMoments_[0].image);
-    addBarrier(historyMoments_[1].image);
+
+    std::vector<VkImageMemoryBarrier2> barriers;
+    addBarrier(gpuBuffers_.colorImage(), barriers);
+    addBarrier(gpuBuffers_.motionImage(), barriers);
+    addBarrier(gpuBuffers_.albedoImage(), barriers);
+    addBarrier(gpuBuffers_.normalImage(), barriers);
+    addBarrier(gpuBuffers_.momentsImage(), barriers);
+    addBarrier(denoiser_.historyReadImage(), barriers);
+    addBarrier(denoiser_.historyWriteImage(), barriers);
+    addBarrier(denoiser_.historyMomentsReadImage(), barriers);
+    addBarrier(denoiser_.historyMomentsWriteImage(), barriers);
+
     VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     dep.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
     dep.pImageMemoryBarriers = barriers.data();
@@ -280,34 +239,8 @@ bool Raytracer::createImages(platform::VulkanContext& vk, platform::Swapchain& s
 }
 
 void Raytracer::destroyImages(platform::VulkanContext& vk) {
-    for (auto& hist : history_) {
-        if (hist.view) { vkDestroyImageView(vk.device(), hist.view, nullptr); hist.view = VK_NULL_HANDLE; }
-        if (hist.image) { vkDestroyImage(vk.device(), hist.image, nullptr); hist.image = VK_NULL_HANDLE; }
-        if (hist.memory) { vkFreeMemory(vk.device(), hist.memory, nullptr); hist.memory = VK_NULL_HANDLE; }
-    }
-    for (auto& hist : historyMoments_) {
-        if (hist.view) { vkDestroyImageView(vk.device(), hist.view, nullptr); hist.view = VK_NULL_HANDLE; }
-        if (hist.image) { vkDestroyImage(vk.device(), hist.image, nullptr); hist.image = VK_NULL_HANDLE; }
-        if (hist.memory) { vkFreeMemory(vk.device(), hist.memory, nullptr); hist.memory = VK_NULL_HANDLE; }
-    }
-    if (currColorView_) { vkDestroyImageView(vk.device(), currColorView_, nullptr); currColorView_ = VK_NULL_HANDLE; }
-    if (currColorImage_) { vkDestroyImage(vk.device(), currColorImage_, nullptr); currColorImage_ = VK_NULL_HANDLE; }
-    if (currColorMem_)   { vkFreeMemory(vk.device(), currColorMem_, nullptr); currColorMem_ = VK_NULL_HANDLE; }
-    if (motionView_) { vkDestroyImageView(vk.device(), motionView_, nullptr); motionView_ = VK_NULL_HANDLE; }
-    if (motionImage_) { vkDestroyImage(vk.device(), motionImage_, nullptr); motionImage_ = VK_NULL_HANDLE; }
-    if (motionMem_)   { vkFreeMemory(vk.device(), motionMem_, nullptr); motionMem_ = VK_NULL_HANDLE; }
-    if (albedoView_) { vkDestroyImageView(vk.device(), albedoView_, nullptr); albedoView_ = VK_NULL_HANDLE; }
-    if (albedoImage_) { vkDestroyImage(vk.device(), albedoImage_, nullptr); albedoImage_ = VK_NULL_HANDLE; }
-    if (albedoMem_) { vkFreeMemory(vk.device(), albedoMem_, nullptr); albedoMem_ = VK_NULL_HANDLE; }
-    if (normalView_) { vkDestroyImageView(vk.device(), normalView_, nullptr); normalView_ = VK_NULL_HANDLE; }
-    if (normalImage_) { vkDestroyImage(vk.device(), normalImage_, nullptr); normalImage_ = VK_NULL_HANDLE; }
-    if (normalMem_) { vkFreeMemory(vk.device(), normalMem_, nullptr); normalMem_ = VK_NULL_HANDLE; }
-    if (momentsView_) { vkDestroyImageView(vk.device(), momentsView_, nullptr); momentsView_ = VK_NULL_HANDLE; }
-    if (momentsImage_) { vkDestroyImage(vk.device(), momentsImage_, nullptr); momentsImage_ = VK_NULL_HANDLE; }
-    if (momentsMem_) { vkFreeMemory(vk.device(), momentsMem_, nullptr); momentsMem_ = VK_NULL_HANDLE; }
-    historyReadIndex_ = 0;
-    historyWriteIndex_ = 1;
-    historyInitialized_ = false;
+    denoiser_.shutdown(vk);
+    gpuBuffers_.shutdown(vk);
 }
 
 bool Raytracer::createPipelines(platform::VulkanContext& vk) {
@@ -442,24 +375,14 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
     if (vkAllocateMemory(vk.device(), &maid, nullptr, &dbgMem_) != VK_SUCCESS) return false;
     vkBindBufferMemory(vk.device(), dbgBuf_, dbgMem_, 0);
 
-    if (!createQueues(vk)) return false;
-    if (!createStatsBuffer(vk)) return false;
     if (!createProfilingResources(vk)) return false;
-    VkBufferCreateInfo bover{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-    bover.size = kOverlayBufferBytes;
-    bover.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    if (vkCreateBuffer(vk.device(), &bover, nullptr, &overlayBuf_) != VK_SUCCESS) return false;
-    VkMemoryRequirements mro{}; vkGetBufferMemoryRequirements(vk.device(), overlayBuf_, &mro);
-    uint32_t typeIndexOverlay = findMemoryType(vk.physicalDevice(), mro.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VkMemoryAllocateInfo maio{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO }; maio.allocationSize = mro.size; maio.memoryTypeIndex = typeIndexOverlay;
-    if (vkAllocateMemory(vk.device(), &maio, nullptr, &overlayMem_) != VK_SUCCESS) return false;
-    vkBindBufferMemory(vk.device(), overlayBuf_, overlayMem_, 0);
-    overlayCapacity_ = mro.size;
-    overlayActive_ = false;
-    void* overlayInit = nullptr;
-    if (vkMapMemory(vk.device(), overlayMem_, 0, overlayCapacity_, 0, &overlayInit) == VK_SUCCESS && overlayInit) {
-        std::memset(overlayInit, 0, static_cast<size_t>(overlayCapacity_));
-        vkUnmapMemory(vk.device(), overlayMem_);
+    if (!overlays_.init(vk, kOverlayBufferBytes)) return false;
+    if (VkDeviceMemory overlayMem = overlays_.memory()) {
+        void* data = nullptr;
+        if (vkMapMemory(vk.device(), overlayMem, 0, overlays_.capacity(), 0, &data) == VK_SUCCESS && data) {
+            std::memset(data, 0, static_cast<size_t>(overlays_.capacity()));
+            vkUnmapMemory(vk.device(), overlayMem);
+        }
     }
     if (matIdxBuf_.buffer == VK_NULL_HANDLE) {
     if (!ensureBuffer(vk, matIdxBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
@@ -474,26 +397,26 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
     // Write descriptors per swapchain image
     for (uint32_t i=0;i<swap.imageCount();++i) {
         VkDescriptorBufferInfo db{}; db.buffer = ubo_; db.offset=0; db.range = sizeof(GlobalsUBOData);
-        VkDescriptorImageInfo diCurr{}; diCurr.imageView = currColorView_; diCurr.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo diCurr{}; diCurr.imageView = gpuBuffers_.colorView(); diCurr.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         VkDescriptorImageInfo diOut{}; diOut.imageView = swap.imageViews()[i]; diOut.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkDescriptorImageInfo diMotion{}; diMotion.imageView = motionView_; diMotion.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkDescriptorImageInfo diHistRead{}; diHistRead.imageView = history_[0].view; diHistRead.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkDescriptorImageInfo diHistWrite{}; diHistWrite.imageView = history_[1].view; diHistWrite.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkDescriptorImageInfo diAlbedo{}; diAlbedo.imageView = albedoView_; diAlbedo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkDescriptorImageInfo diNormal{}; diNormal.imageView = normalView_; diNormal.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkDescriptorImageInfo diMoments{}; diMoments.imageView = momentsView_; diMoments.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkDescriptorImageInfo diHistMomentsRead{}; diHistMomentsRead.imageView = historyMoments_[0].view; diHistMomentsRead.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkDescriptorImageInfo diHistMomentsWrite{}; diHistMomentsWrite.imageView = historyMoments_[1].view; diHistMomentsWrite.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo diMotion{}; diMotion.imageView = gpuBuffers_.motionView(); diMotion.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo diHistRead{}; diHistRead.imageView = denoiser_.historyReadView(); diHistRead.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo diHistWrite{}; diHistWrite.imageView = denoiser_.historyWriteView(); diHistWrite.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo diAlbedo{}; diAlbedo.imageView = gpuBuffers_.albedoView(); diAlbedo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo diNormal{}; diNormal.imageView = gpuBuffers_.normalView(); diNormal.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo diMoments{}; diMoments.imageView = gpuBuffers_.momentsView(); diMoments.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo diHistMomentsRead{}; diHistMomentsRead.imageView = denoiser_.historyMomentsReadView(); diHistMomentsRead.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo diHistMomentsWrite{}; diHistMomentsWrite.imageView = denoiser_.historyMomentsWriteView(); diHistMomentsWrite.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         VkDescriptorBufferInfo dbDBG{ dbgBuf_, 0, VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo dbRay{ rayQueueBuf_, 0, VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo dbHit{ hitQueueBuf_, 0, VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo dbMiss{ missQueueBuf_, 0, VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo dbSec{ secondaryQueueBuf_, 0, VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo dbStats{ statsBuf_, 0, sizeof(TraversalStatsHost) };
+        VkDescriptorBufferInfo dbRay{ gpuBuffers_.queueBuffer(GpuBuffers::Queue::Ray), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo dbHit{ gpuBuffers_.queueBuffer(GpuBuffers::Queue::Hit), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo dbMiss{ gpuBuffers_.queueBuffer(GpuBuffers::Queue::Miss), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo dbSec{ gpuBuffers_.queueBuffer(GpuBuffers::Queue::Secondary), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo dbStats{ gpuBuffers_.statsBuffer(), 0, sizeof(TraversalStatsHost) };
         VkDescriptorBufferInfo dbMatIdx{ matIdxBuf_.buffer, 0, matIdxBuf_.size > 0 ? matIdxBuf_.size : VK_WHOLE_SIZE };
         VkDescriptorBufferInfo dbMatTable{ materialTableBuf_.buffer, 0, materialTableBuf_.size > 0 ? materialTableBuf_.size : VK_WHOLE_SIZE };
         VkDescriptorBufferInfo dbPalette{ paletteBuf_.buffer, 0, paletteBuf_.size > 0 ? paletteBuf_.size : VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo dbOverlay{ overlayBuf_, 0, overlayCapacity_ ? overlayCapacity_ : VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo dbOverlay{ overlays_.buffer(), 0, overlays_.capacity() ? overlays_.capacity() : VK_WHOLE_SIZE };
         VkDescriptorImageInfo diOverlay{}; diOverlay.imageView = swap.imageViews()[i]; diOverlay.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
         VkWriteDescriptorSet writes[22]{};
@@ -529,23 +452,15 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
 
 void Raytracer::destroyDescriptors(platform::VulkanContext& vk) {
     destroyProfilingResources(vk);
-    destroyStatsBuffer(vk);
-    destroyQueues(vk);
     if (ubo_) { vkDestroyBuffer(vk.device(), ubo_, nullptr); ubo_ = VK_NULL_HANDLE; }
     if (uboMem_) { vkFreeMemory(vk.device(), uboMem_, nullptr); uboMem_ = VK_NULL_HANDLE; }
     if (dbgBuf_) { vkDestroyBuffer(vk.device(), dbgBuf_, nullptr); dbgBuf_ = VK_NULL_HANDLE; }
     if (dbgMem_) { vkFreeMemory(vk.device(), dbgMem_, nullptr); dbgMem_ = VK_NULL_HANDLE; }
-    if (overlayBuf_) { vkDestroyBuffer(vk.device(), overlayBuf_, nullptr); overlayBuf_ = VK_NULL_HANDLE; }
-    if (overlayMem_) { vkFreeMemory(vk.device(), overlayMem_, nullptr); overlayMem_ = VK_NULL_HANDLE; overlayCapacity_ = 0; }
-    overlayActive_ = false;
-    overlayCharsX_ = overlayCharsY_ = 0;
-    overlayPixelWidth_ = overlayPixelHeight_ = 0;
+    overlays_.shutdown(vk);
     if (descPool_) { vkDestroyDescriptorPool(vk.device(), descPool_, nullptr); descPool_ = VK_NULL_HANDLE; }
     sets_.clear();
     descriptorsReady_ = false;
-    historyReadIndex_ = 0;
-    historyWriteIndex_ = 1;
-    historyInitialized_ = false;
+    denoiser_.reset();
 }
 
 bool Raytracer::createWorld(platform::VulkanContext& vk) {
@@ -616,9 +531,7 @@ bool Raytracer::addRegion(platform::VulkanContext& vk, const glm::ivec3& regionC
     if (!appendRegion(vk, std::move(cpu), regionCoord)) {
         return false;
     }
-    historyInitialized_ = false;
-    historyReadIndex_ = 0;
-    historyWriteIndex_ = 1;
+    denoiser_.reset();
     return true;
 }
 
@@ -626,9 +539,7 @@ bool Raytracer::removeRegion(platform::VulkanContext& vk, const glm::ivec3& regi
     if (!removeRegionInternal(vk, regionCoord)) {
         return false;
     }
-    historyInitialized_ = false;
-    historyReadIndex_ = 0;
-    historyWriteIndex_ = 1;
+    denoiser_.reset();
     return true;
 }
 
@@ -1051,62 +962,8 @@ void Raytracer::destroyWorld(platform::VulkanContext& vk) {
 }
 
 namespace {
-constexpr VkDeviceSize kQueueHeaderBytes = sizeof(uint32_t) * 4;
-constexpr VkDeviceSize kRayPayloadBytes  = 80;
-constexpr VkDeviceSize kHitPayloadBytes  = 96;
-constexpr VkDeviceSize kMissPayloadBytes = 80;
-
-uint32_t nextPow2(uint32_t v) {
-    if (v <= 1u) return 1u;
-    v -= 1u;
-    v |= v >> 1u;
-    v |= v >> 2u;
-    v |= v >> 4u;
-    v |= v >> 8u;
-    v |= v >> 16u;
-    return v + 1u;
-}
 }
 
-bool Raytracer::createQueues(platform::VulkanContext& vk) {
-    destroyQueues(vk);
-    uint64_t pixelCount = uint64_t(extent_.width) * uint64_t(extent_.height);
-    queueCapacity_ = nextPow2(static_cast<uint32_t>(std::max<uint64_t>(1ull, pixelCount)));
-    auto alloc = [&](VkBuffer& buf, VkDeviceMemory& mem, VkDeviceSize payloadBytes) {
-        VkDeviceSize size = kQueueHeaderBytes + payloadBytes * queueCapacity_;
-        return allocateBuffer(vk.device(), vk.physicalDevice(), size,
-                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                              buf, mem);
-    };
-    if (!alloc(rayQueueBuf_, rayQueueMem_, kRayPayloadBytes)) return false;
-    if (!alloc(hitQueueBuf_, hitQueueMem_, kHitPayloadBytes)) return false;
-    if (!alloc(missQueueBuf_, missQueueMem_, kMissPayloadBytes)) return false;
-    if (!alloc(secondaryQueueBuf_, secondaryQueueMem_, kRayPayloadBytes)) return false;
-    return true;
-}
-
-void Raytracer::destroyQueues(platform::VulkanContext& vk) {
-    if (secondaryQueueBuf_) { vkDestroyBuffer(vk.device(), secondaryQueueBuf_, nullptr); secondaryQueueBuf_ = VK_NULL_HANDLE; }
-    if (secondaryQueueMem_) { vkFreeMemory(vk.device(), secondaryQueueMem_, nullptr); secondaryQueueMem_ = VK_NULL_HANDLE; }
-    if (missQueueBuf_) { vkDestroyBuffer(vk.device(), missQueueBuf_, nullptr); missQueueBuf_ = VK_NULL_HANDLE; }
-    if (missQueueMem_) { vkFreeMemory(vk.device(), missQueueMem_, nullptr); missQueueMem_ = VK_NULL_HANDLE; }
-    if (hitQueueBuf_) { vkDestroyBuffer(vk.device(), hitQueueBuf_, nullptr); hitQueueBuf_ = VK_NULL_HANDLE; }
-    if (hitQueueMem_) { vkFreeMemory(vk.device(), hitQueueMem_, nullptr); hitQueueMem_ = VK_NULL_HANDLE; }
-    if (rayQueueBuf_) { vkDestroyBuffer(vk.device(), rayQueueBuf_, nullptr); rayQueueBuf_ = VK_NULL_HANDLE; }
-    if (rayQueueMem_) { vkFreeMemory(vk.device(), rayQueueMem_, nullptr); rayQueueMem_ = VK_NULL_HANDLE; }
-    queueCapacity_ = 0u;
-}
-
-void Raytracer::writeQueueHeaders(VkCommandBuffer cb) {
-    if (queueCapacity_ == 0u) return;
-    struct Header { uint32_t head; uint32_t tail; uint32_t capacity; uint32_t dropped; } hdr{0u, 0u, queueCapacity_, 0u};
-    vkCmdUpdateBuffer(cb, rayQueueBuf_, 0, sizeof(Header), &hdr);
-    vkCmdUpdateBuffer(cb, hitQueueBuf_, 0, sizeof(Header), &hdr);
-    vkCmdUpdateBuffer(cb, missQueueBuf_, 0, sizeof(Header), &hdr);
-    vkCmdUpdateBuffer(cb, secondaryQueueBuf_, 0, sizeof(Header), &hdr);
-}
 
 bool Raytracer::createProfilingResources(platform::VulkanContext& vk) {
     destroyProfilingResources(vk);
@@ -1132,45 +989,16 @@ void Raytracer::destroyProfilingResources(platform::VulkanContext& vk) {
     }
 }
 
-bool Raytracer::createStatsBuffer(platform::VulkanContext& vk) {
-    destroyStatsBuffer(vk);
-    VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-    bi.size = sizeof(TraversalStatsHost);
-    bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(vk.device(), &bi, nullptr, &statsBuf_) != VK_SUCCESS) return false;
-    VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(vk.device(), statsBuf_, &mr);
-    uint32_t typeIndex = findMemoryType(vk.physicalDevice(), mr.memoryTypeBits,
-                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (typeIndex == UINT32_MAX) return false;
-    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-    mai.allocationSize = mr.size;
-    mai.memoryTypeIndex = typeIndex;
-    if (vkAllocateMemory(vk.device(), &mai, nullptr, &statsMem_) != VK_SUCCESS) return false;
-    vkBindBufferMemory(vk.device(), statsBuf_, statsMem_, 0);
-    std::memset(&statsHost_, 0, sizeof(statsHost_));
-    spdlog::info("Created traversal stats buffer size={} handle={} mem={}", sizeof(TraversalStatsHost), (void*)statsBuf_, (void*)statsMem_);
-    return true;
-}
-
-void Raytracer::destroyStatsBuffer(platform::VulkanContext& vk) {
-    if (statsBuf_) { vkDestroyBuffer(vk.device(), statsBuf_, nullptr); statsBuf_ = VK_NULL_HANDLE; }
-    if (statsMem_) { vkFreeMemory(vk.device(), statsMem_, nullptr); statsMem_ = VK_NULL_HANDLE; }
-    std::memset(&statsHost_, 0, sizeof(statsHost_));
-}
-
 void Raytracer::updateFrameDescriptors(platform::VulkanContext& vk, platform::Swapchain& swap, uint32_t swapIndex) {
-    (void)swap;
     if (!descriptorsReady_) return;
-    historyWriteIndex_ = historyReadIndex_ ^ 1u;
 
-    VkDescriptorImageInfo diCurr{ VK_NULL_HANDLE, currColorView_, VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo diMotion{ VK_NULL_HANDLE, motionView_, VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo diHistRead{ VK_NULL_HANDLE, history_[historyReadIndex_].view, VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo diHistWrite{ VK_NULL_HANDLE, history_[historyWriteIndex_].view, VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo diMoments{ VK_NULL_HANDLE, momentsView_, VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo diHistMomentsRead{ VK_NULL_HANDLE, historyMoments_[historyReadIndex_].view, VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo diHistMomentsWrite{ VK_NULL_HANDLE, historyMoments_[historyWriteIndex_].view, VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo diCurr{ VK_NULL_HANDLE, gpuBuffers_.colorView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo diMotion{ VK_NULL_HANDLE, gpuBuffers_.motionView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo diHistRead{ VK_NULL_HANDLE, denoiser_.historyReadView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo diHistWrite{ VK_NULL_HANDLE, denoiser_.historyWriteView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo diMoments{ VK_NULL_HANDLE, gpuBuffers_.momentsView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo diHistMomentsRead{ VK_NULL_HANDLE, denoiser_.historyMomentsReadView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo diHistMomentsWrite{ VK_NULL_HANDLE, denoiser_.historyMomentsWriteView(), VK_IMAGE_LAYOUT_GENERAL };
 
     VkDescriptorImageInfo diOverlay{ VK_NULL_HANDLE, swap.imageViews()[swapIndex], VK_IMAGE_LAYOUT_GENERAL };
 
@@ -1258,7 +1086,7 @@ void Raytracer::updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData&
     d.macroHashCapacity = macroCapacity_;
     d.macroDimBricks    = macroDimBricks_;
     d.macroSize         = float(macroDimBricks_) * (d.brickSize);
-    d.historyValid      = historyInitialized_ ? 1u : 0u;
+    d.historyValid      = denoiser_.historyValidFlag();
     if (brickStore_) {
         const auto& wg = brickStore_->worldGen();
         const auto& np = wg.params();
@@ -1274,10 +1102,10 @@ void Raytracer::updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData&
         d.noiseMinHeight     = -static_cast<float>(wg.planet().T);
         d.noiseMaxHeight     =  static_cast<float>(wg.planet().Hmax);
         d.noisePad2          = 0.0f;
-        d.noiseSeed          = wg.seed();
-        d.noiseContinentOctaves = static_cast<uint32_t>(np.continentOctaves);
-        d.noiseDetailOctaves    = static_cast<uint32_t>(np.detailOctaves);
-        d.noiseCaveOctaves      = static_cast<uint32_t>(math::kNoiseCaveOctaves);
+    d.noiseSeed          = wg.seed();
+    d.noiseContinentOctaves = static_cast<uint32_t>(np.continentOctaves);
+    d.noiseDetailOctaves    = static_cast<uint32_t>(np.detailOctaves);
+    d.noiseCaveOctaves      = static_cast<uint32_t>(math::kNoiseCaveOctaves);
     } else {
         d.noiseContinentFreq = d.noiseContinentAmp = 0.0f;
         d.noiseDetailFreq = d.noiseDetailAmp = 0.0f;
@@ -1290,6 +1118,7 @@ void Raytracer::updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData&
         d.noiseContinentOctaves = d.noiseDetailOctaves = d.noiseCaveOctaves = 0u;
     }
     renderOrigin_ = glm::vec3(d.renderOrigin[0], d.renderOrigin[1], d.renderOrigin[2]);
+    tonemap_.setExposure(d.exposure);
     void* mapped=nullptr; vkMapMemory(vk.device(), uboMem_, 0, sizeof(GlobalsUBOData), 0, &mapped);
     std::memcpy(mapped, &d, sizeof(GlobalsUBOData));
     vkUnmapMemory(vk.device(), uboMem_);
@@ -1298,10 +1127,8 @@ void Raytracer::updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData&
 
 void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, VkCommandBuffer cb, uint32_t swapIndex) {
     updateFrameDescriptors(vk, swap, swapIndex);
-    writeQueueHeaders(cb);
-    if (statsBuf_) {
-        vkCmdFillBuffer(cb, statsBuf_, 0, sizeof(TraversalStatsHost), 0);
-    }
+    gpuBuffers_.writeQueueHeaders(cb);
+    gpuBuffers_.zeroStats(cb);
     VkMemoryBarrier2 hdrBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
     hdrBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
     hdrBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -1384,11 +1211,11 @@ void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, V
         barrier.subresourceRange.layerCount = 1;
         return barrier;
     };
-    preTemporal[0] = makeBarrier(currColorImage_);
-    preTemporal[1] = makeBarrier(motionImage_);
-    preTemporal[2] = makeBarrier(albedoImage_);
-    preTemporal[3] = makeBarrier(normalImage_);
-    preTemporal[4] = makeBarrier(momentsImage_);
+    preTemporal[0] = makeBarrier(gpuBuffers_.colorImage());
+    preTemporal[1] = makeBarrier(gpuBuffers_.motionImage());
+    preTemporal[2] = makeBarrier(gpuBuffers_.albedoImage());
+    preTemporal[3] = makeBarrier(gpuBuffers_.normalImage());
+    preTemporal[4] = makeBarrier(gpuBuffers_.momentsImage());
     VkDependencyInfo preTemporalDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     preTemporalDep.imageMemoryBarrierCount = static_cast<uint32_t>(preTemporal.size());
     preTemporalDep.pImageMemoryBarriers = preTemporal.data();
@@ -1403,32 +1230,31 @@ void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, V
 
     // Barrier history image for composite pass
     std::array<VkImageMemoryBarrier2, 2> histBarriers{};
-    histBarriers[0] = makeBarrier(history_[historyWriteIndex_].image);
-    histBarriers[1] = makeBarrier(historyMoments_[historyWriteIndex_].image);
+    histBarriers[0] = makeBarrier(denoiser_.historyWriteImage());
+    histBarriers[1] = makeBarrier(denoiser_.historyMomentsWriteImage());
     VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     dep.imageMemoryBarrierCount = static_cast<uint32_t>(histBarriers.size());
     dep.pImageMemoryBarriers = histBarriers.data();
     vkCmdPipelineBarrier2(cb, &dep);
 
     // Composite: read temporally accumulated history, write swap image already in GENERAL from App
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeComposite_);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_, 0, 1, &sets_[swapIndex], 0, nullptr);
-    if (timestampPool_) {
-        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 6);
-    }
-    vkCmdDispatch(cb, gx, gy, 1);
-    if (timestampPool_) {
-        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 7);
-    }
+    tonemap_.record(cb,
+                    pipeComposite_,
+                    pipeLayout_,
+                    sets_[swapIndex],
+                    gx,
+                    gy,
+                    timestampPool_,
+                    6,
+                    7);
 
-    historyReadIndex_ = historyWriteIndex_;
-    historyInitialized_ = true;
+    denoiser_.advance();
 
     // Debug readback moved to readDebug(), called after submit/present to ensure GPU wrote the data.
 }
 
 void Raytracer::recordOverlay(VkCommandBuffer cb, uint32_t swapIndex) {
-    if (!overlayActive_ || overlayPixelWidth_ == 0 || overlayPixelHeight_ == 0 || pipeOverlay_ == VK_NULL_HANDLE) {
+    if (!overlays_.active() || overlays_.pixelWidth() == 0 || overlays_.pixelHeight() == 0 || pipeOverlay_ == VK_NULL_HANDLE) {
         return;
     }
     if (swapIndex >= sets_.size()) {
@@ -1443,8 +1269,8 @@ void Raytracer::recordOverlay(VkCommandBuffer cb, uint32_t swapIndex) {
     dep.memoryBarrierCount = 1;
     dep.pMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cb, &dep);
-    uint32_t groupsX = (overlayPixelWidth_ + 7u) / 8u;
-    uint32_t groupsY = (overlayPixelHeight_ + 7u) / 8u;
+    uint32_t groupsX = (overlays_.pixelWidth() + 7u) / 8u;
+    uint32_t groupsY = (overlays_.pixelHeight() + 7u) / 8u;
     if (groupsX == 0u || groupsY == 0u) {
         return;
     }
@@ -1458,37 +1284,15 @@ std::array<double, 4> Raytracer::gpuTimingsMs() const {
 }
 
 void Raytracer::updateOverlayHUD(platform::VulkanContext& vk, const std::vector<std::string>& lines) {
-    overlayCharsX_ = 0;
-    overlayCharsY_ = 0;
-    overlayPixelWidth_ = 0;
-    overlayPixelHeight_ = 0;
-    overlayActive_ = false;
-
-    if (!overlayBuf_ || !overlayMem_) {
-        return;
-    }
-
-    const uint32_t maxRows = kOverlayMaxRows;
-    const uint32_t maxCols = kOverlayMaxCols;
-    uint32_t rows = std::min<uint32_t>(lines.size(), maxRows);
-    if (rows == 0u) {
-        void* mapped = nullptr;
-        if (vkMapMemory(vk.device(), overlayMem_, 0, overlayCapacity_, 0, &mapped) == VK_SUCCESS && mapped) {
-            std::memset(mapped, 0, static_cast<size_t>(overlayCapacity_));
-            vkUnmapMemory(vk.device(), overlayMem_);
-        }
-        return;
-    }
-
     std::vector<std::string> sanitized;
-    sanitized.reserve(rows);
-    uint32_t width = 0;
-    for (uint32_t i = 0; i < rows; ++i) {
+    sanitized.reserve(std::min<uint32_t>(static_cast<uint32_t>(lines.size()), kOverlayMaxRows));
+
+    for (uint32_t i = 0; i < std::min<uint32_t>(static_cast<uint32_t>(lines.size()), kOverlayMaxRows); ++i) {
         const std::string& line = lines[i];
         std::string clean;
-        clean.reserve(maxCols);
+        clean.reserve(kOverlayMaxCols);
         for (char ch : line) {
-            if (clean.size() >= maxCols) break;
+            if (clean.size() >= kOverlayMaxCols) break;
             unsigned char uc = static_cast<unsigned char>(ch);
             if (uc < 32u || uc > 126u) {
                 uc = ' ';
@@ -1500,49 +1304,16 @@ void Raytracer::updateOverlayHUD(platform::VulkanContext& vk, const std::vector<
             clean.pop_back();
         }
         sanitized.emplace_back(std::move(clean));
-        width = std::max(width, static_cast<uint32_t>(sanitized.back().size()));
     }
 
-    if (width == 0u) {
-        void* mapped = nullptr;
-        if (vkMapMemory(vk.device(), overlayMem_, 0, overlayCapacity_, 0, &mapped) == VK_SUCCESS && mapped) {
-            std::memset(mapped, 0, static_cast<size_t>(overlayCapacity_));
-            vkUnmapMemory(vk.device(), overlayMem_);
-        }
-        return;
-    }
-
-    uint32_t stride = width;
-    uint32_t totalCells = stride * rows;
-    std::vector<uint32_t> payload(4u + totalCells, 0u);
-    payload[0] = width;
-    payload[1] = rows;
-    payload[2] = stride;
-    payload[3] = totalCells;
-    for (uint32_t r = 0; r < rows; ++r) {
-        const std::string& line = sanitized[r];
-        for (uint32_t c = 0; c < stride; ++c) {
-            unsigned char ch = (c < line.size()) ? static_cast<unsigned char>(line[c]) : static_cast<unsigned char>(' ');
-            payload[4u + r * stride + c] = static_cast<uint32_t>(ch);
-        }
-    }
-
-    VkDeviceSize bytes = static_cast<VkDeviceSize>(payload.size() * sizeof(uint32_t));
-    bytes = std::min<VkDeviceSize>(bytes, overlayCapacity_);
-    void* mapped = nullptr;
-    bool wrote = false;
-    if (vkMapMemory(vk.device(), overlayMem_, 0, overlayCapacity_, 0, &mapped) == VK_SUCCESS && mapped) {
-        std::memset(mapped, 0, static_cast<size_t>(overlayCapacity_));
-        std::memcpy(mapped, payload.data(), static_cast<size_t>(bytes));
-        vkUnmapMemory(vk.device(), overlayMem_);
-        wrote = true;
-    }
-
-    overlayCharsX_ = wrote ? width : 0u;
-    overlayCharsY_ = wrote ? rows : 0u;
-    overlayPixelWidth_ = wrote ? width * (kOverlayFontWidth + kOverlayPadX) : 0u;
-    overlayPixelHeight_ = wrote ? rows * (kOverlayFontHeight + kOverlayPadY) : 0u;
-    overlayActive_ = wrote;
+    overlays_.update(vk,
+                     sanitized,
+                     kOverlayMaxCols,
+                     kOverlayMaxRows,
+                     kOverlayFontWidth,
+                     kOverlayFontHeight,
+                     kOverlayPadX,
+                     kOverlayPadY);
 }
 
 void Raytracer::readDebug(platform::VulkanContext& vk, uint32_t frameIdx) {
@@ -1656,13 +1427,13 @@ void Raytracer::readDebug(platform::VulkanContext& vk, uint32_t frameIdx) {
         }
     }
 
-    if (statsBuf_) {
+    if (VkDeviceMemory statsMem = gpuBuffers_.statsMemory()) {
         TraversalStatsHost stats{};
         void* mapped = nullptr;
-        VkResult mapRes = vkMapMemory(vk.device(), statsMem_, 0, sizeof(TraversalStatsHost), 0, &mapped);
+        VkResult mapRes = vkMapMemory(vk.device(), statsMem, 0, sizeof(TraversalStatsHost), 0, &mapped);
         if (mapRes == VK_SUCCESS && mapped) {
             std::memcpy(&stats, mapped, sizeof(TraversalStatsHost));
-            vkUnmapMemory(vk.device(), statsMem_);
+            vkUnmapMemory(vk.device(), statsMem);
             statsHost_ = stats;
             spdlog::debug("Traverse stats: macroVisited={} macroSkipped={} brickSteps={} microSteps={} hits={}",
                           stats.macroVisited, stats.macroSkipped, stats.brickSteps, stats.microSteps, stats.hitsTotal);

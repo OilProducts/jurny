@@ -62,19 +62,6 @@ int App::run() {
     world::Streaming streaming;
     core::FrameGraph frameGraph;
 
-    // Shell-visualization compute pipeline (UBO + storage image)
-    VkDescriptorSetLayoutBinding bUbo{}; bUbo.binding = 0; bUbo.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; bUbo.descriptorCount = 1; bUbo.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutBinding bImg{}; bImg.binding = 1; bImg.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bImg.descriptorCount = 1; bImg.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutBinding bindings[2] = { bUbo, bImg };
-    VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    dslci.bindingCount = 2; dslci.pBindings = bindings;
-    VkDescriptorSetLayout dsl{}; vkCreateDescriptorSetLayout(vk.device(), &dslci, nullptr, &dsl);
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount = 1; plci.pSetLayouts = &dsl;
-    VkPipelineLayout pl{}; vkCreatePipelineLayout(vk.device(), &plci, nullptr, &pl);
-
-    auto readFile = [](const char* path) -> std::vector<uint32_t> {
-        std::vector<uint32_t> out; FILE* f = fopen(path, "rb"); if (!f) return out; fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET); out.resize((sz+3)/4); fread(out.data(), 1, sz, f); fclose(f); return out; };
     const char* envAssets = std::getenv("VOXEL_ASSETS_DIR");
     const char* assetsDir = envAssets ? envAssets :
 #ifdef VOXEL_ASSETS_DIR
@@ -97,60 +84,6 @@ int App::run() {
         }
     } else {
         spdlog::warn("Asset directory not specified; proceeding without packed assets");
-    }
-
-    std::string spvPath = std::string(assetsDir) + "/shaders/shell_visual.comp.spv";
-    std::vector<uint32_t> spv = readFile(spvPath.c_str());
-    if (spv.empty()) { spdlog::error("Failed to load %s. You may need to build shaders.", spvPath.c_str()); return 1; }
-    VkShaderModuleCreateInfo smci{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-    smci.codeSize = spv.size()*sizeof(uint32_t); smci.pCode = spv.data();
-    VkShaderModule sm{}; vkCreateShaderModule(vk.device(), &smci, nullptr, &sm);
-    VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    VkPipelineShaderStageCreateInfo ssci{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
-    ssci.stage = VK_SHADER_STAGE_COMPUTE_BIT; ssci.module = sm; ssci.pName = "main"; cpci.stage = ssci; cpci.layout = pl;
-    VkPipeline pipe{}; vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipe);
-
-    // Create a small UBO
-    using GlobalsUBO = render::GlobalsUBOData;
-
-    VkBuffer ubo{}; VkDeviceMemory uboMem{};
-    {
-        VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-        bi.size = sizeof(GlobalsUBO);
-        bi.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-        bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        vkCreateBuffer(vk.device(), &bi, nullptr, &ubo);
-        VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(vk.device(), ubo, &mr);
-        VkPhysicalDeviceMemoryProperties mp{}; vkGetPhysicalDeviceMemoryProperties(vk.physicalDevice(), &mp);
-        uint32_t typeIndex = UINT32_MAX;
-        for (uint32_t i=0;i<mp.memoryTypeCount;++i) {
-            if ((mr.memoryTypeBits & (1u<<i)) && (mp.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) == (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) { typeIndex = i; break; }
-        }
-        VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        mai.allocationSize = mr.size; mai.memoryTypeIndex = typeIndex;
-        vkAllocateMemory(vk.device(), &mai, nullptr, &uboMem);
-        vkBindBufferMemory(vk.device(), ubo, uboMem, 0);
-    }
-
-    // Descriptor pool for UBO + storage images
-    VkDescriptorPoolSize poolSizes[2] = {
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,  swap.imageCount() },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,   swap.imageCount() }
-    };
-    VkDescriptorPoolCreateInfo dpci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    dpci.maxSets = swap.imageCount(); dpci.poolSizeCount = 2; dpci.pPoolSizes = poolSizes;
-    VkDescriptorPool dpool{}; vkCreateDescriptorPool(vk.device(), &dpci, nullptr, &dpool);
-    std::vector<VkDescriptorSet> sets(swap.imageCount()); std::vector<VkDescriptorSetLayout> layouts(swap.imageCount(), dsl);
-    VkDescriptorSetAllocateInfo dsai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dsai.descriptorPool = dpool; dsai.descriptorSetCount = swap.imageCount(); dsai.pSetLayouts = layouts.data();
-    vkAllocateDescriptorSets(vk.device(), &dsai, sets.data());
-    for (uint32_t i=0;i<swap.imageCount();++i) {
-        VkDescriptorBufferInfo db{}; db.buffer = ubo; db.offset = 0; db.range = sizeof(GlobalsUBO);
-        VkDescriptorImageInfo di{}; di.imageView = swap.imageViews()[i]; di.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkWriteDescriptorSet writes[2]{};
-        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[0].dstSet = sets[i]; writes[0].dstBinding=0; writes[0].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; writes[0].descriptorCount=1; writes[0].pBufferInfo=&db;
-        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[1].dstSet = sets[i]; writes[1].dstBinding=1; writes[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[1].descriptorCount=1; writes[1].pImageInfo=&di;
-        vkUpdateDescriptorSets(vk.device(), 2, writes, 0, nullptr);
     }
 
     VkCommandBuffer cb{}; VkCommandBufferAllocateInfo cbai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO }; cbai.commandPool = vk.commandPool(); cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1; vkAllocateCommandBuffers(vk.device(), &cbai, &cb);
@@ -187,7 +120,6 @@ int App::run() {
     auto t0 = std::chrono::steady_clock::now();
     auto last = t0;
     uint32_t frameCounter = 0;
-    bool useShell = false; // toggle with 'V'
     bool mPrevDown = false; // edge-trigger for 'M'
     uint32_t debugFlags = 8u; // start with macro skip enabled (bit3)
     glm::dvec3 camWorld = glm::dvec3(double(planetRadius) + 5.0, 0.0, 5.0);
@@ -217,8 +149,6 @@ int App::run() {
             break;
         }
 
-        if (glfwGetKey(window.handle(), GLFW_KEY_V) == GLFW_PRESS) useShell = true;
-        if (glfwGetKey(window.handle(), GLFW_KEY_B) == GLFW_PRESS) useShell = false;
         if (glfwGetKey(window.handle(), GLFW_KEY_1) == GLFW_PRESS) { debugFlags = 1u; }
         if (glfwGetKey(window.handle(), GLFW_KEY_2) == GLFW_PRESS) { debugFlags = 2u; }
         if (glfwGetKey(window.handle(), GLFW_KEY_3) == GLFW_PRESS) { debugFlags = 4u; }
@@ -233,7 +163,7 @@ int App::run() {
         mPrevDown = mDown;
 #endif
 
-        GlobalsUBO data{};
+        render::GlobalsUBOData data{};
         auto now = std::chrono::steady_clock::now();
         float dt = std::chrono::duration<float>(now - last).count();
         last = now;
@@ -354,11 +284,6 @@ int App::run() {
         data.height = swap.extent().height;
         data.raysPerPixel = 1;
         data.flags = debugFlags;
-        void* mapped = nullptr;
-        vkMapMemory(vk.device(), uboMem, 0, sizeof(GlobalsUBO), 0, &mapped);
-        std::memcpy(mapped, &data, sizeof(GlobalsUBO));
-        vkUnmapMemory(vk.device(), uboMem);
-
         uint32_t currentFrameIdx = data.frameIdx;
         ++frameCounter;
         prevViewMat = V;
@@ -443,10 +368,7 @@ int App::run() {
             spdlog::info("dot(center,corner)={:.3f} (expect < 1)", dotDirs);
         }
 
-        render::GlobalsUBOData gd = data;
-        if (!useShell) {
-            ray.updateGlobals(vk, gd);
-        }
+        ray.updateGlobals(vk, data);
 
         frameGraph.addPass("PrepareSwapImage", [&, idx](VkCommandBuffer cmd) {
             VkImageMemoryBarrier barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
@@ -469,19 +391,9 @@ int App::run() {
                                  1, &barrier);
         });
 
-        if (useShell) {
-            frameGraph.addPass("ShellVisualize", [&, idx](VkCommandBuffer cmd) {
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &sets[idx], 0, nullptr);
-                uint32_t gx = (swap.extent().width + 7u) / 8u;
-                uint32_t gy = (swap.extent().height + 7u) / 8u;
-                vkCmdDispatch(cmd, gx, gy, 1);
-            });
-        } else {
-            frameGraph.addPass("Raytrace", [&, idx](VkCommandBuffer cmd) {
-                ray.record(vk, swap, cmd, idx);
-            });
-        }
+        frameGraph.addPass("Raytrace", [&, idx](VkCommandBuffer cmd) {
+            ray.record(vk, swap, cmd, idx);
+        });
 
         frameGraph.addPass("OverlayHUD", [&, idx](VkCommandBuffer cmd) {
             ray.recordOverlay(cmd, idx);
@@ -543,9 +455,6 @@ int App::run() {
     streaming.shutdown();
     jobs.stop();
     ray.shutdown(vk);
-    vkDestroyPipeline(vk.device(), pipe, nullptr); vkDestroyShaderModule(vk.device(), sm, nullptr);
-    vkDestroyDescriptorPool(vk.device(), dpool, nullptr); vkDestroyPipelineLayout(vk.device(), pl, nullptr); vkDestroyDescriptorSetLayout(vk.device(), dsl, nullptr);
-    vkDestroyBuffer(vk.device(), ubo, nullptr); vkFreeMemory(vk.device(), uboMem, nullptr);
     swap.destroy(vk.device());
     vk.shutdown();
     window.destroy();
