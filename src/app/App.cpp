@@ -201,7 +201,7 @@ int App::run() {
         }
         up = glm::normalize(glm::cross(right, forward));
 
-        float moveSpeed = 25.0f;
+        float moveSpeed = 5.0f;
         if (glfwGetKey(window.handle(), GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS || glfwGetKey(window.handle(), GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
             moveSpeed *= 2.0f;
         }
