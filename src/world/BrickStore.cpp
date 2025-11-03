@@ -283,6 +283,8 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
     auto sampleField = [&](const glm::vec3& pos) -> float {
         return worldGen_.crustField(pos);
     };
+    float minFieldSample = std::numeric_limits<float>::infinity();
+    float maxFieldSample = -std::numeric_limits<float>::infinity();
 
     // Fast reject: sample brick corners and center. If all comfortably outside, skip voxel walk.
     bool allPositive = true;
@@ -322,6 +324,8 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
                 glm::vec3 voxelMin = brickOrigin + glm::vec3(vx, vy, vz) * voxelSize;
                 glm::vec3 centerPos = voxelMin + glm::vec3(0.5f) * voxelSteps;
                 float voxelField = sampleField(centerPos);
+                minFieldSample = std::min(minFieldSample, voxelField);
+                maxFieldSample = std::max(maxFieldSample, voxelField);
 
                 bool occupied = (voxelField < 0.0f);
                 if (!occupied) {
@@ -332,10 +336,12 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
                             (corner & 2) ? 1.0f : 0.0f,
                             (corner & 4) ? 1.0f : 0.0f);
                         glm::vec3 cornerPos = voxelMin + offset * voxelSteps;
-                        float cornerField = sampleField(cornerPos);
-                        if (cornerField < 0.0f) {
-                            occupied = true;
-                        }
+                    float cornerField = sampleField(cornerPos);
+                    minFieldSample = std::min(minFieldSample, cornerField);
+                    maxFieldSample = std::max(maxFieldSample, cornerField);
+                    if (cornerField < 0.0f) {
+                        occupied = true;
+                    }
                     }
                 }
 
@@ -377,12 +383,36 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
             for (int iy = 0; iy < samplesPerAxis; ++iy) {
                 for (int ix = 0; ix < samplesPerAxis; ++ix, ++sampleIdx) {
                     glm::vec3 vertexPos = brickOrigin + glm::vec3(ix, iy, iz) * voxelSize;
-                    outField[sampleIdx] = sampleField(vertexPos);
+                    float f = sampleField(vertexPos);
+                    minFieldSample = std::min(minFieldSample, f);
+                    maxFieldSample = std::max(maxFieldSample, f);
+                    outField[sampleIdx] = f;
                 }
             }
         }
     } else {
         outField.clear();
+    }
+
+    static std::atomic<uint32_t> loggingBudget{0};
+    if (maxFieldSample < -1e-3f) {
+        uint32_t idx = loggingBudget.fetch_add(1, std::memory_order_relaxed);
+        if (idx < 32) {
+            spdlog::debug("BrickStore: fully negative field brick ({}, {}, {}) minF={} maxF={}",
+                          bc.x, bc.y, bc.z, minFieldSample, maxFieldSample);
+        }
+    } else if (minFieldSample > 1e-3f) {
+        uint32_t idx = loggingBudget.fetch_add(1, std::memory_order_relaxed);
+        if (idx < 32) {
+            spdlog::debug("BrickStore: fully positive field brick ({}, {}, {}) minF={} maxF={}",
+                          bc.x, bc.y, bc.z, minFieldSample, maxFieldSample);
+        }
+    } else if (minFieldSample < -1e-3f && maxFieldSample > 1e-3f) {
+        uint32_t idx = loggingBudget.fetch_add(1, std::memory_order_relaxed);
+        if (idx < 32) {
+            spdlog::debug("BrickStore: surface-crossing brick ({}, {}, {}) minF={} maxF={}",
+                          bc.x, bc.y, bc.z, minFieldSample, maxFieldSample);
+        }
     }
 
     return true;

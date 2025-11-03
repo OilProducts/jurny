@@ -7,7 +7,7 @@
 - **`tests/`** — Lightweight C++ executables invoked through CTest; expand here for unit coverage.
 - **`docs/`** — Design notes and architecture walk-throughs; read `03_architecture_overview.md` before touching core systems.
 
-## Build, Test, and Development Commands
+## Build, Test, and Development Command
 - `cmake -S . -B build -G "Ninja" -DCMAKE_BUILD_TYPE=RelWithDebInfo` — configure toolchain, locate `glslc`, stage shader steps.
 - `cmake --build build -j` — build the app, shaders, packed assets, and tests.
 - `cmake --build build --target shaders_spv` — recompile GLSL only (helpful while iterating on `.comp` files).

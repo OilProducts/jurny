@@ -125,6 +125,8 @@ bool Streaming::popEvictedRegion(glm::ivec3& out) {
 
 void Streaming::enqueueCandidateRegions(const glm::vec3& cameraPos, uint64_t frameIndex) {
     const auto [shellInner, shellOuter] = shellBounds();
+    spdlog::debug("Streaming: update cameraRadius={} shell=[{}, {}] keepRadius={} loadRadius={}",
+                  glm::length(cameraPos), shellInner, shellOuter, config_.keepRadius, config_.loadRadius);
     const float brickSize = store_->brickSize();
     const int regionDim = std::max(config_.regionDimBricks, 1);
     const float regionSize = static_cast<float>(regionDim) * brickSize;
@@ -208,6 +210,8 @@ void Streaming::launchRegionBuilds() {
     if (!jobs_) return;
 
     const auto [shellInner, shellOuter] = shellBounds();
+    spdlog::debug("Streaming: launch builds shell=[{}, {}] loadRadius={} keepRadius={}",
+                  shellInner, shellOuter, config_.loadRadius, config_.keepRadius);
 
     while (!pendingRegions_.empty() && static_cast<int>(inFlight_.size()) < config_.maxConcurrentGenerations) {
         RegionTask task = pendingRegions_.top();
@@ -397,6 +401,18 @@ std::vector<glm::ivec3> Streaming::enumerateRegionBricks(const glm::ivec3& regio
             }
         }
     }
+    if (bricks.empty()) {
+        spdlog::debug("Streaming: region ({}, {}, {}) yielded 0 bricks (shell=[{}, {}])",
+                      regionCoord.x, regionCoord.y, regionCoord.z, shellInner, shellOuter);
+    } else {
+        const float brickSize = store_->brickSize();
+        const float brickHalfDiag = 0.5f * brickSize * std::sqrt(3.0f);
+        glm::vec3 center = (glm::vec3(bricks.front()) + glm::vec3(0.5f)) * brickSize;
+        float radius = glm::length(center);
+        spdlog::debug("Streaming: region ({}, {}, {}) kept {} bricks; first radius={} shell=[{}, {}] halfDiag={}",
+                      regionCoord.x, regionCoord.y, regionCoord.z,
+                      bricks.size(), radius, shellInner, shellOuter, brickHalfDiag);
+    }
     return bricks;
 }
 
@@ -417,6 +433,11 @@ std::pair<float, float> Streaming::shellBounds() const {
     float defaultOuter = static_cast<float>(params.R) + static_cast<float>(params.Hmax) + 10.0f;
     float inner = (config_.shellInner > 0.0f) ? config_.shellInner : defaultInner;
     float outer = (config_.shellOuter > 0.0f) ? config_.shellOuter : defaultOuter;
+    if (store_) {
+        const float brickHalfDiag = 0.5f * store_->brickSize() * std::sqrt(3.0f);
+        inner = std::max(0.0f, inner - brickHalfDiag);
+        outer += brickHalfDiag;
+    }
     if (outer <= inner) {
         outer = inner + 10.0f;
     }
