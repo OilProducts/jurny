@@ -15,6 +15,10 @@
 
 namespace world {
 
+namespace {
+constexpr bool kCacheFieldSamples = true;
+}
+
 uint64_t BrickStore::packKey(int bx, int by, int bz) {
     const uint64_t B = 1ull << 20; // bias for signed coords
     return ((uint64_t)(bx + (int)B) << 42) |
@@ -365,7 +369,6 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
         return false;
     }
 
-    constexpr bool kCacheFieldSamples = true;
     if (kCacheFieldSamples) {
         const int samplesPerAxis = brickDim + 1;
         const size_t samplesPerBrick = static_cast<size_t>(samplesPerAxis) *
@@ -396,8 +399,13 @@ bool BrickStore::acquireBrick(const glm::ivec3& bc,
         std::lock_guard<std::mutex> lock(cacheMutex_);
         auto it = brickCache_.find(key);
         if (it != brickCache_.end()) {
-            payload = it->second;
-            return payload != nullptr;
+            const auto& cached = it->second;
+            if (!cached || (kCacheFieldSamples && cached->field.empty())) {
+                brickCache_.erase(it);
+            } else {
+                payload = cached;
+                return payload != nullptr;
+            }
         }
     }
 
@@ -423,7 +431,13 @@ bool BrickStore::acquireBrick(const glm::ivec3& bc,
         std::lock_guard<std::mutex> lock(cacheMutex_);
         auto [it, inserted] = brickCache_.emplace(key, newPayload);
         if (!inserted) {
-            payload = it->second;
+            const auto& existing = it->second;
+            if (!existing || (kCacheFieldSamples && existing->field.empty())) {
+                it->second = newPayload;
+                payload = newPayload;
+            } else {
+                payload = existing;
+            }
             return payload != nullptr;
         }
     }
@@ -435,7 +449,6 @@ bool BrickStore::acquireBrick(const glm::ivec3& bc,
 CpuWorld BrickStore::buildCpuWorld(const std::vector<glm::ivec3>& brickCoords,
                                    std::atomic<bool>* cancel) const {
     CpuWorld world{};
-    constexpr bool kCacheFieldSamples = true;
     const size_t brickCount = brickCoords.size();
     const size_t voxelsPerBrick = static_cast<size_t>(brickDim_) * static_cast<size_t>(brickDim_) * static_cast<size_t>(brickDim_);
     const size_t wordsPerBrick = (voxelsPerBrick + 63u) / 64u;
