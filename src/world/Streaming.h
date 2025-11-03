@@ -37,6 +37,13 @@ public:
         uint32_t queuedRegions   = 0;
         uint32_t buildingRegions = 0;
         uint32_t readyRegions    = 0;
+        double   buildMsLast     = 0.0;
+        double   buildMsAvg      = 0.0;
+        double   buildMsMax      = 0.0;
+        uint32_t buildSamples    = 0;
+        uint32_t bricksGeneratedLast = 0;
+        uint32_t bricksRequestedLast = 0;
+        double   solidRatioLast  = 0.0;
     };
 
     struct ReadyRegion {
@@ -78,6 +85,9 @@ private:
         float priority = 0.0f;
         CpuWorld bricks;
         bool cancelled = false;
+        double buildMs = 0.0;
+        uint32_t bricksRequested = 0;
+        uint32_t bricksGenerated = 0;
     };
 
     enum class RegionState : uint8_t {
@@ -86,7 +96,8 @@ private:
         Building,
         Ready,
         Resident,
-        Evicting
+        Evicting,
+        Empty
     };
 
     struct RegionRecord {
@@ -133,6 +144,9 @@ private:
     core::Jobs* jobs_ = nullptr;
 
     Stats stats_{};
+    double buildMsAvg_ = 0.0;
+    bool buildMsAvgValid_ = false;
+    double solidRatioLast_ = 0.0;
     glm::vec3 lastCameraWorld_{0.0f};
 
     std::priority_queue<RegionTask, std::vector<RegionTask>, RegionTaskCompare> pendingRegions_;

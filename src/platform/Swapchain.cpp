@@ -3,30 +3,91 @@
 #include <vector>
 #include <algorithm>
 #include <cstdio>
+#include <spdlog/spdlog.h>
 
 namespace platform {
 
-static VkSurfaceFormatKHR chooseSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& fmts) {
-    for (auto& f : fmts) {
-        if ((f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) &&
-            f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) return f;
-    }
-    return fmts.empty() ? VkSurfaceFormatKHR{VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR} : fmts[0];
+namespace {
+
+bool supportsStorage(VkPhysicalDevice phys, VkFormat fmt) {
+    VkFormatProperties props{};
+    vkGetPhysicalDeviceFormatProperties(phys, fmt, &props);
+    return (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
 }
+
+bool selectSurfaceFormat(VkPhysicalDevice phys,
+                         const std::vector<VkSurfaceFormatKHR>& fmts,
+                         VkSurfaceFormatKHR& chosen) {
+    if (fmts.size() == 1 && fmts[0].format == VK_FORMAT_UNDEFINED) {
+        const VkColorSpaceKHR cs = fmts[0].colorSpace;
+        const VkFormat candidates[] = {
+            VK_FORMAT_B8G8R8A8_UNORM,
+            VK_FORMAT_R8G8B8A8_UNORM
+        };
+        for (VkFormat fmt : candidates) {
+            if (!supportsStorage(phys, fmt)) continue;
+            chosen.format = fmt;
+            chosen.colorSpace = cs;
+            return true;
+        }
+        return false;
+    }
+
+    auto tryPick = [&](VkFormat fmt, VkColorSpaceKHR cs, bool requireColorSpace) -> bool {
+        for (auto& f : fmts) {
+            if (f.format != fmt) continue;
+            if (requireColorSpace && f.colorSpace != cs) continue;
+            if (!supportsStorage(phys, f.format)) continue;
+            chosen = f;
+            return true;
+        }
+        return false;
+    };
+
+    const VkColorSpaceKHR desiredCS = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+
+    // Prefer RGBA so storage image bindings using layout(rgba8) remain valid.
+    if (tryPick(VK_FORMAT_R8G8B8A8_UNORM, desiredCS, true)) return true;
+    if (tryPick(VK_FORMAT_R8G8B8A8_UNORM, desiredCS, false)) return true;
+    if (tryPick(VK_FORMAT_B8G8R8A8_UNORM, desiredCS, true)) return true;
+    if (tryPick(VK_FORMAT_B8G8R8A8_UNORM, desiredCS, false)) return true;
+
+    for (auto& f : fmts) {
+        if (!supportsStorage(phys, f.format)) continue;
+        chosen = f;
+        return true;
+    }
+    return false;
+}
+
 static VkPresentModeKHR choosePresentMode(const std::vector<VkPresentModeKHR>& modes) {
     for (auto m : modes) if (m == VK_PRESENT_MODE_MAILBOX_KHR) return m;
     return VK_PRESENT_MODE_FIFO_KHR;
 }
+
+} // namespace
 
 bool Swapchain::create(const SwapchainCreateInfo& info) {
     if (!info.device || !info.surface || !info.physicalDevice) return false;
     VkSurfaceCapabilitiesKHR caps{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(info.physicalDevice, info.surface, &caps);
     uint32_t fmtCount=0; vkGetPhysicalDeviceSurfaceFormatsKHR(info.physicalDevice, info.surface, &fmtCount, nullptr);
-    std::vector<VkSurfaceFormatKHR> fmts(fmtCount); vkGetPhysicalDeviceSurfaceFormatsKHR(info.physicalDevice, info.surface, &fmtCount, fmts.data());
+    std::vector<VkSurfaceFormatKHR> fmts(fmtCount);
+    if (fmtCount > 0) {
+        vkGetPhysicalDeviceSurfaceFormatsKHR(info.physicalDevice, info.surface, &fmtCount, fmts.data());
+    }
     uint32_t pmCount=0; vkGetPhysicalDeviceSurfacePresentModesKHR(info.physicalDevice, info.surface, &pmCount, nullptr);
     std::vector<VkPresentModeKHR> pms(pmCount); vkGetPhysicalDeviceSurfacePresentModesKHR(info.physicalDevice, info.surface, &pmCount, pms.data());
-    auto fmt = chooseSurfaceFormat(fmts);
+
+    if (fmts.empty()) {
+        spdlog::error("No surface formats reported by the driver.");
+        return false;
+    }
+    VkSurfaceFormatKHR fmt{};
+    if (!selectSurfaceFormat(info.physicalDevice, fmts, fmt)) {
+        spdlog::error("No surface format supports STORAGE usage; cannot build swapchain.");
+        return false;
+    }
     auto pmode = choosePresentMode(pms);
 
     VkExtent2D extent{};
@@ -36,7 +97,8 @@ bool Swapchain::create(const SwapchainCreateInfo& info) {
     }
     uint32_t imageCount = caps.minImageCount + 1; if (caps.maxImageCount > 0 && imageCount > caps.maxImageCount) imageCount = caps.maxImageCount;
 
-    VkSwapchainCreateInfoKHR sci{ VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
+    VkSwapchainCreateInfoKHR sci{};
+    sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     sci.surface = info.surface;
     sci.minImageCount = imageCount;
     sci.imageFormat = fmt.format;
@@ -65,7 +127,8 @@ bool Swapchain::create(const SwapchainCreateInfo& info) {
     images_.resize(count); vkGetSwapchainImagesKHR(info.device, swapchain_, &count, images_.data());
     imageViews_ = new VkImageView[count]; imageCount_ = count;
     for (uint32_t i=0;i<count;++i) {
-        VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        VkImageViewCreateInfo vci{};
+        vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         vci.image = images_[i];
         vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
         vci.format = fmt.format;

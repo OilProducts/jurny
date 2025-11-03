@@ -1,6 +1,7 @@
 #include "Streaming.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <utility>
 
@@ -27,6 +28,7 @@ void Streaming::initialize(const BrickStore& store, const Config& config, core::
     config_ = config;
     jobs_ = jobs;
     stats_ = {};
+    stats_.buildMsAvg = 0.0;
     lastCameraWorld_ = glm::vec3(0.0f);
     clearQueues();
 }
@@ -38,6 +40,11 @@ void Streaming::shutdown() {
 
 void Streaming::clearQueues() {
     pendingRegions_ = decltype(pendingRegions_)();
+    for (auto& job : inFlight_) {
+        if (job.cancel) {
+            job.cancel->store(true, std::memory_order_relaxed);
+        }
+    }
     inFlight_.clear();
     {
         std::lock_guard<std::mutex> lock(completedMutex_);
@@ -46,13 +53,24 @@ void Streaming::clearQueues() {
     readyQueue_ = decltype(readyQueue_)();
     regionRecords_.clear();
     evictedRegions_.clear();
+    buildMsAvgValid_ = false;
+    buildMsAvg_ = 0.0;
+    solidRatioLast_ = 0.0;
 }
 
 void Streaming::update(const glm::vec3& cameraPos, uint64_t frameIndex) {
     if (!store_) return;
 
     lastCameraWorld_ = cameraPos;
+    Stats prevStats = stats_;
     stats_ = {};
+    stats_.buildMsLast = prevStats.buildMsLast;
+    stats_.bricksGeneratedLast = prevStats.bricksGeneratedLast;
+    stats_.bricksRequestedLast = prevStats.bricksRequestedLast;
+    stats_.solidRatioLast = prevStats.solidRatioLast;
+    stats_.buildMsMax = prevStats.buildMsMax;
+    stats_.buildSamples = prevStats.buildSamples;
+    stats_.buildMsAvg = buildMsAvgValid_ ? buildMsAvg_ : 0.0;
     evictedRegions_.clear();
 
     enqueueCandidateRegions(cameraPos, frameIndex);
@@ -160,7 +178,8 @@ void Streaming::enqueueCandidateRegions(const glm::vec3& cameraPos, uint64_t fra
                                   record.state == RegionState::Building ||
                                   record.state == RegionState::Ready ||
                                   record.state == RegionState::Resident ||
-                                  record.state == RegionState::Evicting)) {
+                                  record.state == RegionState::Evicting ||
+                                  record.state == RegionState::Empty)) {
                     continue;
                 }
 
@@ -213,13 +232,31 @@ void Streaming::launchRegionBuilds() {
         stats_.queuedRegions = static_cast<uint32_t>(pendingRegions_.size());
 
         jobs_->schedule([this, coord = task.coord, priority = task.priority, bricks = std::move(bricks), cancelFlag]() mutable {
+            const auto start = std::chrono::steady_clock::now();
+            uint32_t bricksRequested = static_cast<uint32_t>(bricks.size());
             CpuWorld cpu = store_->buildCpuWorld(bricks, cancelFlag.get());
+            const auto end = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(end - start).count();
             bool cancelled = cancelFlag->load(std::memory_order_relaxed);
             CompletedRegion completed;
             completed.coord = coord;
             completed.priority = priority;
             completed.bricks = std::move(cpu);
             completed.cancelled = cancelled;
+            completed.buildMs = ms;
+            completed.bricksRequested = bricksRequested;
+            completed.bricksGenerated = static_cast<uint32_t>(completed.bricks.headers.size());
+            if (!cancelled) {
+                double solidRatio = (bricksRequested > 0)
+                    ? (static_cast<double>(completed.bricksGenerated) / static_cast<double>(bricksRequested))
+                    : 0.0;
+                spdlog::info("Streaming built region ({}, {}, {}): {:.2f} ms, bricks {} / {} ({:.1f}% solid)",
+                             coord.x, coord.y, coord.z,
+                             ms,
+                             completed.bricksGenerated,
+                             bricksRequested,
+                             solidRatio * 100.0);
+            }
             {
                 std::lock_guard<std::mutex> lock(completedMutex_);
                 completedRegions_.push_back(std::move(completed));
@@ -259,10 +296,36 @@ void Streaming::promoteToReady(CompletedRegion&& completed) {
         return;
     }
 
-    if (completed.cancelled || completed.bricks.headers.empty()) {
+    if (completed.cancelled) {
         it->second.state = RegionState::None;
         return;
     }
+
+    if (completed.bricks.headers.empty()) {
+        it->second.state = RegionState::Empty;
+        return;
+    }
+
+    stats_.buildMsLast = completed.buildMs;
+    stats_.buildSamples += 1;
+    stats_.buildMsMax = std::max(stats_.buildMsMax, completed.buildMs);
+    stats_.bricksGeneratedLast = completed.bricksGenerated;
+    stats_.bricksRequestedLast = completed.bricksRequested;
+    double solidRatio = (completed.bricksRequested > 0)
+        ? (static_cast<double>(completed.bricksGenerated) / static_cast<double>(completed.bricksRequested))
+        : 0.0;
+    stats_.solidRatioLast = solidRatio;
+    solidRatioLast_ = solidRatio;
+    if (completed.buildMs > 0.0) {
+        if (!buildMsAvgValid_) {
+            buildMsAvg_ = completed.buildMs;
+            buildMsAvgValid_ = true;
+        } else {
+            const double alpha = 0.15;
+            buildMsAvg_ = (1.0 - alpha) * buildMsAvg_ + alpha * completed.buildMs;
+        }
+    }
+    stats_.buildMsAvg = buildMsAvgValid_ ? buildMsAvg_ : 0.0;
 
     ReadyRegion ready;
     ready.regionCoord = completed.coord;
@@ -280,7 +343,10 @@ void Streaming::evaluateEvictions(uint64_t frameIndex) {
     const int regionDim = std::max(config_.regionDimBricks, 1);
     const float regionSize = static_cast<float>(regionDim) * store_->brickSize();
     const float regionHalfDiag = 0.5f * regionSize * std::sqrt(3.0f);
-    const float keepRadius = (config_.keepRadius > 0.0f) ? config_.keepRadius : config_.loadRadius;
+    float keepRadius = (config_.keepRadius > 0.0f) ? config_.keepRadius : config_.loadRadius;
+    if (config_.loadRadius > 0.0f) {
+        keepRadius = std::max(keepRadius, config_.loadRadius);
+    }
 
     for (auto& entry : regionRecords_) {
         RegionRecord& record = entry.second;

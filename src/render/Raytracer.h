@@ -27,6 +27,8 @@ namespace render {
 struct GlobalsUBOData {
     float currView[16];
     float currProj[16];
+    float currViewInv[16];
+    float currProjInv[16];
     float prevView[16];
     float prevProj[16];
     float renderOrigin[4];
@@ -64,6 +66,7 @@ public:
     size_t residentRegionCount() const { return regionResidents_.size(); }
     std::array<double, 4> gpuTimingsMs() const;
     void updateOverlayHUD(platform::VulkanContext& vk, const std::vector<std::string>& lines);
+    void collectGpuTimings(platform::VulkanContext& vk, uint32_t frameIdx);
 
 private:
     bool createPipelines(platform::VulkanContext& vk);
@@ -93,6 +96,7 @@ private:
     void uploadOccupancyRange(platform::VulkanContext& vk, uint32_t first, uint32_t count);
     void uploadMaterialRange(platform::VulkanContext& vk, uint32_t first, uint32_t count);
     void uploadPaletteRange(platform::VulkanContext& vk, uint32_t first, uint32_t count);
+    void uploadFieldRange(platform::VulkanContext& vk, uint32_t first, uint32_t count);
     void updateBrickHeader(uint32_t index);
     void fixupBrickHeader(uint32_t index);
     bool createProfilingResources(platform::VulkanContext& vk);
@@ -124,6 +128,7 @@ private:
     BufferResource mkBuf_{};
     BufferResource mvBuf_{};
     BufferResource paletteBuf_{};
+    BufferResource fieldBuf_{};
     BufferResource matIdxBuf_{};
     BufferResource materialTableBuf_{};
     struct TraversalStatsHost {
@@ -145,6 +150,7 @@ private:
     double timestampPeriodNs_{}; // GPU timestamp period in nanoseconds
     double gpuTimingsMs_[4]{};   // generate, traverse, shade, composite
     uint32_t lastTimingFrame_{}; // last frame we logged timings
+    bool useSync2_ = false;
 
     // Debug buffer (GPU→CPU) for per-frame diagnostics
     VkBuffer dbgBuf_{}; VkDeviceMemory dbgMem_{}; // 16*4 bytes sufficient
@@ -153,6 +159,7 @@ private:
     glm::vec3 renderOrigin_{0.0f};
     GpuBuffers gpuBuffers_;
     Denoiser denoiser_;
+    bool denoiseEnabled_ = false;
     Tonemap tonemap_;
     Overlays overlays_;
 
@@ -161,6 +168,7 @@ private:
         glm::ivec3 coord{0};
         uint16_t paletteCount = 0;
         uint16_t flags = 0;
+        bool hasField = false;
     };
 
     struct RegionResident {
@@ -184,12 +192,15 @@ private:
     std::vector<uint64_t> occWordsHost_;
     std::vector<uint32_t> matWordsHost_;
     std::vector<uint32_t> paletteHost_;
+    std::vector<float>    fieldHost_;
     std::vector<uint64_t> hashKeysHost_;
     std::vector<uint32_t> hashValsHost_;
     uint32_t macroDimBricks_ = 8;
     static constexpr uint32_t kOccWordsPerBrick = 8;
     static constexpr uint32_t kMaterialWordsPerBrick = 128;
     static constexpr uint32_t kPaletteEntriesPerBrick = 16;
+    static constexpr uint32_t kFieldValuesPerBrick =
+        (VOXEL_BRICK_SIZE + 1) * (VOXEL_BRICK_SIZE + 1) * (VOXEL_BRICK_SIZE + 1);
 };
 
 }

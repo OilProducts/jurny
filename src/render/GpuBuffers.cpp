@@ -28,7 +28,8 @@ bool allocateBuffer(VkDevice device,
                     VkMemoryPropertyFlags flags,
                     VkBuffer& outBuf,
                     VkDeviceMemory& outMem) {
-    VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    VkBufferCreateInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bi.size = size;
     bi.usage = usage;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -45,7 +46,8 @@ bool allocateBuffer(VkDevice device,
         outBuf = VK_NULL_HANDLE;
         return false;
     }
-    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = mr.size;
     mai.memoryTypeIndex = typeIndex;
     if (vkAllocateMemory(device, &mai, nullptr, &outMem) != VK_SUCCESS) {
@@ -132,7 +134,8 @@ bool GpuBuffers::allocateImage(platform::VulkanContext& vk,
                                VkFormat format,
                                VkImageUsageFlags usage,
                                ImageResource& out) {
-    VkImageCreateInfo ici{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    VkImageCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = format;
     ici.extent = { extent.width, extent.height, 1 };
@@ -156,7 +159,8 @@ bool GpuBuffers::allocateImage(platform::VulkanContext& vk,
         out.image = VK_NULL_HANDLE;
         return false;
     }
-    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = mr.size;
     mai.memoryTypeIndex = typeIndex;
     if (vkAllocateMemory(vk.device(), &mai, nullptr, &out.memory) != VK_SUCCESS) {
@@ -167,7 +171,8 @@ bool GpuBuffers::allocateImage(platform::VulkanContext& vk,
     }
     vkBindImageMemory(vk.device(), out.image, out.memory, 0);
 
-    VkImageViewCreateInfo ivci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    VkImageViewCreateInfo ivci{};
+    ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     ivci.image = out.image;
     ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
     ivci.format = format;
@@ -234,7 +239,8 @@ void GpuBuffers::destroyQueueBuffers(platform::VulkanContext& vk) {
 
 bool GpuBuffers::createStatsBuffer(platform::VulkanContext& vk) {
     destroyStatsBuffer(vk);
-    VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    VkBufferCreateInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bi.size = sizeof(uint32_t) * 8;
     bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -252,7 +258,8 @@ bool GpuBuffers::createStatsBuffer(platform::VulkanContext& vk) {
         statsBuf_ = VK_NULL_HANDLE;
         return false;
     }
-    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = mr.size;
     mai.memoryTypeIndex = typeIndex;
     if (vkAllocateMemory(vk.device(), &mai, nullptr, &statsMem_) != VK_SUCCESS) {

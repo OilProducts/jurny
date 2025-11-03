@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Pre-commit hook: enforce repository clang-format settings on staged C/C++ files.
+# Place this script in .git/hooks/pre-commit or set core.hooksPath to tools/git-hooks.
+
+set -euo pipefail
+
+if ! command -v clang-format >/dev/null 2>&1; then
+  echo "[pre-commit] clang-format not found in PATH; install it or disable the hook." >&2
+  exit 1
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "${repo_root}"
+
+staged_files="$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(c|cc|cpp|cxx|h|hh|hpp)$' || true)"
+
+if [[ -z "${staged_files}" ]]; then
+  exit 0
+fi
+
+echo "[pre-commit] Formatting staged C/C++ sources with clang-format..."
+
+formatter_failed=0
+
+for file in ${staged_files}; do
+  if [[ ! -f "${file}" ]]; then
+    continue
+  fi
+  if ! clang-format -i "${file}"; then
+    formatter_failed=1
+    continue
+  fi
+  git add "${file}"
+done
+
+if [[ "${formatter_failed}" -ne 0 ]]; then
+  echo "[pre-commit] clang-format failed on one or more files." >&2
+  exit 1
+fi
+
+# Re-check the staged diff to ensure formatting succeeded.
+if ! git diff --quiet --cached -- ${staged_files}; then
+  echo "[pre-commit] Formatting applied. Review the staged changes before retrying commit." >&2
+fi
+
+exit 0

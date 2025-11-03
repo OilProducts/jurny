@@ -40,13 +40,31 @@ int App::run() {
 #if VOXEL_ENABLE_WINDOW
     // Logging is initialized in main(); no per-frame flush here.
     platform::Window window;
-    if (!window.create()) return 1;
+    spdlog::info("Creating window");
+    if (!window.create()) {
+        spdlog::error("Window creation failed");
+        return 1;
+    }
+    spdlog::info("Window created ({}x{})", window.width(), window.height());
     std::vector<const char*> instanceExts;
     platform::Window::getRequiredInstanceExtensions(instanceExts);
-    if (!vk.initInstance(instanceExts, enableValidation)) return 1;
+    spdlog::info("Initializing Vulkan instance");
+    if (!vk.initInstance(instanceExts, enableValidation)) {
+        spdlog::error("initInstance failed");
+        return 1;
+    }
+    spdlog::info("Vulkan instance ready");
     VkSurfaceKHR surface = (VkSurfaceKHR)0;
-    if (!window.createSurface(vk.instance(), &surface)) return 1;
-    if (!vk.initDevice(surface)) return 1;
+    if (!window.createSurface(vk.instance(), &surface)) {
+        spdlog::error("createSurface failed");
+        return 1;
+    }
+    spdlog::info("Surface created");
+    if (!vk.initDevice(surface)) {
+        spdlog::error("initDevice failed");
+        return 1;
+    }
+    spdlog::info("Device initialized");
     platform::Swapchain swap;
     platform::SwapchainCreateInfo sci{};
     sci.device = vk.device();
@@ -56,7 +74,12 @@ int App::run() {
     sci.presentQueueFamily = vk.graphicsFamily();
     sci.width = window.width();
     sci.height= window.height();
-    swap.create(sci);
+    spdlog::info("Creating swapchain");
+    if (!swap.create(sci)) {
+        spdlog::error("Swapchain creation failed");
+        return 1;
+    }
+    spdlog::info("Swapchain ready");
 
     core::Jobs jobs;
     jobs.start();
@@ -87,7 +110,13 @@ int App::run() {
         spdlog::warn("Asset directory not specified; proceeding without packed assets");
     }
 
-    VkCommandBuffer cb{}; VkCommandBufferAllocateInfo cbai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO }; cbai.commandPool = vk.commandPool(); cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1; vkAllocateCommandBuffers(vk.device(), &cbai, &cb);
+    VkCommandBuffer cb{};
+    VkCommandBufferAllocateInfo cbai{};
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbai.commandPool = vk.commandPool();
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    vkAllocateCommandBuffers(vk.device(), &cbai, &cb);
 
     // Initialize Raytracer M1 skeleton
     render::Raytracer ray;
@@ -101,30 +130,40 @@ int App::run() {
     spdlog::debug("Raytracer initialized");
     const float planetRadius = 100.0f;
     const float eyeHeight = 1.7f;
+    const bool enableStreaming = true;
     const world::BrickStore* brickStore = ray.worldStore();
-    if (brickStore) {
+    if (enableStreaming && brickStore) {
         world::Streaming::Config streamCfg;
         streamCfg.shellInner = planetRadius - 25.0f;
         streamCfg.shellOuter = planetRadius + 75.0f;
         streamCfg.shellInner = 0.0f; // use planet defaults from store
         streamCfg.shellOuter = 0.0f;
-        streamCfg.keepRadius = 70.0f;
-        streamCfg.loadRadius = 110.0f;
-        streamCfg.simRadius  = 80.0f;
-        streamCfg.regionDimBricks = 16;
-        streamCfg.maxRegionSelectionsPerFrame = 4;
+        streamCfg.keepRadius = 60.0f;
+        streamCfg.loadRadius = 90.0f;
+        streamCfg.simRadius  = 70.0f;
+        streamCfg.regionDimBricks = 8;
+        streamCfg.maxRegionSelectionsPerFrame = 2;
         streamCfg.maxConcurrentGenerations = std::max(2, static_cast<int>(jobs.workerCount()));
         streaming.initialize(*brickStore, streamCfg, &jobs);
         spdlog::debug("Streaming initialized");
+    } else if (!enableStreaming) {
+        spdlog::info("Streaming disabled for debugging");
     } else {
         spdlog::warn("Streaming not initialized: no brick store available");
     }
-    VkSemaphoreCreateInfo sciSem{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO }; VkSemaphore acquireSem{}, finishSem{}; vkCreateSemaphore(vk.device(), &sciSem, nullptr, &acquireSem); vkCreateSemaphore(vk.device(), &sciSem, nullptr, &finishSem);
+    VkSemaphoreCreateInfo sciSem{};
+    sciSem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    VkSemaphore acquireSem{};
+    VkSemaphore finishSem{};
+    vkCreateSemaphore(vk.device(), &sciSem, nullptr, &acquireSem);
+    vkCreateSemaphore(vk.device(), &sciSem, nullptr, &finishSem);
     auto t0 = std::chrono::steady_clock::now();
     auto last = t0;
     uint32_t frameCounter = 0;
     bool mPrevDown = false; // edge-trigger for 'M'
-    uint32_t debugFlags = 8u; // start with macro skip enabled (bit3)
+    bool blockPrevDown = false; // edge-trigger for 'B'
+    const uint32_t blockNormalFlag = 32u;
+    uint32_t debugFlags = 8u; // macro skip on, smooth normals by default
     glm::dvec3 camWorld = glm::dvec3(double(planetRadius) + 5.0, 0.0, 5.0);
     glm::dvec3 prevRenderOrigin = camWorld;
     glm::mat4 prevViewMat(1.0f);
@@ -164,15 +203,27 @@ int App::run() {
 #if VOXEL_ENABLE_WINDOW
     glfwSetInputMode(window.handle(), GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 #endif
+    size_t debugFrameSerial = 0;
     while (!window.shouldClose()) {
         window.poll();
         uint32_t idx = 0;
         VkResult acquireRes = vkAcquireNextImageKHR(vk.device(), swap.handle(), UINT64_MAX, acquireSem, VK_NULL_HANDLE, &idx);
         if (acquireRes != VK_SUCCESS) {
+            spdlog::error("vkAcquireNextImageKHR failed ({})", int(acquireRes));
+            frameGraph.endFrame();
             break;
         }
 
+        ++debugFrameSerial;
+        bool logFrame = (debugFrameSerial <= 10) || ((debugFrameSerial % 60) == 0);
+        if (logFrame) {
+            spdlog::info("Frame {} acquired image {}", debugFrameSerial, idx);
+        }
+
         frameGraph.beginFrame();
+        if (logFrame) {
+            spdlog::info("Frame {} beginFrame done", debugFrameSerial);
+        }
 
 #if VOXEL_ENABLE_WINDOW
         if (glfwGetKey(window.handle(), GLFW_KEY_ESCAPE) == GLFW_PRESS) {
@@ -192,6 +243,14 @@ int App::run() {
             spdlog::info("macro-skip {}", (debugFlags & 8u) ? "ON" : "OFF");
         }
         mPrevDown = mDown;
+
+        int bState = glfwGetKey(window.handle(), GLFW_KEY_B);
+        bool bDown = (bState == GLFW_PRESS);
+        if (bDown && !blockPrevDown) {
+            debugFlags ^= blockNormalFlag;
+            spdlog::info("voxel normals {}", (debugFlags & blockNormalFlag) ? "BLOCK" : "SMOOTH");
+        }
+        blockPrevDown = bDown;
 #endif
 
         render::GlobalsUBOData data{};
@@ -354,8 +413,12 @@ int App::run() {
         glm::mat4 V = glm::lookAt(camPosF, camPosF + forward, up);
         float aspect = float(swap.extent().width) / float(swap.extent().height);
         glm::mat4 P = glm::perspective(glm::radians(45.0f), aspect, 0.05f, 2000.0f);
+        glm::mat4 invV = glm::inverse(V);
+        glm::mat4 invP = glm::inverse(P);
         std::memcpy(data.currView, &V[0][0], sizeof(float) * 16);
         std::memcpy(data.currProj, &P[0][0], sizeof(float) * 16);
+        std::memcpy(data.currViewInv, &invV[0][0], sizeof(float) * 16);
+        std::memcpy(data.currProjInv, &invP[0][0], sizeof(float) * 16);
         std::memcpy(data.prevView, &prevViewMat[0][0], sizeof(float) * 16);
         std::memcpy(data.prevProj, &prevProjMat[0][0], sizeof(float) * 16);
         data.renderOrigin[0] = camPosF.x;
@@ -405,8 +468,8 @@ int App::run() {
                << "  DT " << std::setw(6) << dtMs << "MS";
             clampLine(ss.str());
         }
+        auto timings = ray.gpuTimingsMs();
         {
-            auto timings = ray.gpuTimingsMs();
             std::ostringstream ss;
             ss << std::fixed << std::setprecision(2)
                << "GPU MS G:" << std::setw(5) << timings[0]
@@ -424,6 +487,20 @@ int App::run() {
                << " BUILD " << statsOverlay.buildingRegions;
             clampLine(ss.str());
         }
+        if (statsOverlay.bricksRequestedLast > 0) {
+            std::ostringstream ss;
+            ss << std::fixed << std::setprecision(2)
+               << "BUILD MS LAST " << statsOverlay.buildMsLast
+               << " AVG " << statsOverlay.buildMsAvg
+               << " MAX " << statsOverlay.buildMsMax;
+            ss << std::setprecision(0)
+               << " SAMPLES " << statsOverlay.buildSamples;
+            ss << std::setprecision(0)
+               << " BRICKS " << statsOverlay.bricksGeneratedLast
+               << "/" << statsOverlay.bricksRequestedLast
+               << " (" << std::setprecision(1) << statsOverlay.solidRatioLast * 100.0 << "%)";
+            clampLine(ss.str());
+        }
         {
             double altitude = glm::length(camPosF) - double(planetRadius);
             std::ostringstream ss;
@@ -435,10 +512,12 @@ int App::run() {
             clampLine(ss.str());
         }
         ray.updateOverlayHUD(vk, overlayLines);
+        if (logFrame) {
+            spdlog::info("Frame {} globals prepared (GPU ms: G={:.2f} T={:.2f} S={:.2f} C={:.2f})",
+                         debugFrameSerial, timings[0], timings[1], timings[2], timings[3]);
+        }
 
         if (data.frameIdx < 3) {
-            auto invV = glm::inverse(V);
-            auto invP = glm::inverse(P);
             auto makeRayCPU = [&](int px, int py) {
                 float w = float(swap.extent().width), h = float(swap.extent().height);
                 glm::vec2 uv = (glm::vec2(px + 0.5f, py + 0.5f)) / glm::vec2(w, h);
@@ -465,9 +544,13 @@ int App::run() {
         }
 
         ray.updateGlobals(vk, data);
+        if (logFrame) {
+            spdlog::info("Frame {} globals uploaded", debugFrameSerial);
+        }
 
         frameGraph.addPass("PrepareSwapImage", [&, idx](VkCommandBuffer cmd) {
-            VkImageMemoryBarrier barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+            VkImageMemoryBarrier barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             barrier.srcAccessMask = 0;
             barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
             barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
@@ -496,7 +579,8 @@ int App::run() {
         });
 
         frameGraph.addPass("TransitionToPresent", [&, idx](VkCommandBuffer cmd) {
-            VkImageMemoryBarrier barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+            VkImageMemoryBarrier barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
             barrier.dstAccessMask = 0;
             barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -516,13 +600,18 @@ int App::run() {
                                  1, &barrier);
         });
 
-        VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        VkCommandBufferBeginInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         vkBeginCommandBuffer(cb, &bi);
         frameGraph.execute(cb);
         vkEndCommandBuffer(cb);
+        if (logFrame) {
+            spdlog::info("Frame {} command buffer recorded", debugFrameSerial);
+        }
 
         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-        VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        VkSubmitInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.waitSemaphoreCount = 1;
         si.pWaitSemaphores = &acquireSem;
         si.pWaitDstStageMask = &waitStage;
@@ -530,21 +619,55 @@ int App::run() {
         si.pCommandBuffers = &cb;
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &finishSem;
+        auto submitStart = std::chrono::steady_clock::now();
         vkQueueSubmit(vk.graphicsQueue(), 1, &si, VK_NULL_HANDLE);
+        auto submitEnd = std::chrono::steady_clock::now();
+        if (logFrame) {
+            double submitMs = std::chrono::duration<double, std::milli>(submitEnd - submitStart).count();
+            spdlog::info("Frame {} submitted ({:.3f} ms)", debugFrameSerial, submitMs);
+        }
 
-        VkPresentInfoKHR pi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+        VkPresentInfoKHR pi{};
+        pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         VkSwapchainKHR sc = swap.handle();
         pi.waitSemaphoreCount = 1;
         pi.pWaitSemaphores = &finishSem;
         pi.swapchainCount = 1;
         pi.pSwapchains = &sc;
         pi.pImageIndices = &idx;
+        auto presentStart = std::chrono::steady_clock::now();
         vkQueuePresentKHR(vk.graphicsQueue(), &pi);
-        vkQueueWaitIdle(vk.graphicsQueue());
+        auto presentEnd = std::chrono::steady_clock::now();
+        if (logFrame) {
+            double presentMs = std::chrono::duration<double, std::milli>(presentEnd - presentStart).count();
+            spdlog::info("Frame {} presented ({:.3f} ms)", debugFrameSerial, presentMs);
+        }
+        auto waitStart = std::chrono::steady_clock::now();
+        VkResult waitRes = vkQueueWaitIdle(vk.graphicsQueue());
+        auto waitEnd = std::chrono::steady_clock::now();
+        if (logFrame) {
+            double waitMs = std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();
+            spdlog::info("Frame {} queue idle ({:.3f} ms)", debugFrameSerial, waitMs);
+        }
+
+        if (waitRes != VK_SUCCESS) {
+            spdlog::error("vkQueueWaitIdle failed ({})", int(waitRes));
+            frameGraph.endFrame();
+            break;
+        }
+
+        ray.collectGpuTimings(vk, currentFrameIdx);
 
         frameGraph.endFrame();
+        if (logFrame) {
+            spdlog::info("Frame {} endFrame done", debugFrameSerial);
+        }
 
-        ray.readDebug(vk, currentFrameIdx);
+        // Temporarily disable per-frame debug readback to avoid blocking on device-local memory.
+        // ray.readDebug(vk, currentFrameIdx);
+        if (logFrame) {
+            spdlog::info("Frame {} loop end", debugFrameSerial);
+        }
     }
 
     vkDestroySemaphore(vk.device(), finishSem, nullptr); vkDestroySemaphore(vk.device(), acquireSem, nullptr);

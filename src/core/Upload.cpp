@@ -18,7 +18,8 @@ bool UploadContext::init(platform::VulkanContext& vk, VkDeviceSize initialStagin
         queueFamily_ = vk.graphicsFamily();
     }
 
-    VkCommandPoolCreateInfo cpci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    VkCommandPoolCreateInfo cpci{};
+    cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     cpci.queueFamilyIndex = queueFamily_;
     if (vkCreateCommandPool(vk.device(), &cpci, nullptr, &commandPool_) != VK_SUCCESS) {
@@ -26,7 +27,8 @@ bool UploadContext::init(platform::VulkanContext& vk, VkDeviceSize initialStagin
         return false;
     }
 
-    VkCommandBufferAllocateInfo cbai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    VkCommandBufferAllocateInfo cbai{};
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cbai.commandPool = commandPool_;
     cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cbai.commandBufferCount = 1;
@@ -35,7 +37,8 @@ bool UploadContext::init(platform::VulkanContext& vk, VkDeviceSize initialStagin
         return false;
     }
 
-    VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     if (vkCreateFence(vk.device(), &fci, nullptr, &fence_) != VK_SUCCESS) {
         spdlog::error("UploadContext: failed to create fence");
@@ -65,7 +68,8 @@ bool UploadContext::ensureStagingCapacity(VkDeviceSize bytes) {
 
     VkDeviceSize newCapacity = stagingCapacity_ == 0 ? required : std::max(required, stagingCapacity_ * 2);
 
-    VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    VkBufferCreateInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bi.size = newCapacity;
     bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -83,7 +87,8 @@ bool UploadContext::ensureStagingCapacity(VkDeviceSize bytes) {
         return false;
     }
 
-    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = mr.size;
     mai.memoryTypeIndex = typeIndex;
     if (vkAllocateMemory(vk_->device(), &mai, nullptr, &stagingMemory_) != VK_SUCCESS) {
@@ -97,6 +102,8 @@ bool UploadContext::ensureStagingCapacity(VkDeviceSize bytes) {
     }
 
     stagingCapacity_ = newCapacity;
+    spdlog::info("UploadContext: staging buffer resize -> {} bytes (requested {})",
+                 static_cast<uint64_t>(stagingCapacity_), static_cast<uint64_t>(bytes));
     return true;
 }
 
@@ -128,10 +135,20 @@ bool UploadContext::uploadBufferRegion(const void* data,
     if (bytes == 0 || dstBuffer == VK_NULL_HANDLE) {
         return true;
     }
+    if (deviceLost_) {
+        spdlog::error("UploadContext: device lost, skipping buffer upload ({} bytes)", static_cast<uint64_t>(bytes));
+        return false;
+    }
 
     if (!ensureStagingCapacity(bytes)) {
         return false;
     }
+
+    spdlog::info("UploadContext: copy request bytes={} dstBuffer={} dstOffset={} stagingCapacity={}",
+                 static_cast<uint64_t>(bytes),
+                 static_cast<const void*>(dstBuffer),
+                 static_cast<uint64_t>(dstOffset),
+                 static_cast<uint64_t>(stagingCapacity_));
 
     void* mapped = nullptr;
     if (vkMapMemory(vk_->device(), stagingMemory_, 0, bytes, 0, &mapped) != VK_SUCCESS || mapped == nullptr) {
@@ -141,13 +158,18 @@ bool UploadContext::uploadBufferRegion(const void* data,
     std::memcpy(mapped, data, static_cast<std::size_t>(bytes));
     vkUnmapMemory(vk_->device(), stagingMemory_);
 
-    if (vkWaitForFences(vk_->device(), 1, &fence_, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
-        spdlog::warn("UploadContext: wait for fence failed");
+    VkResult waitRes = vkWaitForFences(vk_->device(), 1, &fence_, VK_TRUE, UINT64_MAX);
+    if (waitRes != VK_SUCCESS) {
+        spdlog::error("UploadContext: wait for fence failed ({})", static_cast<int>(waitRes));
+        deviceLost_ = (waitRes == VK_ERROR_DEVICE_LOST);
+        return false;
     }
     vkResetFences(vk_->device(), 1, &fence_);
+    spdlog::info("UploadContext: fence cleared before submit (bytes={})", static_cast<uint64_t>(bytes));
 
     vkResetCommandPool(vk_->device(), commandPool_, 0);
-    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(commandBuffer_, &bi);
     VkBufferCopy region{};
@@ -157,18 +179,26 @@ bool UploadContext::uploadBufferRegion(const void* data,
     vkCmdCopyBuffer(commandBuffer_, stagingBuffer_, dstBuffer, 1, &region);
     vkEndCommandBuffer(commandBuffer_);
 
-    VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &commandBuffer_;
-    if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) {
-        spdlog::error("UploadContext: vkQueueSubmit failed");
+    VkResult submitRes = vkQueueSubmit(queue_, 1, &si, fence_);
+    if (submitRes != VK_SUCCESS) {
+        spdlog::error("UploadContext: vkQueueSubmit failed ({})", static_cast<int>(submitRes));
+        deviceLost_ = (submitRes == VK_ERROR_DEVICE_LOST);
         return false;
     }
 
-    if (vkWaitForFences(vk_->device(), 1, &fence_, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
-        spdlog::warn("UploadContext: wait for fence after submit failed");
+    spdlog::info("UploadContext: submitted copy bytes={} queueFamily={}", static_cast<uint64_t>(bytes), queueFamily_);
+
+    waitRes = vkWaitForFences(vk_->device(), 1, &fence_, VK_TRUE, UINT64_MAX);
+    if (waitRes != VK_SUCCESS) {
+        spdlog::error("UploadContext: wait for fence after submit failed ({})", static_cast<int>(waitRes));
+        deviceLost_ = (waitRes == VK_ERROR_DEVICE_LOST);
         return false;
     }
+    spdlog::info("UploadContext: copy complete bytes={}", static_cast<uint64_t>(bytes));
     return true;
 }
 
@@ -195,6 +225,7 @@ void UploadContext::shutdown() {
     queue_ = VK_NULL_HANDLE;
     stagingCapacity_ = 0;
     vk_ = nullptr;
+    deviceLost_ = false;
 }
 
 }

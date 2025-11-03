@@ -5,6 +5,8 @@ struct GlobalsUBO_t {
   // Camera (local space, origin rebased)
   mat4 currView;
   mat4 currProj;
+  mat4 currViewInv;
+  mat4 currProjInv;
   mat4 prevView;
   mat4 prevProj;
 

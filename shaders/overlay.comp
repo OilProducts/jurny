@@ -6,12 +6,12 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 26, std430) readonly buffer OverlayBuffer {
+layout(set = 0, binding = 27, std430) readonly buffer OverlayBuffer {
   uint header[4];          // [0]=width (chars), [1]=height (chars), [2]=lineStride, [3]=charCount
   uint data[];             // packed ASCII chars (one per uint lower byte)
 } Overlay;
 
-layout(set = 0, binding = 27, rgba8) uniform image2D targetImage;
+layout(set = 0, binding = 28, rgba8) uniform image2D targetImage;
 
 const uint FONT_WIDTH  = 6u;
 const uint FONT_HEIGHT = 8u;

@@ -107,6 +107,29 @@ layout(set = 0, binding = 25, std430) readonly buffer PaletteBuf {
   uint paletteEntries[];
 };
 
+layout(set = 0, binding = 26, std430) readonly buffer FieldSamplesBuf {
+  float fieldSamples[];
+};
+
+const uint FIELD_DIM   = uint(VOXEL_BRICK_SIZE + 1);
+const uint FIELD_PLANE = FIELD_DIM * FIELD_DIM;
+const uint FIELD_COUNT_PER_BRICK = FIELD_DIM * FIELD_PLANE;
+
+bool brickFieldBase(const BrickHeader h, out uint baseIndex) {
+  if (h.tsdfOffset == BRICK_INVALID_OFFSET) return false;
+  uint base = h.tsdfOffset >> 2u;
+  uint count = fieldSamples.length();
+  if (count == 0u) return false;
+  if (base + FIELD_COUNT_PER_BRICK > count) return false;
+  baseIndex = base;
+  return true;
+}
+
+float fetchFieldSample(uint baseIndex, int x, int y, int z) {
+  uint idx = baseIndex + uint(x) + uint(y) * FIELD_DIM + uint(z) * FIELD_PLANE;
+  return fieldSamples[idx];
+}
+
 // Constants ----------------------------------------------------------------------------
 const float INF_T              = 1e30;
 const float BRICK_NUDGE        = 1e-5;
@@ -116,7 +139,8 @@ const int   BRICK_MAX_STEPS    = 4096;
 const int   MACRO_MAX_STEPS    = 2048;
 const int   MICRO_MAX_STEPS    = 128;
 const int   REFINE_MAX_ITERS   = 6;
-const uint  FLAG_ENABLE_MACRO  = 8u;       // matches CPU/debug flag bit
+const uint  FLAG_ENABLE_MACRO        = 8u;       // matches CPU/debug flag bit
+const uint  FLAG_FORCE_BLOCK_NORMALS = 32u;
 const uint  MISS_REASON_ENV    = 0u;
 const uint  MISS_REASON_SHELL  = 1u;
 const uint  MISS_REASON_BAND   = 2u;
@@ -195,33 +219,70 @@ bool brickHasOccupancy(const BrickHeader h) {
   return false;
 }
 
-float evaluateField(vec3 p, const BrickHeader /*h*/) {
-  return F_crust(p);
+float sampleBrickField(uint baseIndex, vec3 worldPos, const BrickHeader h) {
+  vec3 brickOriginWorld = vec3(h.bx, h.by, h.bz) * g.brickSize;
+  vec3 local = (worldPos - brickOriginWorld) / g.voxelSize;
+
+  float fx = clamp(local.x, 0.0, float(VOXEL_BRICK_SIZE));
+  float fy = clamp(local.y, 0.0, float(VOXEL_BRICK_SIZE));
+  float fz = clamp(local.z, 0.0, float(VOXEL_BRICK_SIZE));
+
+  int ix0 = clamp(int(floor(fx)), 0, VOXEL_BRICK_SIZE);
+  int iy0 = clamp(int(floor(fy)), 0, VOXEL_BRICK_SIZE);
+  int iz0 = clamp(int(floor(fz)), 0, VOXEL_BRICK_SIZE);
+  int ix1 = min(ix0 + 1, VOXEL_BRICK_SIZE);
+  int iy1 = min(iy0 + 1, VOXEL_BRICK_SIZE);
+  int iz1 = min(iz0 + 1, VOXEL_BRICK_SIZE);
+
+  float tx = clamp(fx - float(ix0), 0.0, 1.0);
+  float ty = clamp(fy - float(iy0), 0.0, 1.0);
+  float tz = clamp(fz - float(iz0), 0.0, 1.0);
+
+  float c00 = mix(fetchFieldSample(baseIndex, ix0, iy0, iz0), fetchFieldSample(baseIndex, ix1, iy0, iz0), tx);
+  float c10 = mix(fetchFieldSample(baseIndex, ix0, iy1, iz0), fetchFieldSample(baseIndex, ix1, iy1, iz0), tx);
+  float c01 = mix(fetchFieldSample(baseIndex, ix0, iy0, iz1), fetchFieldSample(baseIndex, ix1, iy0, iz1), tx);
+  float c11 = mix(fetchFieldSample(baseIndex, ix0, iy1, iz1), fetchFieldSample(baseIndex, ix1, iy1, iz1), tx);
+  float c0 = mix(c00, c10, ty);
+  float c1 = mix(c01, c11, ty);
+  return mix(c0, c1, tz);
 }
 
-vec3 evaluateNormal(vec3 p, const BrickHeader h, float voxelSize) {
+float evaluateField(uint baseIndex, vec3 p, const BrickHeader h) {
+  return sampleBrickField(baseIndex, p, h);
+}
+
+vec3 evaluateNormal(uint baseIndex, vec3 p, const BrickHeader h, float voxelSize) {
   float eps = max(voxelSize * REFINE_EPS, 1e-4);
-  float fx1 = evaluateField(p + vec3(eps, 0.0, 0.0), h);
-  float fx0 = evaluateField(p - vec3(eps, 0.0, 0.0), h);
-  float fy1 = evaluateField(p + vec3(0.0, eps, 0.0), h);
-  float fy0 = evaluateField(p - vec3(0.0, eps, 0.0), h);
-  float fz1 = evaluateField(p + vec3(0.0, 0.0, eps), h);
-  float fz0 = evaluateField(p - vec3(0.0, 0.0, eps), h);
+  float fx1 = evaluateField(baseIndex, p + vec3(eps, 0.0, 0.0), h);
+  float fx0 = evaluateField(baseIndex, p - vec3(eps, 0.0, 0.0), h);
+  float fy1 = evaluateField(baseIndex, p + vec3(0.0, eps, 0.0), h);
+  float fy0 = evaluateField(baseIndex, p - vec3(0.0, eps, 0.0), h);
+  float fz1 = evaluateField(baseIndex, p + vec3(0.0, 0.0, eps), h);
+  float fz0 = evaluateField(baseIndex, p - vec3(0.0, 0.0, eps), h);
   vec3 n = vec3(fx1 - fx0, fy1 - fy0, fz1 - fz0);
   return (length(n) > 0.0) ? normalize(n) : vec3(0.0, 1.0, 0.0);
 }
 
-float refineSurface(vec3 origin, vec3 dir, float ta, float tb, const BrickHeader h) {
+bool refineSurface(uint baseIndex,
+                   vec3 origin,
+                   vec3 dir,
+                   float ta,
+                   float tb,
+                   const BrickHeader h,
+                   out float tOut) {
   vec3 originWorld = origin + g.renderOrigin;
-  float fa = evaluateField(originWorld + dir * ta, h);
-  float fb = evaluateField(originWorld + dir * tb, h);
-  if (fa * fb > 0.0) return ta; // no sign change, fallback to entering point
+  float fa = evaluateField(baseIndex, originWorld + dir * ta, h);
+  float fb = evaluateField(baseIndex, originWorld + dir * tb, h);
+  tOut = ta;
+  if (fa * fb > 0.0) {
+    return false; // no sign change along this segment
+  }
   float a = ta;
   float b = tb;
   float tMid = ta;
   for (int i = 0; i < REFINE_MAX_ITERS; ++i) {
     tMid = 0.5 * (a + b);
-    float fm = evaluateField(originWorld + dir * tMid, h);
+    float fm = evaluateField(baseIndex, originWorld + dir * tMid, h);
     if (fm == 0.0) break;
     bool same = (fm * fa) > 0.0;
     if (same) {
@@ -232,7 +293,8 @@ float refineSurface(vec3 origin, vec3 dir, float ta, float tb, const BrickHeader
       fb = fm;
     }
   }
-  return tMid;
+  tOut = tMid;
+  return true;
 }
 
 uint fallbackMaterialId() {
@@ -428,6 +490,9 @@ bool traverseBrickMicro(const RayPayload ray,
 
   float tCellEnter = t0;
   uint baseWord = h.occOffset >> 3u;
+  uint fieldBase = 0u;
+  bool fieldReady = brickFieldBase(h, fieldBase);
+  bool blockNormalsFlag = ((g.flags & FLAG_FORCE_BLOCK_NORMALS) != 0u) || !fieldReady;
 
   for (int iter = 0; iter < MICRO_MAX_STEPS && tCellEnter <= t1; ++iter) {
     atomicAdd(TraverseStats.microSteps, 1u);
@@ -440,18 +505,48 @@ bool traverseBrickMicro(const RayPayload ray,
 
     float tCellExit = min(tMax.x, min(tMax.y, tMax.z));
     if (occupied) {
-      float tRefined = refineSurface(ray.origin, dir, tCellEnter, min(tCellExit, t1), h);
-      vec3 hitWorld = originWorld + dir * tRefined;
-      vec3 normal = evaluateNormal(hitWorld, h, g.voxelSize);
-      tHit = tRefined;
-      hitNormal = normal;
-      uint matValue;
-      if (fetchMaterialId(linear, h, matValue)) {
-        materialId = matValue;
+      bool forceBlock = blockNormalsFlag;
+      float tCandidate = tCellEnter;
+      vec3 normal = vec3(0.0);
+      bool surfaceFound = true;
+      if (forceBlock) {
+        vec3 absDir = abs(dir);
+        if (absDir.x >= absDir.y && absDir.x >= absDir.z) {
+          normal = vec3(dir.x > 0.0 ? -1.0 : 1.0, 0.0, 0.0);
+        } else if (absDir.y >= absDir.x && absDir.y >= absDir.z) {
+          normal = vec3(0.0, dir.y > 0.0 ? -1.0 : 1.0, 0.0);
+        } else {
+          normal = vec3(0.0, 0.0, dir.z > 0.0 ? -1.0 : 1.0);
+        }
       } else {
-        materialId = fallbackMaterialId();
+        float tExitClamped = min(tCellExit, t1);
+        float tRefined = tCellEnter;
+        surfaceFound = refineSurface(fieldBase,
+                                     ray.origin,
+                                     dir,
+                                     tCellEnter,
+                                     tExitClamped,
+                                     h,
+                                     tRefined);
+        if (surfaceFound) {
+          tCandidate = tRefined;
+          vec3 hitWorld = originWorld + dir * tCandidate;
+          normal = evaluateNormal(fieldBase, hitWorld, h, g.voxelSize);
+        }
       }
-      return true;
+      if (!forceBlock && !surfaceFound) {
+        occupied = false;
+      } else {
+        tHit = tCandidate;
+        hitNormal = normal;
+        uint matValue;
+        if (fetchMaterialId(linear, h, matValue)) {
+          materialId = matValue;
+        } else {
+          materialId = fallbackMaterialId();
+        }
+        return true;
+      }
     }
 
     if (tCellExit > t1) break;

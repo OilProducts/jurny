@@ -26,7 +26,8 @@ bool Overlays::init(platform::VulkanContext& vk, VkDeviceSize capacityBytes) {
     if (capacityBytes == 0) {
         return true;
     }
-    VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    VkBufferCreateInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bi.size = capacityBytes;
     bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -45,7 +46,8 @@ bool Overlays::init(platform::VulkanContext& vk, VkDeviceSize capacityBytes) {
         buffer_ = VK_NULL_HANDLE;
         return false;
     }
-    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = std::max<VkDeviceSize>(mr.size, capacityBytes);
     mai.memoryTypeIndex = typeIndex;
     if (vkAllocateMemory(vk.device(), &mai, nullptr, &memory_) != VK_SUCCESS) {

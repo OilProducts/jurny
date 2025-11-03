@@ -78,6 +78,23 @@ voxel_set_warnings(voxel_app)
 voxel_enable_sanitizers(voxel_app)
 target_compile_definitions(voxel_app PRIVATE VOXEL_ENABLE_WINDOW=1 VOXEL_ASSETS_DIR=\"$<SHELL_PATH:${CMAKE_BINARY_DIR}/assets>\")
 
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set(_voxel_targets
+    voxel_core
+    voxel_platform
+    voxel_math
+    voxel_world
+    voxel_render
+    voxel_sim
+    voxel_tools
+    voxel_app)
+  foreach(_tgt IN LISTS _voxel_targets)
+    if(TARGET ${_tgt})
+      target_compile_options(${_tgt} PRIVATE -fno-var-tracking)
+    endif()
+  endforeach()
+endif()
+
 # Copy packed assets next to the executable for local runs.
 add_custom_command(TARGET voxel_app POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:voxel_app>/assets

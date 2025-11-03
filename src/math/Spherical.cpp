@@ -36,7 +36,8 @@ float valueNoise(const glm::vec3& p, std::uint32_t seed) {
                                static_cast<float>(oz));
         const std::uint32_t cornerSeed =
             seed + static_cast<std::uint32_t>(ox + oy * 17 + oz * 131);
-        return hash(i + offset, cornerSeed);
+        const glm::vec3 pos = i + offset;
+        return hash(pos, cornerSeed);
     };
 
     const float n000 = corner(0, 0, 0);

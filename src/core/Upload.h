@@ -30,5 +30,6 @@ private:
     VkDeviceMemory stagingMemory_ = VK_NULL_HANDLE;
     VkDeviceSize stagingCapacity_ = 0;
     VkDeviceSize minCapacity_ = 0;
+    bool deviceLost_ = false;
 };
 }

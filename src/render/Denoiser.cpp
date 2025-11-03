@@ -59,7 +59,8 @@ bool Denoiser::createTargets(platform::VulkanContext& vk, VkExtent2D extent) {
     destroyTargets(vk);
 
     auto createTarget = [&](HistoryTarget& target) -> bool {
-        VkImageCreateInfo ici{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        VkImageCreateInfo ici{};
+        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         ici.imageType = VK_IMAGE_TYPE_2D;
         ici.format = VK_FORMAT_R16G16B16A16_SFLOAT;
         ici.extent = { extent.width, extent.height, 1 };
@@ -67,8 +68,11 @@ bool Denoiser::createTargets(platform::VulkanContext& vk, VkExtent2D extent) {
         ici.arrayLayers = 1;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ici.usage = VK_IMAGE_USAGE_STORAGE_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         if (vkCreateImage(vk.device(), &ici, nullptr, &target.image) != VK_SUCCESS) {
             spdlog::error("Failed to create denoiser history image ({}x{})", extent.width, extent.height);
             return false;
@@ -82,7 +86,8 @@ bool Denoiser::createTargets(platform::VulkanContext& vk, VkExtent2D extent) {
             target.image = VK_NULL_HANDLE;
             return false;
         }
-        VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        VkMemoryAllocateInfo mai{};
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         mai.allocationSize = mr.size;
         mai.memoryTypeIndex = typeIndex;
         if (vkAllocateMemory(vk.device(), &mai, nullptr, &target.memory) != VK_SUCCESS) {
@@ -92,13 +97,22 @@ bool Denoiser::createTargets(platform::VulkanContext& vk, VkExtent2D extent) {
             return false;
         }
         vkBindImageMemory(vk.device(), target.image, target.memory, 0);
-        VkImageViewCreateInfo ivci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        VkImageViewCreateInfo ivci{};
+        ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         ivci.image = target.image;
         ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
         ivci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        ivci.components = {
+            VK_COMPONENT_SWIZZLE_IDENTITY,
+            VK_COMPONENT_SWIZZLE_IDENTITY,
+            VK_COMPONENT_SWIZZLE_IDENTITY,
+            VK_COMPONENT_SWIZZLE_IDENTITY
+        };
         ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         ivci.subresourceRange.levelCount = 1;
         ivci.subresourceRange.layerCount = 1;
+        ivci.subresourceRange.baseMipLevel = 0;
+        ivci.subresourceRange.baseArrayLayer = 0;
         if (vkCreateImageView(vk.device(), &ivci, nullptr, &target.view) != VK_SUCCESS) {
             spdlog::error("Failed to create denoiser history view");
             vkFreeMemory(vk.device(), target.memory, nullptr);

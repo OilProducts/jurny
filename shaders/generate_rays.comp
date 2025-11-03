@@ -29,24 +29,55 @@ layout(set = 0, binding = 10, std430) buffer RayQueueBuf {
 } RayQueueIn;
 
 vec3 makeCameraOrigin() {
-  mat4 invView = inverse(g.currView);
-  vec4 o = invView * vec4(0.0, 0.0, 0.0, 1.0);
+  vec4 o = g.currViewInv * vec4(0.0, 0.0, 0.0, 1.0);
   return o.xyz;
 }
 
 vec3 makeCameraRay(vec2 ndc) {
-  mat4 invProj = inverse(g.currProj);
-  mat4 invView = inverse(g.currView);
   vec4 clip = vec4(ndc, 1.0, 1.0);
-  vec4 view = invProj * clip;
+  vec4 view = g.currProjInv * clip;
   view /= max(view.w, 1e-6);
-  vec4 world = invView * vec4(normalize(view.xyz), 0.0);
+  vec4 world = g.currViewInv * vec4(normalize(view.xyz), 0.0);
   return normalize(world.xyz);
 }
 
+shared uint blockBaseIndex;
+shared uint activePrefix[64];
+
 void main() {
   ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
-  if (pix.x >= int(g.width) || pix.y >= int(g.height)) return;
+  bool isActive = pix.x < int(g.width) && pix.y < int(g.height);
+  uint localIndex = gl_LocalInvocationIndex;
+
+  const uint blockSize = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+
+  activePrefix[localIndex] = isActive ? 1u : 0u;
+  barrier();
+  for (uint offset = 1u; offset < blockSize; offset <<= 1u) {
+    uint value = 0u;
+    if (localIndex >= offset) {
+      value = activePrefix[localIndex - offset];
+    }
+    barrier();
+    activePrefix[localIndex] += value;
+    barrier();
+  }
+
+  uint blockActiveCount = activePrefix[blockSize - 1u];
+  if (blockActiveCount == 0u) {
+    return;
+  }
+
+  if (localIndex == 0u) {
+    blockBaseIndex = atomicAdd(RayQueueIn.header.tail, blockActiveCount);
+  }
+  barrier();
+
+  if (!isActive) {
+    return;
+  }
+
+  uint localRank = activePrefix[localIndex] - 1u;
 
   uint pixelIndex = uint(pix.y) * g.width + uint(pix.x);
   vec2 uv = (vec2(pix) + vec2(0.5)) / vec2(float(g.width), float(g.height));
@@ -61,7 +92,8 @@ void main() {
 
   uint capacity = RayQueueIn.header.capacity;
   if (capacity == 0u) return;
-  uint slot = atomicAdd(RayQueueIn.header.tail, 1u);
+
+  uint slot = blockBaseIndex + localRank;
   if ((slot - RayQueueIn.header.head) >= capacity) {
     atomicAdd(RayQueueIn.header.dropped, 1u);
     return;

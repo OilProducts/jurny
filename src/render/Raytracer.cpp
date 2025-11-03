@@ -3,6 +3,7 @@
 #include "math/Spherical.h"
 #include "core/Assets.h"
 #include <spdlog/spdlog.h>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -24,6 +25,7 @@ constexpr uint32_t kOverlayFontHeight = 8u;
 constexpr uint32_t kOverlayPadX = 1u;
 constexpr uint32_t kOverlayPadY = 1u;
 constexpr VkDeviceSize kOverlayBufferBytes = (4u + kOverlayMaxCols * kOverlayMaxRows) * sizeof(uint32_t);
+constexpr bool kCacheFieldSamples = true;
 }
 
 static uint32_t findMemoryType(VkPhysicalDevice phys, uint32_t typeBits, VkMemoryPropertyFlags req) {
@@ -41,7 +43,8 @@ static bool allocateBuffer(VkDevice device,
                            VkMemoryPropertyFlags flags,
                            VkBuffer& outBuf,
                            VkDeviceMemory& outMem) {
-    VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    VkBufferCreateInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bi.size = size;
     bi.usage = usage;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -49,7 +52,8 @@ static bool allocateBuffer(VkDevice device,
     VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(device, outBuf, &mr);
     uint32_t typeIndex = findMemoryType(phys, mr.memoryTypeBits, flags);
     if (typeIndex == UINT32_MAX) return false;
-    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = mr.size;
     mai.memoryTypeIndex = typeIndex;
     if (vkAllocateMemory(device, &mai, nullptr, &outMem) != VK_SUCCESS) return false;
@@ -142,7 +146,7 @@ void Raytracer::refreshWorldDescriptors(platform::VulkanContext& vk) {
         return buf.size > 0 ? buf.size : VK_WHOLE_SIZE;
     };
 
-    const size_t bindingCountPerSet = 9; // bindings 3..8 plus material/palette buffers
+    const size_t bindingCountPerSet = 10; // bindings 3..8 plus material/palette/field buffers
     std::vector<VkDescriptorBufferInfo> infos;
     infos.reserve(sets_.size() * bindingCountPerSet);
     std::vector<VkWriteDescriptorSet> writes;
@@ -155,7 +159,8 @@ void Raytracer::refreshWorldDescriptors(platform::VulkanContext& vk) {
         info.range = bufferRange(buf);
         infos.push_back(info);
 
-        VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         write.dstSet = set;
         write.dstBinding = binding;
         write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -174,6 +179,7 @@ void Raytracer::refreshWorldDescriptors(platform::VulkanContext& vk) {
         appendWrite(set, 23, matIdxBuf_);
         appendWrite(set, 24, materialTableBuf_);
         appendWrite(set, 25, paletteBuf_);
+        appendWrite(set, 26, fieldBuf_);
     }
 
     if (!writes.empty()) {
@@ -184,52 +190,101 @@ void Raytracer::refreshWorldDescriptors(platform::VulkanContext& vk) {
 bool Raytracer::createImages(platform::VulkanContext& vk, platform::Swapchain& swap) {
     extent_ = swap.extent();
     if (!gpuBuffers_.init(vk, extent_)) return false;
-    if (!denoiser_.init(vk, extent_)) return false;
+    if (denoiseEnabled_) {
+        if (!denoiser_.init(vk, extent_)) return false;
+    }
 
-    VkCommandBufferAllocateInfo cbai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    VkCommandBufferAllocateInfo cbai{};
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cbai.commandPool = vk.commandPool();
     cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cbai.commandBufferCount = 1;
     VkCommandBuffer cb{};
     vkAllocateCommandBuffers(vk.device(), &cbai, &cb);
 
-    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cb, &bi);
 
-    auto addBarrier = [](VkImage image, std::vector<VkImageMemoryBarrier2>& barriers) {
-        VkImageMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-        barrier.srcAccessMask = 0;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
-        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        barrier.subresourceRange.levelCount = 1;
-        barrier.subresourceRange.layerCount = 1;
-        barrier.image = image;
-        barriers.push_back(barrier);
-    };
+    bool sync2 = vk.deviceInfo().hasSynchronization2;
+    if (sync2) {
+        std::vector<VkImageMemoryBarrier2> barriers;
+        auto addBarrier = [&barriers](VkImage image) {
+            VkImageMemoryBarrier2 barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+            barrier.srcAccessMask = 0;
+            barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            barrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.layerCount = 1;
+            barrier.image = image;
+            barriers.push_back(barrier);
+        };
 
-    std::vector<VkImageMemoryBarrier2> barriers;
-    addBarrier(gpuBuffers_.colorImage(), barriers);
-    addBarrier(gpuBuffers_.motionImage(), barriers);
-    addBarrier(gpuBuffers_.albedoImage(), barriers);
-    addBarrier(gpuBuffers_.normalImage(), barriers);
-    addBarrier(gpuBuffers_.momentsImage(), barriers);
-    addBarrier(denoiser_.historyReadImage(), barriers);
-    addBarrier(denoiser_.historyWriteImage(), barriers);
-    addBarrier(denoiser_.historyMomentsReadImage(), barriers);
-    addBarrier(denoiser_.historyMomentsWriteImage(), barriers);
+        addBarrier(gpuBuffers_.colorImage());
+        addBarrier(gpuBuffers_.motionImage());
+        addBarrier(gpuBuffers_.albedoImage());
+        addBarrier(gpuBuffers_.normalImage());
+        addBarrier(gpuBuffers_.momentsImage());
+        if (denoiseEnabled_) {
+            addBarrier(denoiser_.historyReadImage());
+            addBarrier(denoiser_.historyWriteImage());
+            addBarrier(denoiser_.historyMomentsReadImage());
+            addBarrier(denoiser_.historyMomentsWriteImage());
+        }
 
-    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    dep.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
-    dep.pImageMemoryBarriers = barriers.data();
-    vkCmdPipelineBarrier2(cb, &dep);
+        VkDependencyInfo dep{};
+        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
+        dep.pImageMemoryBarriers = barriers.data();
+        vkCmdPipelineBarrier2(cb, &dep);
+    } else {
+        std::vector<VkImageMemoryBarrier> barriers;
+        auto addBarrierLegacy = [&barriers](VkImage image) {
+            VkImageMemoryBarrier barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.layerCount = 1;
+            barrier.image = image;
+            barriers.push_back(barrier);
+        };
+
+        addBarrierLegacy(gpuBuffers_.colorImage());
+        addBarrierLegacy(gpuBuffers_.motionImage());
+        addBarrierLegacy(gpuBuffers_.albedoImage());
+        addBarrierLegacy(gpuBuffers_.normalImage());
+        addBarrierLegacy(gpuBuffers_.momentsImage());
+        if (denoiseEnabled_) {
+            addBarrierLegacy(denoiser_.historyReadImage());
+            addBarrierLegacy(denoiser_.historyWriteImage());
+            addBarrierLegacy(denoiser_.historyMomentsReadImage());
+            addBarrierLegacy(denoiser_.historyMomentsWriteImage());
+        }
+
+        vkCmdPipelineBarrier(cb,
+                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              0,
+                              0, nullptr,
+                              0, nullptr,
+                              static_cast<uint32_t>(barriers.size()), barriers.data());
+    }
     vkEndCommandBuffer(cb);
 
-    VkSubmitInfo submit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cb;
     vkQueueSubmit(vk.graphicsQueue(), 1, &submit, VK_NULL_HANDLE);
@@ -239,7 +294,9 @@ bool Raytracer::createImages(platform::VulkanContext& vk, platform::Swapchain& s
 }
 
 void Raytracer::destroyImages(platform::VulkanContext& vk) {
-    denoiser_.shutdown(vk);
+    if (denoiseEnabled_) {
+        denoiser_.shutdown(vk);
+    }
     gpuBuffers_.shutdown(vk);
 }
 
@@ -274,14 +331,19 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     VkDescriptorSetLayoutBinding bMatIdx{ }; bMatIdx.binding=23; bMatIdx.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bMatIdx.descriptorCount=1; bMatIdx.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bMatTable{ }; bMatTable.binding=24; bMatTable.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bMatTable.descriptorCount=1; bMatTable.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bPalette{ }; bPalette.binding=25; bPalette.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bPalette.descriptorCount=1; bPalette.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutBinding bOverlayBuf{}; bOverlayBuf.binding=26; bOverlayBuf.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bOverlayBuf.descriptorCount=1; bOverlayBuf.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutBinding bOverlayImage{}; bOverlayImage.binding=27; bOverlayImage.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bOverlayImage.descriptorCount=1; bOverlayImage.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutBinding bindings[28] = { bUbo, bAcc, bOut, bBH, bOcc, bHK, bHV, bMK, bMV, bDBG, bRayQ, bHitQ, bMissQ, bSecQ, bStats, bMotion, bHistRead, bHistWrite, bAlbedo, bNormal, bMoments, bHistMomentsRead, bHistMomentsWrite, bMatIdx, bMatTable, bPalette, bOverlayBuf, bOverlayImage };
-    VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    dslci.bindingCount=28; dslci.pBindings=bindings;
+    VkDescriptorSetLayoutBinding bField{ }; bField.binding=26; bField.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bField.descriptorCount=1; bField.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding bOverlayBuf{}; bOverlayBuf.binding=27; bOverlayBuf.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bOverlayBuf.descriptorCount=1; bOverlayBuf.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding bOverlayImage{}; bOverlayImage.binding=28; bOverlayImage.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bOverlayImage.descriptorCount=1; bOverlayImage.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding bindings[29] = { bUbo, bAcc, bOut, bBH, bOcc, bHK, bHV, bMK, bMV, bDBG, bRayQ, bHitQ, bMissQ, bSecQ, bStats, bMotion, bHistRead, bHistWrite, bAlbedo, bNormal, bMoments, bHistMomentsRead, bHistMomentsWrite, bMatIdx, bMatTable, bPalette, bField, bOverlayBuf, bOverlayImage };
+    VkDescriptorSetLayoutCreateInfo dslci{};
+    dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dslci.bindingCount = static_cast<uint32_t>(sizeof(bindings) / sizeof(bindings[0]));
+    dslci.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(vk.device(), &dslci, nullptr, &setLayout_) != VK_SUCCESS) return false;
-    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount=1; plci.pSetLayouts=&setLayout_;
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &setLayout_;
     if (vkCreatePipelineLayout(vk.device(), &plci, nullptr, &pipeLayout_) != VK_SUCCESS) return false;
 
     auto readFile = [](const char* path)->std::vector<uint32_t>{ std::vector<uint32_t> out; FILE* f=fopen(path,"rb"); if(!f) return out; fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET); out.resize((sz+3)/4); fread(out.data(),1,sz,f); fclose(f); return out; };
@@ -296,8 +358,10 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
         std::string base = std::string(assetsDir) + "/shaders/";
         std::vector<uint32_t> spv = readFile((base + rel).c_str());
         if (spv.empty()) { spdlog::error("Failed to load shader %s%s", base.c_str(), rel); return VK_NULL_HANDLE; }
-        VkShaderModuleCreateInfo smci{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-        smci.codeSize = spv.size()*sizeof(uint32_t); smci.pCode = spv.data();
+        VkShaderModuleCreateInfo smci{};
+        smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        smci.codeSize = spv.size() * sizeof(uint32_t);
+        smci.pCode = spv.data();
         VkShaderModule sm{}; vkCreateShaderModule(vk.device(), &smci, nullptr, &sm); return sm;
     };
     VkShaderModule smGen   = loadShader("generate_rays.comp.spv");
@@ -307,9 +371,13 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     VkShaderModule smComp  = loadShader("composite.comp.spv");
     VkShaderModule smOverlay = loadShader("overlay.comp.spv");
     if (!smGen || !smShade || !smTemporal || !smTrav || !smComp || !smOverlay) return false;
-    VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    VkPipelineShaderStageCreateInfo ss{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
-    ss.stage = VK_SHADER_STAGE_COMPUTE_BIT; ss.pName = "main"; cpci.layout = pipeLayout_;
+    VkComputePipelineCreateInfo cpci{};
+    cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    VkPipelineShaderStageCreateInfo ss{};
+    ss.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ss.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ss.pName = "main";
+    cpci.layout = pipeLayout_;
     ss.module = smGen;   cpci.stage = ss; if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeGenerate_) != VK_SUCCESS) return false;
     ss.module = smShade; cpci.stage = ss; if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeShade_) != VK_SUCCESS) return false;
     ss.module = smTemporal; cpci.stage = ss; if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeTemporal_) != VK_SUCCESS) return false;
@@ -344,34 +412,47 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,   12u * swap.imageCount() },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  18u * swap.imageCount() }
     };
-    VkDescriptorPoolCreateInfo dpci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    dpci.maxSets = swap.imageCount(); dpci.poolSizeCount = 3; dpci.pPoolSizes = sizes;
+    VkDescriptorPoolCreateInfo dpci{};
+    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpci.maxSets = swap.imageCount();
+    dpci.poolSizeCount = 3;
+    dpci.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(vk.device(), &dpci, nullptr, &descPool_) != VK_SUCCESS) return false;
     sets_.resize(swap.imageCount()); std::vector<VkDescriptorSetLayout> layouts(swap.imageCount(), setLayout_);
-    VkDescriptorSetAllocateInfo dsai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dsai.descriptorPool = descPool_; dsai.descriptorSetCount = swap.imageCount(); dsai.pSetLayouts = layouts.data();
+    VkDescriptorSetAllocateInfo dsai{};
+    dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsai.descriptorPool = descPool_;
+    dsai.descriptorSetCount = swap.imageCount();
+    dsai.pSetLayouts = layouts.data();
     if (vkAllocateDescriptorSets(vk.device(), &dsai, sets_.data()) != VK_SUCCESS) return false;
 
     // Create UBO
-    VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    VkBufferCreateInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bi.size = sizeof(GlobalsUBOData);
     bi.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
     if (vkCreateBuffer(vk.device(), &bi, nullptr, &ubo_) != VK_SUCCESS) return false;
     VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(vk.device(), ubo_, &mr);
     uint32_t typeIndex = findMemoryType(vk.physicalDevice(), mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-    mai.allocationSize = mr.size; mai.memoryTypeIndex = typeIndex;
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = typeIndex;
     if (vkAllocateMemory(vk.device(), &mai, nullptr, &uboMem_) != VK_SUCCESS) return false;
     vkBindBufferMemory(vk.device(), ubo_, uboMem_, 0);
 
     // Create Debug buffer (host visible)
-    VkBufferCreateInfo bdbg{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    VkBufferCreateInfo bdbg{};
+    bdbg.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bdbg.size = 128 * sizeof(uint32_t); // expanded for richer diagnostics
     bdbg.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     if (vkCreateBuffer(vk.device(), &bdbg, nullptr, &dbgBuf_) != VK_SUCCESS) return false;
     VkMemoryRequirements mrd{}; vkGetBufferMemoryRequirements(vk.device(), dbgBuf_, &mrd);
     uint32_t typeIndexDbg = findMemoryType(vk.physicalDevice(), mrd.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VkMemoryAllocateInfo maid{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO }; maid.allocationSize = mrd.size; maid.memoryTypeIndex = typeIndexDbg;
+    VkMemoryAllocateInfo maid{};
+    maid.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    maid.allocationSize = mrd.size;
+    maid.memoryTypeIndex = typeIndexDbg;
     if (vkAllocateMemory(vk.device(), &maid, nullptr, &dbgMem_) != VK_SUCCESS) return false;
     vkBindBufferMemory(vk.device(), dbgBuf_, dbgMem_, 0);
 
@@ -389,6 +470,9 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
     }
     if (paletteBuf_.buffer == VK_NULL_HANDLE) {
     if (!ensureBuffer(vk, paletteBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
+    }
+    if (fieldBuf_.buffer == VK_NULL_HANDLE) {
+    if (!ensureBuffer(vk, fieldBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
     }
     if (materialTableBuf_.buffer == VK_NULL_HANDLE) {
     if (!ensureBuffer(vk, materialTableBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
@@ -416,10 +500,11 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
         VkDescriptorBufferInfo dbMatIdx{ matIdxBuf_.buffer, 0, matIdxBuf_.size > 0 ? matIdxBuf_.size : VK_WHOLE_SIZE };
         VkDescriptorBufferInfo dbMatTable{ materialTableBuf_.buffer, 0, materialTableBuf_.size > 0 ? materialTableBuf_.size : VK_WHOLE_SIZE };
         VkDescriptorBufferInfo dbPalette{ paletteBuf_.buffer, 0, paletteBuf_.size > 0 ? paletteBuf_.size : VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo dbField{ fieldBuf_.buffer, 0, fieldBuf_.size > 0 ? fieldBuf_.size : VK_WHOLE_SIZE };
         VkDescriptorBufferInfo dbOverlay{ overlays_.buffer(), 0, overlays_.capacity() ? overlays_.capacity() : VK_WHOLE_SIZE };
         VkDescriptorImageInfo diOverlay{}; diOverlay.imageView = swap.imageViews()[i]; diOverlay.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet writes[22]{};
+        VkWriteDescriptorSet writes[23]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[0].dstSet = sets_[i]; writes[0].dstBinding=0; writes[0].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; writes[0].descriptorCount=1; writes[0].pBufferInfo=&db;
         writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[1].dstSet = sets_[i]; writes[1].dstBinding=1; writes[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[1].descriptorCount=1; writes[1].pImageInfo=&diCurr;
         writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[2].dstSet = sets_[i]; writes[2].dstBinding=2; writes[2].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[2].descriptorCount=1; writes[2].pImageInfo=&diOut;
@@ -440,8 +525,9 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
         writes[17].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[17].dstSet=sets_[i]; writes[17].dstBinding=23; writes[17].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[17].descriptorCount=1; writes[17].pBufferInfo=&dbMatIdx;
         writes[18].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[18].dstSet=sets_[i]; writes[18].dstBinding=24; writes[18].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[18].descriptorCount=1; writes[18].pBufferInfo=&dbMatTable;
         writes[19].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[19].dstSet=sets_[i]; writes[19].dstBinding=25; writes[19].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[19].descriptorCount=1; writes[19].pBufferInfo=&dbPalette;
-        writes[20].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[20].dstSet=sets_[i]; writes[20].dstBinding=26; writes[20].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[20].descriptorCount=1; writes[20].pBufferInfo=&dbOverlay;
-        writes[21].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[21].dstSet=sets_[i]; writes[21].dstBinding=27; writes[21].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[21].descriptorCount=1; writes[21].pImageInfo=&diOverlay;
+        writes[20].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[20].dstSet=sets_[i]; writes[20].dstBinding=26; writes[20].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[20].descriptorCount=1; writes[20].pBufferInfo=&dbField;
+        writes[21].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[21].dstSet=sets_[i]; writes[21].dstBinding=27; writes[21].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[21].descriptorCount=1; writes[21].pBufferInfo=&dbOverlay;
+        writes[22].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[22].dstSet=sets_[i]; writes[22].dstBinding=28; writes[22].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[22].descriptorCount=1; writes[22].pImageInfo=&diOverlay;
         uint32_t writeCount = static_cast<uint32_t>(sizeof(writes) / sizeof(writes[0]));
         vkUpdateDescriptorSets(vk.device(), writeCount, writes, 0, nullptr);
     }
@@ -460,7 +546,9 @@ void Raytracer::destroyDescriptors(platform::VulkanContext& vk) {
     if (descPool_) { vkDestroyDescriptorPool(vk.device(), descPool_, nullptr); descPool_ = VK_NULL_HANDLE; }
     sets_.clear();
     descriptorsReady_ = false;
-    denoiser_.reset();
+    if (denoiseEnabled_) {
+        denoiser_.reset();
+    }
 }
 
 bool Raytracer::createWorld(platform::VulkanContext& vk) {
@@ -486,6 +574,7 @@ bool Raytracer::createWorld(platform::VulkanContext& vk) {
     occWordsHost_.clear();
     matWordsHost_.clear();
     paletteHost_.clear();
+    fieldHost_.clear();
     brickLookup_.clear();
     regionResidents_.clear();
     macroKeysHost_.clear();
@@ -531,7 +620,9 @@ bool Raytracer::addRegion(platform::VulkanContext& vk, const glm::ivec3& regionC
     if (!appendRegion(vk, std::move(cpu), regionCoord)) {
         return false;
     }
-    denoiser_.reset();
+    if (denoiseEnabled_) {
+        denoiser_.reset();
+    }
     return true;
 }
 
@@ -539,11 +630,14 @@ bool Raytracer::removeRegion(platform::VulkanContext& vk, const glm::ivec3& regi
     if (!removeRegionInternal(vk, regionCoord)) {
         return false;
     }
-    denoiser_.reset();
+    if (denoiseEnabled_) {
+        denoiser_.reset();
+    }
     return true;
 }
 
 bool Raytracer::appendRegion(platform::VulkanContext& vk, world::CpuWorld&& cpu, const glm::ivec3& regionCoord) {
+    const auto regionStart = std::chrono::steady_clock::now();
     const uint32_t oldCount = static_cast<uint32_t>(headersHost_.size());
     const uint32_t requested = static_cast<uint32_t>(cpu.headers.size());
     if (requested == 0u) {
@@ -564,6 +658,11 @@ bool Raytracer::appendRegion(platform::VulkanContext& vk, world::CpuWorld&& cpu,
     occWordsHost_.resize(static_cast<size_t>(oldCount + requested) * kOccWordsPerBrick);
     matWordsHost_.resize(static_cast<size_t>(oldCount + requested) * kMaterialWordsPerBrick);
     paletteHost_.resize(static_cast<size_t>(oldCount + requested) * kPaletteEntriesPerBrick);
+    if (kCacheFieldSamples) {
+        fieldHost_.resize(static_cast<size_t>(oldCount + requested) * kFieldValuesPerBrick);
+    } else {
+        fieldHost_.clear();
+    }
 
     RegionResident resident;
     resident.coord = regionCoord;
@@ -583,7 +682,7 @@ bool Raytracer::appendRegion(platform::VulkanContext& vk, world::CpuWorld&& cpu,
         record.coord = glm::ivec3(srcHeader.bx, srcHeader.by, srcHeader.bz);
         record.paletteCount = srcHeader.paletteCount;
         record.flags = srcHeader.flags;
-        brickRecords_[dstIndex] = record;
+        record.hasField = kCacheFieldSamples && (srcHeader.tsdfOffset != world::kInvalidOffset);
         brickLookup_[key] = dstIndex;
         resident.brickKeys.push_back(key);
 
@@ -616,6 +715,27 @@ bool Raytracer::appendRegion(platform::VulkanContext& vk, world::CpuWorld&& cpu,
             const uint32_t* paletteSrc = cpu.palettes.data() + (srcHeader.paletteOffset / sizeof(uint32_t));
             std::copy_n(paletteSrc, srcHeader.paletteCount, paletteDst);
         }
+
+        if (kCacheFieldSamples) {
+            float* fieldDst = fieldHost_.data() + static_cast<size_t>(dstIndex) * kFieldValuesPerBrick;
+            std::fill(fieldDst, fieldDst + kFieldValuesPerBrick, 0.0f);
+            if (record.hasField && srcHeader.tsdfOffset != world::kInvalidOffset) {
+                size_t srcOffset = static_cast<size_t>(srcHeader.tsdfOffset / sizeof(float));
+                if (srcOffset + kFieldValuesPerBrick <= cpu.fieldSamples.size()) {
+                    const float* fieldSrc = cpu.fieldSamples.data() + srcOffset;
+                    std::copy_n(fieldSrc, kFieldValuesPerBrick, fieldDst);
+                } else {
+                    spdlog::warn("TSDF field truncated for brick ({}, {}, {}) — expected {} floats, have {}", srcHeader.bx, srcHeader.by, srcHeader.bz, kFieldValuesPerBrick, cpu.fieldSamples.size() - srcOffset);
+                    record.hasField = false;
+                    std::fill(fieldDst, fieldDst + kFieldValuesPerBrick, 0.0f);
+                }
+            }
+        } else {
+            record.hasField = false;
+        }
+
+        brickRecords_[dstIndex] = record;
+
         fixupBrickHeader(dstIndex);
     }
 
@@ -626,6 +746,11 @@ bool Raytracer::appendRegion(platform::VulkanContext& vk, world::CpuWorld&& cpu,
     occWordsHost_.resize(static_cast<size_t>(newCount) * kOccWordsPerBrick);
     matWordsHost_.resize(static_cast<size_t>(newCount) * kMaterialWordsPerBrick);
     paletteHost_.resize(static_cast<size_t>(newCount) * kPaletteEntriesPerBrick);
+    if (kCacheFieldSamples) {
+        fieldHost_.resize(static_cast<size_t>(newCount) * kFieldValuesPerBrick);
+    } else {
+        fieldHost_.clear();
+    }
 
     if (materialTableHost_.empty() && !cpu.materialTable.empty()) {
         materialTableHost_ = cpu.materialTable;
@@ -643,14 +768,29 @@ bool Raytracer::appendRegion(platform::VulkanContext& vk, world::CpuWorld&& cpu,
 
     regionResidents_.emplace(packRegionKey(regionCoord), std::move(resident));
     brickCount_ = newCount;
+    const auto packEnd = std::chrono::steady_clock::now();
+    const double packMs = std::chrono::duration<double, std::milli>(packEnd - regionStart).count();
 
+    const auto uploadBegin = std::chrono::steady_clock::now();
     if (appended > 0) {
         uploadHeadersRange(vk, oldCount, appended);
         uploadOccupancyRange(vk, oldCount, appended);
         uploadMaterialRange(vk, oldCount, appended);
         uploadPaletteRange(vk, oldCount, appended);
+        uploadFieldRange(vk, oldCount, appended);
     }
+    const auto uploadEnd = std::chrono::steady_clock::now();
+    const double uploadMs = std::chrono::duration<double, std::milli>(uploadEnd - uploadBegin).count();
+
+    const auto hashStart = std::chrono::steady_clock::now();
     rebuildHashesAndMacro(vk);
+    const auto regionEnd = std::chrono::steady_clock::now();
+    const double hashMs = std::chrono::duration<double, std::milli>(regionEnd - hashStart).count();
+    const double totalMs = std::chrono::duration<double, std::milli>(regionEnd - regionStart).count();
+    spdlog::info("Raytracer append region ({}, {}, {}): total {:.2f} ms [pack {:.2f} ms | upload {:.2f} ms | hash {:.2f} ms], bricks now {} (+{})",
+                 regionCoord.x, regionCoord.y, regionCoord.z,
+                 totalMs, packMs, uploadMs, hashMs,
+                 brickCount_, appended);
     markWorldDescriptorsDirty();
     return true;
 }
@@ -683,6 +823,11 @@ bool Raytracer::removeRegionInternal(platform::VulkanContext& vk, const glm::ive
             std::copy_n(paletteHost_.data() + static_cast<size_t>(last) * kPaletteEntriesPerBrick,
                         kPaletteEntriesPerBrick,
                         paletteHost_.data() + static_cast<size_t>(idx) * kPaletteEntriesPerBrick);
+            if (kCacheFieldSamples) {
+                std::copy_n(fieldHost_.data() + static_cast<size_t>(last) * kFieldValuesPerBrick,
+                            kFieldValuesPerBrick,
+                            fieldHost_.data() + static_cast<size_t>(idx) * kFieldValuesPerBrick);
+            }
             fixupBrickHeader(idx);
         }
 
@@ -692,6 +837,11 @@ bool Raytracer::removeRegionInternal(platform::VulkanContext& vk, const glm::ive
         occWordsHost_.resize(static_cast<size_t>(brickRecords_.size()) * kOccWordsPerBrick);
         matWordsHost_.resize(static_cast<size_t>(brickRecords_.size()) * kMaterialWordsPerBrick);
         paletteHost_.resize(static_cast<size_t>(brickRecords_.size()) * kPaletteEntriesPerBrick);
+        if (kCacheFieldSamples) {
+            fieldHost_.resize(static_cast<size_t>(brickRecords_.size()) * kFieldValuesPerBrick);
+        } else {
+            fieldHost_.clear();
+        }
     }
 
     regionResidents_.erase(it);
@@ -782,18 +932,44 @@ void Raytracer::uploadPaletteRange(platform::VulkanContext& vk, uint32_t first, 
     }
 }
 
+void Raytracer::uploadFieldRange(platform::VulkanContext& vk, uint32_t first, uint32_t count) {
+    if (!kCacheFieldSamples) {
+        fieldBuf_.size = 0;
+        return;
+    }
+    VkDeviceSize totalBytes = static_cast<VkDeviceSize>(fieldHost_.size()) * sizeof(float);
+    bool reallocated = false;
+    if (!ensureBuffer(vk, fieldBuf_, totalBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &reallocated)) {
+        return;
+    }
+    fieldBuf_.size = totalBytes;
+    if (totalBytes == 0) {
+        return;
+    }
+    if (reallocated || count == brickCount_) {
+        uploadCtx_.uploadBufferRegion(fieldHost_.data(), totalBytes, fieldBuf_.buffer, 0);
+    } else if (count > 0) {
+        const float* src = fieldHost_.data() + static_cast<size_t>(first) * kFieldValuesPerBrick;
+        VkDeviceSize offset = static_cast<VkDeviceSize>(first) * kFieldValuesPerBrick * sizeof(float);
+        VkDeviceSize bytes = static_cast<VkDeviceSize>(count) * kFieldValuesPerBrick * sizeof(float);
+        uploadCtx_.uploadBufferRegion(src, bytes, fieldBuf_.buffer, offset);
+    }
+}
+
 void Raytracer::uploadAllWorldBuffers(platform::VulkanContext& vk) {
     if (brickCount_ == 0u) {
         bhBuf_.size = 0;
         occBuf_.size = 0;
         matIdxBuf_.size = 0;
         paletteBuf_.size = 0;
+        fieldBuf_.size = 0;
         return;
     }
     uploadHeadersRange(vk, 0, brickCount_);
     uploadOccupancyRange(vk, 0, brickCount_);
     uploadMaterialRange(vk, 0, brickCount_);
     uploadPaletteRange(vk, 0, brickCount_);
+    uploadFieldRange(vk, 0, brickCount_);
 }
 
 void Raytracer::rebuildHashesAndMacro(platform::VulkanContext& vk) {
@@ -928,7 +1104,7 @@ void Raytracer::fixupBrickHeader(uint32_t index) {
     header.paletteCount = record.paletteCount;
     header.flags = record.flags;
     header.paletteOffset = (record.paletteCount > 0) ? index * kPaletteEntriesPerBrick * sizeof(uint32_t) : world::kInvalidOffset;
-    header.tsdfOffset = world::kInvalidOffset;
+    header.tsdfOffset = record.hasField ? index * kFieldValuesPerBrick * sizeof(float) : world::kInvalidOffset;
 }
 
 void Raytracer::destroyWorld(platform::VulkanContext& vk) {
@@ -939,6 +1115,7 @@ void Raytracer::destroyWorld(platform::VulkanContext& vk) {
     destroyBuffer(vk, mkBuf_);
     destroyBuffer(vk, mvBuf_);
     destroyBuffer(vk, paletteBuf_);
+    destroyBuffer(vk, fieldBuf_);
     destroyBuffer(vk, matIdxBuf_);
     destroyBuffer(vk, materialTableBuf_);
     macroKeysHost_.clear();
@@ -946,6 +1123,7 @@ void Raytracer::destroyWorld(platform::VulkanContext& vk) {
     hashKeysHost_.clear();
     hashValsHost_.clear();
     paletteHost_.clear();
+    fieldHost_.clear();
     materialTableHost_.clear();
     brickRecords_.clear();
     headersHost_.clear();
@@ -970,7 +1148,8 @@ bool Raytracer::createProfilingResources(platform::VulkanContext& vk) {
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(vk.physicalDevice(), &props);
     timestampPeriodNs_ = props.limits.timestampPeriod;
-    VkQueryPoolCreateInfo qpci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+    VkQueryPoolCreateInfo qpci{};
+    qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
     qpci.queryCount = kTimestampCount;
     if (vkCreateQueryPool(vk.device(), &qpci, nullptr, &timestampPool_) != VK_SUCCESS) {
@@ -994,11 +1173,15 @@ void Raytracer::updateFrameDescriptors(platform::VulkanContext& vk, platform::Sw
 
     VkDescriptorImageInfo diCurr{ VK_NULL_HANDLE, gpuBuffers_.colorView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo diMotion{ VK_NULL_HANDLE, gpuBuffers_.motionView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo diHistRead{ VK_NULL_HANDLE, denoiser_.historyReadView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo diHistWrite{ VK_NULL_HANDLE, denoiser_.historyWriteView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView historyReadView  = denoiseEnabled_ ? denoiser_.historyReadView() : gpuBuffers_.colorView();
+    VkImageView historyWriteView = denoiseEnabled_ ? denoiser_.historyWriteView() : gpuBuffers_.colorView();
+    VkImageView historyMomentsReadView  = denoiseEnabled_ ? denoiser_.historyMomentsReadView() : gpuBuffers_.momentsView();
+    VkImageView historyMomentsWriteView = denoiseEnabled_ ? denoiser_.historyMomentsWriteView() : gpuBuffers_.momentsView();
+    VkDescriptorImageInfo diHistRead{ VK_NULL_HANDLE, historyReadView, VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo diHistWrite{ VK_NULL_HANDLE, historyWriteView, VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo diMoments{ VK_NULL_HANDLE, gpuBuffers_.momentsView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo diHistMomentsRead{ VK_NULL_HANDLE, denoiser_.historyMomentsReadView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo diHistMomentsWrite{ VK_NULL_HANDLE, denoiser_.historyMomentsWriteView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo diHistMomentsRead{ VK_NULL_HANDLE, historyMomentsReadView, VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo diHistMomentsWrite{ VK_NULL_HANDLE, historyMomentsWriteView, VK_IMAGE_LAYOUT_GENERAL };
 
     VkDescriptorImageInfo diOverlay{ VK_NULL_HANDLE, swap.imageViews()[swapIndex], VK_IMAGE_LAYOUT_GENERAL };
 
@@ -1054,7 +1237,7 @@ void Raytracer::updateFrameDescriptors(platform::VulkanContext& vk, platform::Sw
 
     writes[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[7].dstSet = sets_[swapIndex];
-    writes[7].dstBinding = 27;
+    writes[7].dstBinding = 28;
     writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     writes[7].descriptorCount = 1;
     writes[7].pImageInfo = &diOverlay;
@@ -1063,6 +1246,7 @@ void Raytracer::updateFrameDescriptors(platform::VulkanContext& vk, platform::Sw
 }
 
 bool Raytracer::init(platform::VulkanContext& vk, platform::Swapchain& swap) {
+    useSync2_ = vk.deviceInfo().hasSynchronization2;
     if (!createImages(vk, swap)) return false;
     if (!createPipelines(vk)) return false;
     if (!uploadCtx_.init(vk)) return false;
@@ -1086,7 +1270,7 @@ void Raytracer::updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData&
     d.macroHashCapacity = macroCapacity_;
     d.macroDimBricks    = macroDimBricks_;
     d.macroSize         = float(macroDimBricks_) * (d.brickSize);
-    d.historyValid      = denoiser_.historyValidFlag();
+    d.historyValid      = denoiseEnabled_ ? denoiser_.historyValidFlag() : 0u;
     if (brickStore_) {
         const auto& wg = brickStore_->worldGen();
         const auto& np = wg.params();
@@ -1126,80 +1310,124 @@ void Raytracer::updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData&
 }
 
 void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, VkCommandBuffer cb, uint32_t swapIndex) {
+    constexpr bool kDisableRayDispatch = false;
+    constexpr bool kEnableGenerateStage = true;
+    constexpr bool kEnableTraverseStage = true;
+    constexpr bool kEnableShadeStage = true;
+    if (kDisableRayDispatch) {
+        return;
+    }
     refreshWorldDescriptors(vk);
     updateFrameDescriptors(vk, swap, swapIndex);
     gpuBuffers_.writeQueueHeaders(cb);
     gpuBuffers_.zeroStats(cb);
-    VkMemoryBarrier2 hdrBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-    hdrBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-    hdrBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    hdrBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    hdrBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    VkDependencyInfo hdrDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    hdrDep.memoryBarrierCount = 1;
-    hdrDep.pMemoryBarriers = &hdrBarrier;
-    vkCmdPipelineBarrier2(cb, &hdrDep);
+    auto issueBarrier = [&](VkPipelineStageFlags2 srcStage2,
+                            VkAccessFlags2 srcAccess2,
+                            VkPipelineStageFlags2 dstStage2,
+                            VkAccessFlags2 dstAccess2,
+                            VkPipelineStageFlags srcStage,
+                            VkAccessFlags srcAccess,
+                            VkPipelineStageFlags dstStage,
+                            VkAccessFlags dstAccess) {
+        if (useSync2_) {
+            VkMemoryBarrier2 barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            barrier.srcStageMask = srcStage2;
+            barrier.srcAccessMask = srcAccess2;
+            barrier.dstStageMask = dstStage2;
+            barrier.dstAccessMask = dstAccess2;
+            VkDependencyInfo dep{};
+            dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            dep.memoryBarrierCount = 1;
+            dep.pMemoryBarriers = &barrier;
+            vkCmdPipelineBarrier2(cb, &dep);
+        } else {
+            VkMemoryBarrier barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            barrier.srcAccessMask = srcAccess;
+            barrier.dstAccessMask = dstAccess;
+            vkCmdPipelineBarrier(cb, srcStage, dstStage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        }
+    };
+
+    auto writeTimestamp = [&](uint32_t index) {
+        if (!timestampPool_) return;
+        if (useSync2_) {
+            vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, index);
+        } else {
+            vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampPool_, index);
+        }
+    };
+
+    issueBarrier(VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                 VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                 VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                 VK_ACCESS_TRANSFER_WRITE_BIT,
+                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                 VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     if (timestampPool_) {
         vkCmdResetQueryPool(cb, timestampPool_, 0, kTimestampCount);
-        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 0);
+        writeTimestamp(0);
     }
 
     // Generate primary rays into queue
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeGenerate_);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_, 0, 1, &sets_[swapIndex], 0, nullptr);
-    uint32_t gx = (extent_.width + 7u)/8u;
-    uint32_t gy = (extent_.height + 7u)/8u;
-    vkCmdDispatch(cb, gx, gy, 1);
-    if (timestampPool_) {
-        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 1);
+    uint32_t gx = (extent_.width + 7u) / 8u;
+    uint32_t gy = (extent_.height + 7u) / 8u;
+    if (kEnableGenerateStage) {
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeGenerate_);
+        vkCmdDispatch(cb, gx, gy, 1);
+        writeTimestamp(1);
     }
-    VkMemoryBarrier2 genBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-    genBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    genBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    genBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    genBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    VkDependencyInfo genDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    genDep.memoryBarrierCount = 1;
-    genDep.pMemoryBarriers = &genBarrier;
-    vkCmdPipelineBarrier2(cb, &genDep);
-    if (timestampPool_) {
-        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 2);
+    if (kEnableGenerateStage && (kEnableTraverseStage || kEnableShadeStage)) {
+        issueBarrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_SHADER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        writeTimestamp(2);
     }
 
     // Traverse rays into queues
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeTraverse_);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_, 0, 1, &sets_[swapIndex], 0, nullptr);
-    vkCmdDispatch(cb, gx, gy, 1);
+    if (kEnableTraverseStage) {
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeTraverse_);
+        vkCmdDispatch(cb, gx, gy, 1);
+    }
     // Ensure queue writes are visible to shading pass
-    VkMemoryBarrier2 queueBarrier{};
-    queueBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-    queueBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    queueBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    queueBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    queueBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    VkDependencyInfo queueDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    queueDep.memoryBarrierCount = 1;
-    queueDep.pMemoryBarriers = &queueBarrier;
-    vkCmdPipelineBarrier2(cb, &queueDep);
-    if (timestampPool_) {
-        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 3);
+    if (kEnableTraverseStage && kEnableShadeStage) {
+        issueBarrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_SHADER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        writeTimestamp(3);
     }
 
     // Shade hits/misses from queues into current color/motion targets
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeShade_);
-    uint32_t shadeGroups = gx * gy; // one workgroup per traverse workgroup (64 threads)
-    if (timestampPool_) {
-        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 4);
-    }
-    vkCmdDispatch(cb, shadeGroups, 1, 1);
-    if (timestampPool_) {
-        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 5);
+    if (kEnableShadeStage) {
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeShade_);
+        uint32_t shadeGroups = gx * gy; // one workgroup per traverse workgroup (64 threads)
+        writeTimestamp(4);
+        vkCmdDispatch(cb, shadeGroups, 1, 1);
+        if (timestampPool_) {
+            vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 5);
+        }
     }
 
-    // Make current color and motion available to temporal accumulation
-    std::array<VkImageMemoryBarrier2, 5> preTemporal{};
+    // Make current color and motion available to downstream passes
+    std::vector<VkImageMemoryBarrier2> preTemporal;
+    preTemporal.reserve(8);
     auto makeBarrier = [](VkImage image) {
-        VkImageMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+        VkImageMemoryBarrier2 barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
         barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         barrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
         barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -1212,31 +1440,41 @@ void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, V
         barrier.subresourceRange.layerCount = 1;
         return barrier;
     };
-    preTemporal[0] = makeBarrier(gpuBuffers_.colorImage());
-    preTemporal[1] = makeBarrier(gpuBuffers_.motionImage());
-    preTemporal[2] = makeBarrier(gpuBuffers_.albedoImage());
-    preTemporal[3] = makeBarrier(gpuBuffers_.normalImage());
-    preTemporal[4] = makeBarrier(gpuBuffers_.momentsImage());
-    VkDependencyInfo preTemporalDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    preTemporal.push_back(makeBarrier(gpuBuffers_.colorImage()));
+    preTemporal.push_back(makeBarrier(gpuBuffers_.motionImage()));
+    preTemporal.push_back(makeBarrier(gpuBuffers_.albedoImage()));
+    preTemporal.push_back(makeBarrier(gpuBuffers_.normalImage()));
+    preTemporal.push_back(makeBarrier(gpuBuffers_.momentsImage()));
+    if (denoiseEnabled_) {
+        preTemporal.push_back(makeBarrier(denoiser_.historyReadImage()));
+        preTemporal.push_back(makeBarrier(denoiser_.historyWriteImage()));
+        preTemporal.push_back(makeBarrier(denoiser_.historyMomentsReadImage()));
+        preTemporal.push_back(makeBarrier(denoiser_.historyMomentsWriteImage()));
+    }
+    VkDependencyInfo preTemporalDep{};
+    preTemporalDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     preTemporalDep.imageMemoryBarrierCount = static_cast<uint32_t>(preTemporal.size());
     preTemporalDep.pImageMemoryBarriers = preTemporal.data();
     vkCmdPipelineBarrier2(cb, &preTemporalDep);
 
-    // Temporal accumulation into history write target
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeTemporal_);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_, 0, 1, &sets_[swapIndex], 0, nullptr);
-    uint32_t tx = (extent_.width + 7u) / 8u;
-    uint32_t ty = (extent_.height + 7u) / 8u;
-    vkCmdDispatch(cb, tx, ty, 1);
+    if (denoiseEnabled_) {
+        // Temporal accumulation into history write target
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeTemporal_);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_, 0, 1, &sets_[swapIndex], 0, nullptr);
+        uint32_t tx = (extent_.width + 7u) / 8u;
+        uint32_t ty = (extent_.height + 7u) / 8u;
+        vkCmdDispatch(cb, tx, ty, 1);
 
-    // Barrier history image for composite pass
-    std::array<VkImageMemoryBarrier2, 2> histBarriers{};
-    histBarriers[0] = makeBarrier(denoiser_.historyWriteImage());
-    histBarriers[1] = makeBarrier(denoiser_.historyMomentsWriteImage());
-    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    dep.imageMemoryBarrierCount = static_cast<uint32_t>(histBarriers.size());
-    dep.pImageMemoryBarriers = histBarriers.data();
-    vkCmdPipelineBarrier2(cb, &dep);
+        // Barrier history image for composite pass
+        std::array<VkImageMemoryBarrier2, 2> histBarriers{};
+        histBarriers[0] = makeBarrier(denoiser_.historyWriteImage());
+        histBarriers[1] = makeBarrier(denoiser_.historyMomentsWriteImage());
+        VkDependencyInfo dep{};
+        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep.imageMemoryBarrierCount = static_cast<uint32_t>(histBarriers.size());
+        dep.pImageMemoryBarriers = histBarriers.data();
+        vkCmdPipelineBarrier2(cb, &dep);
+    }
 
     // Composite: read temporally accumulated history, write swap image already in GENERAL from App
     tonemap_.record(cb,
@@ -1249,7 +1487,9 @@ void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, V
                     6,
                     7);
 
-    denoiser_.advance();
+    if (denoiseEnabled_) {
+        denoiser_.advance();
+    }
 
     // Debug readback moved to readDebug(), called after submit/present to ensure GPU wrote the data.
 }
@@ -1261,12 +1501,14 @@ void Raytracer::recordOverlay(VkCommandBuffer cb, uint32_t swapIndex) {
     if (swapIndex >= sets_.size()) {
         return;
     }
-    VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    VkMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
     barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     barrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
     barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     barrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
-    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    VkDependencyInfo dep{};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     dep.memoryBarrierCount = 1;
     dep.pMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cb, &dep);
@@ -1318,9 +1560,13 @@ void Raytracer::updateOverlayHUD(platform::VulkanContext& vk, const std::vector<
 }
 
 void Raytracer::readDebug(platform::VulkanContext& vk, uint32_t frameIdx) {
+    spdlog::info("readDebug begin frame {}", frameIdx);
     // Poll infrequently and debounce identical frames to avoid log spam.
     // Temporarily read back every frame for profiling
-    void* p=nullptr; if (vkMapMemory(vk.device(), dbgMem_, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS || !p) return;
+    void* p=nullptr; if (vkMapMemory(vk.device(), dbgMem_, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS || !p) {
+        spdlog::info("readDebug map failed frame {}", frameIdx);
+        return;
+    }
     uint32_t* u = reinterpret_cast<uint32_t*>(p);
     uint32_t frame = u[0]; uint32_t flags = u[1]; uint32_t mcap=u[2]; uint32_t mdim=u[3];
     int bcx0 = int(u[4]), bcy0=int(u[5]), bcz0=int(u[6]); uint32_t present0=u[7];
@@ -1442,6 +1688,31 @@ void Raytracer::readDebug(platform::VulkanContext& vk, uint32_t frameIdx) {
             spdlog::warn("Failed to map traversal stats buffer (res={})", int(mapRes));
         }
     }
+    spdlog::info("readDebug end frame {}", frameIdx);
+}
+
+void Raytracer::collectGpuTimings(platform::VulkanContext& vk, uint32_t frameIdx) {
+    if (!timestampPool_) return;
+    uint64_t timestamps[kTimestampCount]{};
+    VkResult qr = vkGetQueryPoolResults(vk.device(), timestampPool_, 0, kTimestampCount,
+                                        sizeof(timestamps), timestamps, sizeof(uint64_t),
+                                        VK_QUERY_RESULT_64_BIT);
+    if (qr == VK_NOT_READY) {
+        return; // queries not complete yet; skip this frame
+    }
+    if (qr != VK_SUCCESS) {
+        spdlog::warn("vkGetQueryPoolResults failed ({})", int(qr));
+        return;
+    }
+    double scaleMs = timestampPeriodNs_ * 1e-6;
+    auto diffMs = [&](uint32_t a, uint32_t b) {
+        return (timestamps[b] > timestamps[a]) ? double(timestamps[b] - timestamps[a]) * scaleMs : 0.0;
+    };
+    gpuTimingsMs_[0] = diffMs(0, 1);
+    gpuTimingsMs_[1] = diffMs(2, 3);
+    gpuTimingsMs_[2] = diffMs(4, 5);
+    gpuTimingsMs_[3] = diffMs(6, 7);
+    lastTimingFrame_ = frameIdx;
 }
 
 void Raytracer::shutdown(platform::VulkanContext& vk) {

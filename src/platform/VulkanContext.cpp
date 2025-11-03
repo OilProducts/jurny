@@ -57,11 +57,13 @@ bool VulkanContext::createInstance(const std::vector<const char*>& extraExts, bo
         if (hasExtension(instExts, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
 
-    VkApplicationInfo appInfo{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
+    VkApplicationInfo appInfo{};
+    appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "voxel_app";
     appInfo.apiVersion = apiVer ? apiVer : VK_API_VERSION_1_3;
 
-    VkInstanceCreateInfo ci{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    VkInstanceCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ci.pApplicationInfo = &appInfo;
     ci.enabledLayerCount = static_cast<uint32_t>(layers.size());
     ci.ppEnabledLayerNames = layers.empty() ? nullptr : layers.data();
@@ -77,7 +79,8 @@ bool VulkanContext::createInstance(const std::vector<const char*>& extraExts, bo
 
 void VulkanContext::setupDebugMessenger(bool enableValidation) {
     if (!enableValidation) return;
-    VkDebugUtilsMessengerCreateInfoEXT info{ VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT };
+    VkDebugUtilsMessengerCreateInfoEXT info{};
+    info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
     info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
                            VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
     info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
@@ -147,37 +150,109 @@ bool VulkanContext::pickPhysicalDevice(VkSurfaceKHR surface) {
 }
 
 bool VulkanContext::createDevice(bool enableValidation, VkSurfaceKHR surface) {
-    // Desired extensions
-    std::vector<const char*> devExts = {
-        VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, // core in 1.2+
-        VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME // core bits in 1.2
-    };
-    if (surface) devExts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-
-    // Query available
+    (void)enableValidation;
+    // Query available extensions
     uint32_t ec = 0; vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &ec, nullptr);
     std::vector<VkExtensionProperties> avail(ec);
     vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &ec, avail.data());
-    auto keep = [&](const char* name){ return hasExtension(avail, name); };
-    devExts.erase(std::remove_if(devExts.begin(), devExts.end(), [&](const char* n){ return !keep(n); }), devExts.end());
+
+    std::vector<const char*> devExts;
+    auto requestExtension = [&](const char* name, bool mandatory) -> bool {
+        if (hasExtension(avail, name)) {
+            devExts.push_back(name);
+            return true;
+        }
+        if (mandatory) {
+            spdlog::error("Required device extension '{}' is not supported", name);
+        } else {
+            spdlog::debug("Optional device extension '{}' is not supported", name);
+        }
+        return false;
+    };
+
+    // Optional: these became core in 1.2, but older drivers might still expose them as extensions.
+    requestExtension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, false);
+    requestExtension(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME, false);
+    if (surface && !requestExtension(VK_KHR_SWAPCHAIN_EXTENSION_NAME, true)) {
+        return false;
+    }
+
+    const bool wantsSync2ViaExtension = deviceInfo_.apiVersion < VK_MAKE_VERSION(1, 3, 0);
+    bool sync2ViaExtension = false;
+    if (wantsSync2ViaExtension) {
+        sync2ViaExtension = requestExtension(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, true);
+        if (!sync2ViaExtension) {
+            return false;
+        }
+    }
 
     // Features chain
-    VkPhysicalDeviceFeatures2 feats2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
-    VkPhysicalDeviceVulkan12Features v12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
-    VkPhysicalDeviceDescriptorIndexingFeatures descIdx{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES };
-    feats2.pNext = &v12; v12.pNext = &descIdx;
+    VkPhysicalDeviceFeatures2 feats2{};
+    feats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    VkPhysicalDeviceVulkan12Features v12{};
+    v12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    VkPhysicalDeviceDescriptorIndexingFeatures descIdx{};
+    descIdx.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+
+    VkPhysicalDeviceVulkan13Features v13{};
+    v13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    VkPhysicalDeviceSynchronization2FeaturesKHR sync2{};
+    sync2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
+
+    feats2.pNext = &descIdx;
+    descIdx.pNext = &v12;
+    v12.pNext = nullptr;
+
+    const bool supportsVulkan13 = deviceInfo_.apiVersion >= VK_MAKE_VERSION(1, 3, 0);
+    if (supportsVulkan13) {
+        v13.pNext = feats2.pNext;
+        feats2.pNext = &v13;
+    } else if (sync2ViaExtension) {
+        sync2.pNext = feats2.pNext;
+        feats2.pNext = &sync2;
+    }
+
     vkGetPhysicalDeviceFeatures2(physicalDevice_, &feats2);
 
-    v12.timelineSemaphore = VK_TRUE;
-    descIdx.descriptorBindingPartiallyBound = VK_TRUE;
-    descIdx.runtimeDescriptorArray = VK_TRUE;
-    descIdx.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE; // illustrative
+    bool timelineSupported = v12.timelineSemaphore == VK_TRUE;
+    v12.timelineSemaphore = timelineSupported ? VK_TRUE : VK_FALSE;
+
+    descIdx.descriptorBindingPartiallyBound = descIdx.descriptorBindingPartiallyBound ? VK_TRUE : VK_FALSE;
+    descIdx.runtimeDescriptorArray = descIdx.runtimeDescriptorArray ? VK_TRUE : VK_FALSE;
+    descIdx.descriptorBindingSampledImageUpdateAfterBind =
+        descIdx.descriptorBindingSampledImageUpdateAfterBind ? VK_TRUE : VK_FALSE;
 
     // Request 64-bit integers in shaders for SSBO keys/occupancy (used in traversal shader)
-    feats2.features.shaderInt64 = VK_TRUE;
+    bool shaderInt64Supported = feats2.features.shaderInt64 == VK_TRUE;
+    feats2.features.shaderInt64 = shaderInt64Supported ? VK_TRUE : VK_FALSE;
 
-    deviceInfo_.hasTimelineSemaphore = v12.timelineSemaphore;
-    deviceInfo_.hasDescriptorIndexing = descIdx.runtimeDescriptorArray;
+    bool storageImageExtendedFormatsSupported = feats2.features.shaderStorageImageExtendedFormats == VK_TRUE;
+    if (!storageImageExtendedFormatsSupported) {
+        spdlog::error("shaderStorageImageExtendedFormats is required but not supported by this device.");
+        return false;
+    }
+    feats2.features.shaderStorageImageExtendedFormats = VK_TRUE;
+
+    bool sync2Supported = false;
+    if (supportsVulkan13) {
+        if (v13.synchronization2) {
+            v13.synchronization2 = VK_TRUE;
+            sync2Supported = true;
+        }
+    } else if (sync2ViaExtension) {
+        if (sync2.synchronization2) {
+            sync2.synchronization2 = VK_TRUE;
+            sync2Supported = true;
+        }
+    }
+    if (!sync2Supported) {
+        spdlog::error("Vulkan Synchronization2 is required but not supported by this device.");
+        return false;
+    }
+
+    deviceInfo_.hasTimelineSemaphore = timelineSupported;
+    deviceInfo_.hasDescriptorIndexing = descIdx.runtimeDescriptorArray == VK_TRUE;
+    deviceInfo_.hasSynchronization2 = sync2Supported;
 
     // Queues
     float prio = 1.0f;
@@ -189,14 +264,16 @@ bool VulkanContext::createDevice(bool enableValidation, VkSurfaceKHR surface) {
     std::sort(uniqIdx.begin(), uniqIdx.end());
     uniqIdx.erase(std::unique(uniqIdx.begin(), uniqIdx.end()), uniqIdx.end());
     for (uint32_t idx : uniqIdx) {
-        VkDeviceQueueCreateInfo qci{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
+        VkDeviceQueueCreateInfo qci{};
+        qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
         qci.queueFamilyIndex = idx;
         qci.queueCount = 1;
         qci.pQueuePriorities = &prio;
         qcis.push_back(qci);
     }
 
-    VkDeviceCreateInfo dci{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
+    VkDeviceCreateInfo dci{};
+    dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.pNext = &feats2;
     dci.queueCreateInfoCount = static_cast<uint32_t>(qcis.size());
     dci.pQueueCreateInfos = qcis.data();
@@ -215,7 +292,8 @@ bool VulkanContext::createDevice(bool enableValidation, VkSurfaceKHR surface) {
 }
 
 void VulkanContext::createCommandPool() {
-    VkCommandPoolCreateInfo ci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    VkCommandPoolCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     // Use graphics family so command buffers can be submitted to graphics (present-capable) queue.
     ci.queueFamilyIndex = queueFamilies_.graphics.value_or(queueFamilies_.compute.value());
     ci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -230,7 +308,8 @@ void VulkanContext::createDescriptorPool() {
         VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  256 },
         VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024 }
     };
-    VkDescriptorPoolCreateInfo ci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    VkDescriptorPoolCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     ci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
     ci.maxSets = 2048;
     ci.poolSizeCount = static_cast<uint32_t>(sizes.size());
@@ -239,7 +318,8 @@ void VulkanContext::createDescriptorPool() {
 }
 
 void VulkanContext::createPipelineCache() {
-    VkPipelineCacheCreateInfo ci{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+    VkPipelineCacheCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
     vkCreatePipelineCache(device_, &ci, nullptr, &pipelineCache_);
 }
 

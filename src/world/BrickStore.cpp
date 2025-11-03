@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <atomic>
+#include <limits>
 #include <spdlog/spdlog.h>
 #include <sstream>
 #include <cctype>
@@ -259,7 +260,9 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
                                   int brickDim,
                                   float brickSize,
                                   std::vector<uint64_t>& outOcc,
-                                  std::vector<uint16_t>& outMaterials) const {
+                                  std::vector<uint16_t>& outMaterials,
+                                  std::vector<float>& outField) const {
+    (void)P;
     static std::atomic<uint32_t> firstLogs{0};
     uint32_t count = firstLogs.load(std::memory_order_relaxed);
     if (count < 32) {
@@ -274,22 +277,77 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
 
     outOcc.assign(wordsPerBrick, 0ull);
     outMaterials.assign(voxelsPerBrick, 0u);
+    outField.clear();
+
+    const glm::vec3 brickOrigin = glm::vec3(bc) * brickSize;
+    auto sampleField = [&](const glm::vec3& pos) -> float {
+        return worldGen_.crustField(pos);
+    };
+
+    // Fast reject: sample brick corners and center. If all comfortably outside, skip voxel walk.
+    bool allPositive = true;
+    float minField = std::numeric_limits<float>::infinity();
+    const float pad = voxelSize * 0.25f;
+    const float step = static_cast<float>(brickDim) * 0.5f;
+    for (int iz = 0; iz < 3 && allPositive; ++iz) {
+        for (int iy = 0; iy < 3 && allPositive; ++iy) {
+            for (int ix = 0; ix < 3; ++ix) {
+                glm::vec3 offset(
+                    (ix == 0) ? 0.0f : (ix == 1 ? step : static_cast<float>(brickDim)),
+                    (iy == 0) ? 0.0f : (iy == 1 ? step : static_cast<float>(brickDim)),
+                    (iz == 0) ? 0.0f : (iz == 1 ? step : static_cast<float>(brickDim)));
+                glm::vec3 samplePos = brickOrigin + offset * voxelSize;
+                float field = sampleField(samplePos);
+                minField = std::min(minField, field);
+                if (field <= 0.0f) {
+                    allPositive = false;
+                    break;
+                }
+            }
+        }
+    }
+    if (allPositive && minField > pad) {
+        outOcc.clear();
+        outMaterials.clear();
+        outField.clear();
+        return false;
+    }
 
     bool any = false;
-    const glm::vec3 brickOrigin = glm::vec3(bc) * brickSize;
+    const glm::vec3 voxelSteps = glm::vec3(voxelSize);
+
     for (int vz = 0; vz < brickDim; ++vz) {
         for (int vy = 0; vy < brickDim; ++vy) {
             for (int vx = 0; vx < brickDim; ++vx) {
-                glm::vec3 p = brickOrigin + (glm::vec3(vx + 0.5f, vy + 0.5f, vz + 0.5f) * voxelSize);
-                float f = worldGen_.crustField(p);
+                glm::vec3 voxelMin = brickOrigin + glm::vec3(vx, vy, vz) * voxelSize;
+                glm::vec3 centerPos = voxelMin + glm::vec3(0.5f) * voxelSteps;
+                float voxelField = sampleField(centerPos);
+
+                bool occupied = (voxelField < 0.0f);
+                if (!occupied) {
+                    // Check corners for a sign change so thin surfaces are not lost.
+                    for (int corner = 0; corner < 8 && !occupied; ++corner) {
+                        glm::vec3 offset(
+                            (corner & 1) ? 1.0f : 0.0f,
+                            (corner & 2) ? 1.0f : 0.0f,
+                            (corner & 4) ? 1.0f : 0.0f);
+                        glm::vec3 cornerPos = voxelMin + offset * voxelSteps;
+                        float cornerField = sampleField(cornerPos);
+                        if (cornerField < 0.0f) {
+                            occupied = true;
+                        }
+                    }
+                }
+
                 uint32_t idx = static_cast<uint32_t>(vx + vy * brickDim + vz * brickDim * brickDim);
-                if (f < 0.0f) {
+                if (occupied) {
                     uint32_t w = idx >> 6u;
                     uint32_t b = idx & 63u;
                     outOcc[w] |= (1ull << b);
                     any = true;
                 }
-                outMaterials[idx] = static_cast<uint16_t>(classifyMaterial(p));
+
+                outMaterials[idx] = static_cast<uint16_t>(classifyMaterial(centerPos));
             }
         }
     }
@@ -303,7 +361,28 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
         }
         outOcc.clear();
         outMaterials.clear();
+        outField.clear();
         return false;
+    }
+
+    constexpr bool kCacheFieldSamples = true;
+    if (kCacheFieldSamples) {
+        const int samplesPerAxis = brickDim + 1;
+        const size_t samplesPerBrick = static_cast<size_t>(samplesPerAxis) *
+                                       static_cast<size_t>(samplesPerAxis) *
+                                       static_cast<size_t>(samplesPerAxis);
+        outField.resize(samplesPerBrick);
+        size_t sampleIdx = 0;
+        for (int iz = 0; iz < samplesPerAxis; ++iz) {
+            for (int iy = 0; iy < samplesPerAxis; ++iy) {
+                for (int ix = 0; ix < samplesPerAxis; ++ix, ++sampleIdx) {
+                    glm::vec3 vertexPos = brickOrigin + glm::vec3(ix, iy, iz) * voxelSize;
+                    outField[sampleIdx] = sampleField(vertexPos);
+                }
+            }
+        }
+    } else {
+        outField.clear();
     }
 
     return true;
@@ -328,13 +407,15 @@ bool BrickStore::acquireBrick(const glm::ivec3& bc,
 
     std::vector<uint64_t> occ;
     std::vector<uint16_t> mats;
-    bool solid = computeBrickData(bc, params_, voxelSize_, brickDim_, brickSize_, occ, mats);
+    std::vector<float> field;
+    bool solid = computeBrickData(bc, params_, voxelSize_, brickDim_, brickSize_, occ, mats, field);
 
     std::shared_ptr<const BrickPayload> newPayload;
     if (solid) {
         auto owned = std::make_shared<BrickPayload>();
         owned->occ = std::move(occ);
         owned->materials = std::move(mats);
+        owned->field = std::move(field);
         newPayload = std::move(owned);
     }
 
@@ -354,6 +435,7 @@ bool BrickStore::acquireBrick(const glm::ivec3& bc,
 CpuWorld BrickStore::buildCpuWorld(const std::vector<glm::ivec3>& brickCoords,
                                    std::atomic<bool>* cancel) const {
     CpuWorld world{};
+    constexpr bool kCacheFieldSamples = true;
     const size_t brickCount = brickCoords.size();
     const size_t voxelsPerBrick = static_cast<size_t>(brickDim_) * static_cast<size_t>(brickDim_) * static_cast<size_t>(brickDim_);
     const size_t wordsPerBrick = (voxelsPerBrick + 63u) / 64u;
@@ -362,6 +444,12 @@ CpuWorld BrickStore::buildCpuWorld(const std::vector<glm::ivec3>& brickCoords,
     world.occWords.reserve(brickCount * wordsPerBrick);
     world.materialIndices.reserve(brickCount * maxMaterialWords);
     world.palettes.reserve(brickCoords.size() * 16);
+    if (kCacheFieldSamples) {
+        const size_t fieldSamplesPerBrick = static_cast<size_t>(brickDim_ + 1) *
+                                            static_cast<size_t>(brickDim_ + 1) *
+                                            static_cast<size_t>(brickDim_ + 1);
+        world.fieldSamples.reserve(brickCount * fieldSamplesPerBrick);
+    }
 
     uint32_t occByteOffset = 0;
     bool aborted = false;
@@ -382,6 +470,7 @@ CpuWorld BrickStore::buildCpuWorld(const std::vector<glm::ivec3>& brickCoords,
 
         const std::vector<uint64_t>& occ = payload->occ;
         const std::vector<uint16_t>& materials = payload->materials;
+        const std::vector<float>& field = payload->field;
         const size_t voxelCount = materials.size();
         std::array<uint16_t, 16> palette{};
         std::vector<uint8_t> paletteIndices(voxelCount);
@@ -455,6 +544,13 @@ CpuWorld BrickStore::buildCpuWorld(const std::vector<glm::ivec3>& brickCoords,
             }
         }
         header.matIdxOffset = materialOffsetBytes;
+
+        if (kCacheFieldSamples && !field.empty()) {
+            header.tsdfOffset = static_cast<uint32_t>(world.fieldSamples.size() * sizeof(float));
+            world.fieldSamples.insert(world.fieldSamples.end(), field.begin(), field.end());
+        } else {
+            header.tsdfOffset = kInvalidOffset;
+        }
 
         world.headers.push_back(header);
         world.occWords.insert(world.occWords.end(), occ.begin(), occ.end());

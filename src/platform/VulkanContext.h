@@ -32,6 +32,7 @@ struct DeviceInfo {
     bool hasTimelineSemaphore = true;
     bool hasDescriptorIndexing = true;
     bool hasBufferDeviceAddress = false;
+    bool hasSynchronization2 = false;
 };
 
 class VulkanContext {
