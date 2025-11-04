@@ -9,6 +9,7 @@
 #include <volk.h>
 #include <vector>
 #include <array>
+#include <algorithm>
 #include <cstring>
 #include <cstdlib>
 #include <chrono>
@@ -128,22 +129,24 @@ int App::run() {
         return 1;
     }
     spdlog::debug("Raytracer initialized");
-    const float planetRadius = 100.0f;
     const float eyeHeight = 1.7f;
     const bool enableStreaming = true;
     const world::BrickStore* brickStore = ray.worldStore();
+    const float planetRadius = brickStore ? static_cast<float>(brickStore->params().R) : 100.0f;
     if (enableStreaming && brickStore) {
+        const auto& planetParams = brickStore->params();
+        const float innerBand = static_cast<float>(planetParams.T);
+        const float heightSpan = static_cast<float>(planetParams.Hmax);
+        const float shellMargin = brickStore->brickSize(); // allow a single brick beyond nominal range
         world::Streaming::Config streamCfg;
-        streamCfg.shellInner = planetRadius - 25.0f;
-        streamCfg.shellOuter = planetRadius + 75.0f;
-        streamCfg.shellInner = 0.0f; // use planet defaults from store
-        streamCfg.shellOuter = 0.0f;
-        streamCfg.keepRadius = 60.0f;
-        streamCfg.loadRadius = 90.0f;
-        streamCfg.simRadius  = 70.0f;
+        streamCfg.shellInner = planetRadius - std::max(innerBand, 6.0f);
+        streamCfg.shellOuter = planetRadius + heightSpan + shellMargin;
+        streamCfg.keepRadius = 140.0f;
+        streamCfg.loadRadius = 180.0f;
+        streamCfg.simRadius  = 140.0f;
         streamCfg.regionDimBricks = 8;
-        streamCfg.maxRegionSelectionsPerFrame = 2;
-        streamCfg.maxConcurrentGenerations = std::max(2, static_cast<int>(jobs.workerCount()));
+        streamCfg.maxRegionSelectionsPerFrame = 24;
+        streamCfg.maxConcurrentGenerations = std::max(8, static_cast<int>(jobs.workerCount()));
         streaming.initialize(*brickStore, streamCfg, &jobs);
         spdlog::debug("Streaming initialized");
     } else if (!enableStreaming) {
@@ -163,7 +166,7 @@ int App::run() {
     bool mPrevDown = false; // edge-trigger for 'M'
     bool blockPrevDown = false; // edge-trigger for 'B'
     const uint32_t blockNormalFlag = 32u;
-    uint32_t debugFlags = 8u; // macro skip on, smooth normals by default
+    uint32_t debugFlags = 0u; // smooth normals, macro skip off by default
     glm::dvec3 camWorld = glm::dvec3(double(planetRadius) + 5.0, 0.0, 5.0);
     glm::dvec3 prevRenderOrigin = camWorld;
     glm::mat4 prevViewMat(1.0f);

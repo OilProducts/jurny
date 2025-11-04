@@ -61,6 +61,7 @@ void Streaming::clearQueues() {
 void Streaming::update(const glm::vec3& cameraPos, uint64_t frameIndex) {
     if (!store_) return;
 
+    currentFrame_ = frameIndex;
     lastCameraWorld_ = cameraPos;
     Stats prevStats = stats_;
     stats_ = {};
@@ -331,6 +332,14 @@ void Streaming::promoteToReady(CompletedRegion&& completed) {
     }
     stats_.buildMsAvg = buildMsAvgValid_ ? buildMsAvg_ : 0.0;
 
+    constexpr double kInteriorThreshold = 0.9;
+    const bool mostlySolid = solidRatio >= kInteriorThreshold;
+    if (mostlySolid) {
+        // Keep the current region so surface voxels bound to its brick coordinates remain available,
+        // but continue to push the next outward ring so streaming can expand.
+        queueOutwardNeighbor(completed.coord, static_cast<float>(solidRatio));
+    }
+
     ReadyRegion ready;
     ready.regionCoord = completed.coord;
     ready.priority = completed.priority;
@@ -458,6 +467,53 @@ glm::ivec3 Streaming::unpackRegionCoord(uint64_t key) {
     coord.y = static_cast<int>((key >> 21) & ((1ull << 21) - 1ull)) - static_cast<int>(B);
     coord.z = static_cast<int>(key & ((1ull << 21) - 1ull)) - static_cast<int>(B);
     return coord;
+}
+
+void Streaming::queueOutwardNeighbor(const glm::ivec3& coord, float solidRatio) {
+    if (!store_) {
+        return;
+    }
+    const int regionDim = std::max(config_.regionDimBricks, 1);
+    const float regionSize = static_cast<float>(regionDim) * store_->brickSize();
+    glm::vec3 center = (glm::vec3(coord) + glm::vec3(0.5f)) * regionSize;
+    float radius = glm::length(center);
+    if (radius < 1e-3f) {
+        return;
+    }
+    glm::vec3 dir = center / radius;
+    glm::vec3 outwardCenter = center + dir * regionSize;
+    glm::ivec3 outwardCoord = glm::floor(outwardCenter / regionSize);
+    if (outwardCoord == coord) {
+        outwardCoord += glm::ivec3((dir.x >= 0.f) ? 1 : -1,
+                                   (dir.y >= 0.f) ? 1 : -1,
+                                   (dir.z >= 0.f) ? 1 : -1);
+    }
+
+    const uint64_t key = packRegionCoord(outwardCoord);
+    auto [recIt, inserted] = regionRecords_.emplace(key, RegionRecord{});
+    RegionRecord& record = recIt->second;
+    if (!inserted && record.state != RegionState::None) {
+        return;
+    }
+
+    const auto [shellInner, shellOuter] = shellBounds();
+    glm::vec3 outwardCenterExact = (glm::vec3(outwardCoord) + glm::vec3(0.5f)) * regionSize;
+    float distanceToCamera = glm::length(outwardCenterExact - lastCameraWorld_);
+    float priority = regionPriority(outwardCenterExact, distanceToCamera, shellInner, shellOuter);
+
+    record.state = RegionState::Pending;
+    record.priority = priority;
+    record.lastTouchedFrame = currentFrame_;
+
+    RegionTask task;
+    task.coord = outwardCoord;
+    task.priority = priority;
+    task.key = key;
+   task.frameEnqueued = currentFrame_;
+   pendingRegions_.push(task);
+
+    spdlog::debug("Streaming: queued outward region ({}, {}, {}) after solid ratio {:.2f}",
+                  outwardCoord.x, outwardCoord.y, outwardCoord.z, solidRatio);
 }
 
 } // namespace world

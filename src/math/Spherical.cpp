@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <glm/common.hpp>
+#include <glm/vec2.hpp>
 #include <glm/geometric.hpp>
 
 namespace math {
@@ -138,11 +139,53 @@ CrustSample evaluateCrust(const glm::vec3& p,
         kPersistenceDetail,
         seed + 613u);
 
-    float height = noise.continentAmplitude * continents +
-                   noise.detailAmplitude * detail;
+    float continentHeight = noise.continentAmplitude * continents;
+
+    float slopeMask = 0.0f;
+    if (noise.continentAmplitude > 0.0f && noise.continentFrequency > 0.0f) {
+        glm::vec3 east, north, upVec;
+        ENU(dir, east, north, upVec);
+        const float gradStep = 0.02f;
+        auto sampleContinents = [&](const glm::vec3& w) {
+            return fbmInternal(w,
+                               noise.continentFrequency,
+                               contOct,
+                               kPersistenceContinent,
+                               seed);
+        };
+        float continentsEast = sampleContinents(warped + east * gradStep);
+        float continentsNorth = sampleContinents(warped + north * gradStep);
+        float slope = glm::length(glm::vec2(continentsEast - continents,
+                                            continentsNorth - continents)) / gradStep;
+        slopeMask = glm::smoothstep(0.3f, 1.2f, slope);
+    }
+
+    float detailMask = 1.0f - glm::smoothstep(0.55f, 0.95f, continents * 0.5f + 0.5f);
+    float detailStrength = glm::mix(1.0f, 0.25f, slopeMask);
+    float detailContribution = noise.detailAmplitude * detailMask * detailStrength * detail;
+    float height = continentHeight + detailContribution;
+    if (slopeMask > 0.0f) {
+        const float slopeFlatten = glm::mix(0.0f, noise.continentAmplitude * 0.3f, slopeMask);
+        height = glm::mix(height, height - slopeFlatten, slopeMask);
+    }
+
+    auto smoothClamp = [](float value, float lo, float hi, float transition) {
+        if (transition <= 0.0f || hi <= lo) {
+            return glm::clamp(value, lo, hi);
+        }
+        float tLo = glm::smoothstep(lo - transition, lo + transition, value);
+        float vLo = glm::mix(lo, value, tLo);
+        float tHi = glm::smoothstep(hi - transition, hi + transition, value);
+        return glm::mix(vLo, hi, tHi);
+    };
+
     const float minHeight = -static_cast<float>(planet.T);
     const float maxHeight = static_cast<float>(planet.Hmax);
-    height = std::clamp(height, minHeight, maxHeight);
+    const float plateau =
+        std::max(12.0f,
+                 std::max(static_cast<float>(planet.T) * 0.35f,
+                          static_cast<float>(planet.Hmax) * 0.4f));
+    height = smoothClamp(height, minHeight, maxHeight, plateau);
 
     const float surfaceRadius = static_cast<float>(planet.R) + height;
     float field = r - surfaceRadius;

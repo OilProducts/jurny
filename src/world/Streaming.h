@@ -67,6 +67,8 @@ public:
     int regionDimBricks() const { return config_.regionDimBricks; }
 
 private:
+    void queueOutwardNeighbor(const glm::ivec3& coord, float solidRatio);
+
     struct RegionTask {
         glm::ivec3 coord;
         float priority = 0.0f;
@@ -148,6 +150,7 @@ private:
     bool buildMsAvgValid_ = false;
     double solidRatioLast_ = 0.0;
     glm::vec3 lastCameraWorld_{0.0f};
+    uint64_t currentFrame_ = 0;
 
     std::priority_queue<RegionTask, std::vector<RegionTask>, RegionTaskCompare> pendingRegions_;
     std::vector<BuildingJob> inFlight_;

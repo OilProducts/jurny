@@ -309,10 +309,25 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
         }
     }
     if (allPositive && minField > pad) {
-        outOcc.clear();
-        outMaterials.clear();
-        outField.clear();
-        return false;
+        const glm::vec3 brickCenter = brickOrigin + glm::vec3(0.5f * brickDim) * voxelSize;
+        const float radius = glm::length(brickCenter);
+        const float halfDiag = 0.5f * std::sqrt(3.0f) * brickSize;
+        const float minRadius = radius - halfDiag;
+        const float maxRadius = radius + halfDiag;
+
+        const float crustInner = static_cast<float>(params_.R) - static_cast<float>(params_.T);
+        const float crustOuter = static_cast<float>(params_.R) + static_cast<float>(params_.Hmax);
+        const float margin = halfDiag + voxelSize;
+        const float shellInner = crustInner - margin;
+        const float shellOuter = crustOuter + margin;
+
+        bool intersectsCrust = !(maxRadius < shellInner || minRadius > shellOuter);
+        if (!intersectsCrust) {
+            outOcc.clear();
+            outMaterials.clear();
+            outField.clear();
+            return false;
+        }
     }
 
     bool any = false;
