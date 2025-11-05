@@ -40,3 +40,6 @@
 - Respect the wavefront pipeline: edits must update CPU `BrickStore`, GPU SSBOs, and descriptor bindings consistently.
 - When touching streaming, test with `enableStreaming` toggled on in `App::run`; watch log output for residency counts.
 - Instruments (`Tracy`, GPU timestamps) are wired in—capture traces when performance shifts more than ±10%.
+
+## Agent Notes
+- Investigated cliffy terrain; replaced lattice hash with PCG-based mix in `src/math/Spherical.cpp` and mirrored in `shaders/spherical.glsl`. Continuity test in `tests/MathTests.cpp` now checks local stability. Large-scale continents should be back once you rebuild.
