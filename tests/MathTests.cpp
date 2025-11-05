@@ -1,4 +1,5 @@
 // Minimal assertions for spherical math M0.
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <glm/vec3.hpp>
@@ -71,6 +72,19 @@ int main() {
         // Miss: above Rout, direction parallel to shell
         hit = IntersectSphereShell({0.0f, 0.0f, 20.0f}, {1.0f, 0.0f, 0.0f}, Rin, Rout, t0, t1);
         assert(!hit);
+    }
+
+    // Noise continuity: tiny perturbations should not introduce discontinuities.
+    {
+        PlanetParams Pw{100.0, 12.0, 100.0, 24.0};
+        NoiseParams noise{};
+        const std::uint32_t seed = 1337u;
+        const float radius = static_cast<float>(Pw.R) + 5.0f;
+        const glm::vec3 basePos(radius, 0.0f, 0.0f);
+        const float eps = 1e-3f;
+        CrustSample a = SampleCrust(basePos - glm::vec3(eps, 0.0f, 0.0f), Pw, noise, seed);
+        CrustSample b = SampleCrust(basePos + glm::vec3(eps, 0.0f, 0.0f), Pw, noise, seed);
+        assert(std::fabs(a.height - b.height) < 0.1f);
     }
 
     return 0;

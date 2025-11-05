@@ -5,6 +5,24 @@ const float PERSISTENCE_CONTINENT = 0.55;
 const float PERSISTENCE_DETAIL    = 0.5;
 const float PERSISTENCE_CAVE      = 0.5;
 
+float hash13(vec3 p, float seed) {
+    return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719)) + seed) * 43758.5453);
+}
+
+uint pcgHash32(uint v) {
+    v = v * 747796405u + 2891336453u;
+    uint word = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+uint latticeHash(ivec3 c, uint seed) {
+    uvec3 u = uvec3(c);
+    uint v = pcgHash32(u.x ^ seed);
+    v = pcgHash32(u.y ^ v);
+    v = pcgHash32(u.z ^ v);
+    return v;
+}
+
 float fade1(float t) {
     return t * t * (3.0 - 2.0 * t);
 }
@@ -13,28 +31,25 @@ vec3 fade3(vec3 v) {
     return vec3(fade1(v.x), fade1(v.y), fade1(v.z));
 }
 
-float hash13(vec3 p, float seed) {
-    return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719)) + seed) * 43758.5453);
-}
-
 float valueNoise(vec3 p, float seed) {
     vec3 i = floor(p);
     vec3 f = fract(p);
     vec3 u = fade3(f);
+    ivec3 cell = ivec3(i);
+    uint baseSeed = uint(seed);
+    float c000 = hash13(i + vec3(0.0, 0.0, 0.0), float(latticeHash(cell + ivec3(0, 0, 0), baseSeed)));
+    float c100 = hash13(i + vec3(1.0, 0.0, 0.0), float(latticeHash(cell + ivec3(1, 0, 0), baseSeed)));
+    float c010 = hash13(i + vec3(0.0, 1.0, 0.0), float(latticeHash(cell + ivec3(0, 1, 0), baseSeed)));
+    float c110 = hash13(i + vec3(1.0, 1.0, 0.0), float(latticeHash(cell + ivec3(1, 1, 0), baseSeed)));
+    float c001 = hash13(i + vec3(0.0, 0.0, 1.0), float(latticeHash(cell + ivec3(0, 0, 1), baseSeed)));
+    float c101 = hash13(i + vec3(1.0, 0.0, 1.0), float(latticeHash(cell + ivec3(1, 0, 1), baseSeed)));
+    float c011 = hash13(i + vec3(0.0, 1.0, 1.0), float(latticeHash(cell + ivec3(0, 1, 1), baseSeed)));
+    float c111 = hash13(i + vec3(1.0, 1.0, 1.0), float(latticeHash(cell + ivec3(1, 1, 1), baseSeed)));
 
-    float n000 = hash13(i + vec3(0.0, 0.0, 0.0), seed);
-    float n100 = hash13(i + vec3(1.0, 0.0, 0.0), seed + 13.0);
-    float n010 = hash13(i + vec3(0.0, 1.0, 0.0), seed + 57.0);
-    float n110 = hash13(i + vec3(1.0, 1.0, 0.0), seed + 71.0);
-    float n001 = hash13(i + vec3(0.0, 0.0, 1.0), seed + 101.0);
-    float n101 = hash13(i + vec3(1.0, 0.0, 1.0), seed + 127.0);
-    float n011 = hash13(i + vec3(0.0, 1.0, 1.0), seed + 181.0);
-    float n111 = hash13(i + vec3(1.0, 1.0, 1.0), seed + 223.0);
-
-    float nx00 = mix(n000, n100, u.x);
-    float nx10 = mix(n010, n110, u.x);
-    float nx01 = mix(n001, n101, u.x);
-    float nx11 = mix(n011, n111, u.x);
+    float nx00 = mix(c000, c100, u.x);
+    float nx10 = mix(c010, c110, u.x);
+    float nx01 = mix(c001, c101, u.x);
+    float nx11 = mix(c011, c111, u.x);
     float nxy0 = mix(nx00, nx10, u.y);
     float nxy1 = mix(nx01, nx11, u.y);
     return mix(nxy0, nxy1, u.z);

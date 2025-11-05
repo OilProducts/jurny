@@ -4,6 +4,7 @@
 #include <cmath>
 #include <glm/common.hpp>
 #include <glm/vec2.hpp>
+#include <glm/vec3.hpp>
 #include <glm/geometric.hpp>
 
 namespace math {
@@ -11,6 +12,19 @@ namespace {
 constexpr float kPersistenceContinent = 0.55f;
 constexpr float kPersistenceDetail    = 0.5f;
 constexpr float kPersistenceCave      = 0.5f;
+
+inline std::uint32_t pcgHash32(std::uint32_t v) {
+    v = v * 747796405u + 2891336453u;
+    const std::uint32_t word = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+inline std::uint32_t latticeHash(const glm::ivec3& c, std::uint32_t seed) {
+    std::uint32_t v = pcgHash32(static_cast<std::uint32_t>(c.x) ^ seed);
+    v = pcgHash32(static_cast<std::uint32_t>(c.y) ^ v);
+    v = pcgHash32(static_cast<std::uint32_t>(c.z) ^ v);
+    return v;
+}
 
 inline float fade(float t) {
     return t * t * (3.0f - 2.0f * t);
@@ -30,13 +44,14 @@ float valueNoise(const glm::vec3& p, std::uint32_t seed) {
     const glm::vec3 i = glm::floor(p);
     const glm::vec3 f = glm::fract(p);
     const glm::vec3 u = fade3(f);
+    const glm::ivec3 cell = glm::ivec3(i);
 
     const auto corner = [&](int ox, int oy, int oz) {
         const glm::vec3 offset(static_cast<float>(ox),
                                static_cast<float>(oy),
                                static_cast<float>(oz));
-        const std::uint32_t cornerSeed =
-            seed + static_cast<std::uint32_t>(ox + oy * 17 + oz * 131);
+        const glm::ivec3 cornerIdx = cell + glm::ivec3(ox, oy, oz);
+        const std::uint32_t cornerSeed = latticeHash(cornerIdx, seed);
         const glm::vec3 pos = i + offset;
         return hash(pos, cornerSeed);
     };
