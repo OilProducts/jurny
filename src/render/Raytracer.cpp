@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cerrno>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <cctype>
 #include <utility>
 #include <unordered_map>
+#include <memory>
 
 namespace render {
 
@@ -346,7 +348,56 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     plci.pSetLayouts = &setLayout_;
     if (vkCreatePipelineLayout(vk.device(), &plci, nullptr, &pipeLayout_) != VK_SUCCESS) return false;
 
-    auto readFile = [](const char* path)->std::vector<uint32_t>{ std::vector<uint32_t> out; FILE* f=fopen(path,"rb"); if(!f) return out; fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET); out.resize((sz+3)/4); fread(out.data(),1,sz,f); fclose(f); return out; };
+    auto readFile = [](const char* path) -> std::vector<uint32_t> {
+        struct FileCloser {
+            void operator()(FILE* f) const noexcept { if (f) std::fclose(f); }
+        };
+        std::vector<uint32_t> words;
+        FILE* raw = std::fopen(path, "rb");
+        if (!raw) {
+            const int err = errno;
+            spdlog::error("Failed to open shader {}: {}", path, std::strerror(err));
+            return {};
+        }
+        std::unique_ptr<FILE, FileCloser> file(raw);
+        if (std::fseek(file.get(), 0, SEEK_END) != 0) {
+            const int err = errno;
+            spdlog::error("Failed to seek to end of shader {}: {}", path, std::strerror(err));
+            return {};
+        }
+        long end = std::ftell(file.get());
+        if (end < 0) {
+            const int err = errno;
+            spdlog::error("Failed to ftell shader {}: {}", path, std::strerror(err));
+            return {};
+        }
+        if (std::fseek(file.get(), 0, SEEK_SET) != 0) {
+            const int err = errno;
+            spdlog::error("Failed to rewind shader {}: {}", path, std::strerror(err));
+            return {};
+        }
+        const size_t size = static_cast<size_t>(end);
+        if (size == 0) {
+            spdlog::error("Shader {} is empty", path);
+            return {};
+        }
+        if ((size % sizeof(uint32_t)) != 0u) {
+            spdlog::error("Shader {} has byte size {} which is not aligned to 4 bytes", path, size);
+            return {};
+        }
+        words.resize(size / sizeof(uint32_t));
+        const size_t read = std::fread(words.data(), 1, size, file.get());
+        if (read != size) {
+            if (std::ferror(file.get())) {
+                const int err = errno;
+                spdlog::error("Failed while reading shader {}: {}", path, std::strerror(err));
+            } else {
+                spdlog::error("Unexpected EOF while reading shader {} (expected {} bytes, got {})", path, size, read);
+            }
+            return {};
+        }
+        return words;
+    };
     auto loadShader = [&](const char* rel)->VkShaderModule{
         const char* envAssets = std::getenv("VOXEL_ASSETS_DIR");
         const char* assetsDir = envAssets ? envAssets :
@@ -357,7 +408,7 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
 #endif
         std::string base = std::string(assetsDir) + "/shaders/";
         std::vector<uint32_t> spv = readFile((base + rel).c_str());
-        if (spv.empty()) { spdlog::error("Failed to load shader %s%s", base.c_str(), rel); return VK_NULL_HANDLE; }
+        if (spv.empty()) return VK_NULL_HANDLE;
         VkShaderModuleCreateInfo smci{};
         smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         smci.codeSize = spv.size() * sizeof(uint32_t);

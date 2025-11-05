@@ -8,7 +8,7 @@ Current status
 - See `docs/01-repository-layout.md` and `docs/02-build-system-and-dependencies.md` for intent.
 
 Build
-- Prereqs: CMake >= 3.24, C++20 compiler, Vulkan SDK (for `glslc`).
+- Prereqs: CMake >= 3.24, C++20 compiler, Vulkan headers + shader compiler (`sudo apt install libvulkan-dev glslc` or install the Vulkan SDK), and X11 development headers so GLFW can configure (Ubuntu/Debian: `sudo apt install libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev`).
 - Configure: `cmake -S . -B build -G "Ninja" -DCMAKE_BUILD_TYPE=RelWithDebInfo`
 - Build: `cmake --build build -j`
 - Notes:
