@@ -605,18 +605,18 @@ void Raytracer::destroyDescriptors(platform::VulkanContext& vk) {
 bool Raytracer::createWorld(platform::VulkanContext& vk) {
     brickStore_ = std::make_unique<world::BrickStore>();
     auto& store = *brickStore_;
-    math::PlanetParams P{ 100.0, 12.0, 100.0, 24.0 };
-    noiseParams_.continentFrequency = 0.035f;
-    noiseParams_.continentAmplitude = 14.0f;
-    noiseParams_.continentOctaves   = 5;
-    noiseParams_.detailFrequency    = 0.18f;
-    noiseParams_.detailAmplitude    = 3.5f;
+    math::PlanetParams P{ 100.0, 120.0, 100.0, 160.0 }; // base radius, trench depth, sea level, max height
+    noiseParams_.continentFrequency = 0.02f;
+    noiseParams_.continentAmplitude = 120.0f;
+    noiseParams_.continentOctaves   = 6;
+    noiseParams_.detailFrequency    = 0.12f;
+    noiseParams_.detailAmplitude    = 20.0f;
     noiseParams_.detailOctaves      = 4;
-    noiseParams_.warpFrequency      = 0.25f;
-    noiseParams_.warpAmplitude      = 0.7f;
-    noiseParams_.caveFrequency      = 0.45f;
-    noiseParams_.caveAmplitude      = 5.0f;
-    noiseParams_.caveThreshold      = 0.3f;
+    noiseParams_.warpFrequency      = 0.18f;
+    noiseParams_.warpAmplitude      = 2.5f;
+    noiseParams_.caveFrequency      = 0.4f;
+    noiseParams_.caveAmplitude      = 6.0f;
+    noiseParams_.caveThreshold      = 0.35f;
     worldSeed_ = 1337u;
     store.configure(P, /*voxelSize*/0.5f, /*brickDim*/VOXEL_BRICK_SIZE, noiseParams_, worldSeed_, assets_);
 

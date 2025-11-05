@@ -102,8 +102,8 @@ bool UploadContext::ensureStagingCapacity(VkDeviceSize bytes) {
     }
 
     stagingCapacity_ = newCapacity;
-    spdlog::info("UploadContext: staging buffer resize -> {} bytes (requested {})",
-                 static_cast<uint64_t>(stagingCapacity_), static_cast<uint64_t>(bytes));
+    spdlog::debug("UploadContext: staging buffer resize -> {} bytes (requested {})",
+                  static_cast<uint64_t>(stagingCapacity_), static_cast<uint64_t>(bytes));
     return true;
 }
 
@@ -144,11 +144,11 @@ bool UploadContext::uploadBufferRegion(const void* data,
         return false;
     }
 
-    spdlog::info("UploadContext: copy request bytes={} dstBuffer={} dstOffset={} stagingCapacity={}",
-                 static_cast<uint64_t>(bytes),
-                 static_cast<const void*>(dstBuffer),
-                 static_cast<uint64_t>(dstOffset),
-                 static_cast<uint64_t>(stagingCapacity_));
+    spdlog::debug("UploadContext: copy request bytes={} dstBuffer={} dstOffset={} stagingCapacity={}",
+                  static_cast<uint64_t>(bytes),
+                  static_cast<const void*>(dstBuffer),
+                  static_cast<uint64_t>(dstOffset),
+                  static_cast<uint64_t>(stagingCapacity_));
 
     void* mapped = nullptr;
     if (vkMapMemory(vk_->device(), stagingMemory_, 0, bytes, 0, &mapped) != VK_SUCCESS || mapped == nullptr) {
@@ -165,7 +165,7 @@ bool UploadContext::uploadBufferRegion(const void* data,
         return false;
     }
     vkResetFences(vk_->device(), 1, &fence_);
-    spdlog::info("UploadContext: fence cleared before submit (bytes={})", static_cast<uint64_t>(bytes));
+    spdlog::debug("UploadContext: fence cleared before submit (bytes={})", static_cast<uint64_t>(bytes));
 
     vkResetCommandPool(vk_->device(), commandPool_, 0);
     VkCommandBufferBeginInfo bi{};
@@ -190,7 +190,7 @@ bool UploadContext::uploadBufferRegion(const void* data,
         return false;
     }
 
-    spdlog::info("UploadContext: submitted copy bytes={} queueFamily={}", static_cast<uint64_t>(bytes), queueFamily_);
+    spdlog::debug("UploadContext: submitted copy bytes={} queueFamily={}", static_cast<uint64_t>(bytes), queueFamily_);
 
     waitRes = vkWaitForFences(vk_->device(), 1, &fence_, VK_TRUE, UINT64_MAX);
     if (waitRes != VK_SUCCESS) {
@@ -198,7 +198,7 @@ bool UploadContext::uploadBufferRegion(const void* data,
         deviceLost_ = (waitRes == VK_ERROR_DEVICE_LOST);
         return false;
     }
-    spdlog::info("UploadContext: copy complete bytes={}", static_cast<uint64_t>(bytes));
+    spdlog::debug("UploadContext: copy complete bytes={}", static_cast<uint64_t>(bytes));
     return true;
 }
 

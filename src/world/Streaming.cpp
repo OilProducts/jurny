@@ -414,8 +414,6 @@ std::vector<glm::ivec3> Streaming::enumerateRegionBricks(const glm::ivec3& regio
         spdlog::debug("Streaming: region ({}, {}, {}) yielded 0 bricks (shell=[{}, {}])",
                       regionCoord.x, regionCoord.y, regionCoord.z, shellInner, shellOuter);
     } else {
-        const float brickSize = store_->brickSize();
-        const float brickHalfDiag = 0.5f * brickSize * std::sqrt(3.0f);
         glm::vec3 center = (glm::vec3(bricks.front()) + glm::vec3(0.5f)) * brickSize;
         float radius = glm::length(center);
         spdlog::debug("Streaming: region ({}, {}, {}) kept {} bricks; first radius={} shell=[{}, {}] halfDiag={}",

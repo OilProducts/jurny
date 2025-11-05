@@ -200,7 +200,9 @@ private:
     static constexpr uint32_t kMaterialWordsPerBrick = 128;
     static constexpr uint32_t kPaletteEntriesPerBrick = 16;
     static constexpr uint32_t kFieldValuesPerBrick =
-        (VOXEL_BRICK_SIZE + 1) * (VOXEL_BRICK_SIZE + 1) * (VOXEL_BRICK_SIZE + 1);
+        (VOXEL_BRICK_SIZE + 1 + 2 * world::kFieldApron) *
+        (VOXEL_BRICK_SIZE + 1 + 2 * world::kFieldApron) *
+        (VOXEL_BRICK_SIZE + 1 + 2 * world::kFieldApron);
 };
 
 }

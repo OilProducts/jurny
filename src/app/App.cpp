@@ -17,6 +17,7 @@
 #include <utility>
 #include <sstream>
 #include <iomanip>
+#include <thread>
 #include <glm/glm.hpp>
 #include <glm/geometric.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -111,13 +112,70 @@ int App::run() {
         spdlog::warn("Asset directory not specified; proceeding without packed assets");
     }
 
-    VkCommandBuffer cb{};
+    struct FrameSync {
+        VkSemaphore imageAvailable = VK_NULL_HANDLE;
+        VkSemaphore renderFinished = VK_NULL_HANDLE;
+        VkFence inFlight = VK_NULL_HANDLE;
+    };
+    uint32_t maxFramesInFlight = std::min<uint32_t>(swap.imageCount(), 2u);
+    if (maxFramesInFlight == 0u) {
+        maxFramesInFlight = 1u;
+    }
+    std::vector<VkCommandBuffer> commandBuffers(maxFramesInFlight);
     VkCommandBufferAllocateInfo cbai{};
     cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cbai.commandPool = vk.commandPool();
     cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    vkAllocateCommandBuffers(vk.device(), &cbai, &cb);
+    cbai.commandBufferCount = maxFramesInFlight;
+    if (vkAllocateCommandBuffers(vk.device(), &cbai, commandBuffers.data()) != VK_SUCCESS) {
+        spdlog::error("Failed to allocate command buffers");
+        return 1;
+    }
+
+    std::vector<FrameSync> frames(maxFramesInFlight);
+    std::vector<VkFence> imagesInFlight(swap.imageCount(), VK_NULL_HANDLE);
+
+    VkSemaphoreCreateInfo sciSem{};
+    sciSem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    for (auto& frame : frames) {
+        if (vkCreateSemaphore(vk.device(), &sciSem, nullptr, &frame.imageAvailable) != VK_SUCCESS ||
+            vkCreateSemaphore(vk.device(), &sciSem, nullptr, &frame.renderFinished) != VK_SUCCESS ||
+            vkCreateFence(vk.device(), &fci, nullptr, &frame.inFlight) != VK_SUCCESS) {
+            spdlog::error("Failed to create per-frame synchronization primitives");
+            return 1;
+        }
+    }
+    uint32_t currentFrame = 0;
+
+#if VOXEL_ENABLE_WINDOW
+    auto pumpEvents = [&]() {
+        window.poll();
+        glfwWaitEventsTimeout(0.001);
+    };
+#else
+    auto pumpEvents = [&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    };
+#endif
+
+    auto waitFenceResponsive = [&](VkFence fence) -> bool {
+        if (fence == VK_NULL_HANDLE) return true;
+        while (true) {
+            VkResult res = vkWaitForFences(vk.device(), 1, &fence, VK_TRUE, 0);
+            if (res == VK_SUCCESS) {
+                return true;
+            }
+            if (res == VK_TIMEOUT) {
+                pumpEvents();
+                continue;
+            }
+            spdlog::error("vkWaitForFences failed ({})", int(res));
+            return false;
+        }
+    };
 
     // Initialize Raytracer M1 skeleton
     render::Raytracer ray;
@@ -154,12 +212,6 @@ int App::run() {
     } else {
         spdlog::warn("Streaming not initialized: no brick store available");
     }
-    VkSemaphoreCreateInfo sciSem{};
-    sciSem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-    VkSemaphore acquireSem{};
-    VkSemaphore finishSem{};
-    vkCreateSemaphore(vk.device(), &sciSem, nullptr, &acquireSem);
-    vkCreateSemaphore(vk.device(), &sciSem, nullptr, &finishSem);
     auto t0 = std::chrono::steady_clock::now();
     auto last = t0;
     uint32_t frameCounter = 0;
@@ -204,16 +256,42 @@ int App::run() {
     bool firstMouse = true;
     double lastX = 0.0, lastY = 0.0;
 #if VOXEL_ENABLE_WINDOW
-    glfwSetInputMode(window.handle(), GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    glfwSetInputMode(window.handle(), GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+    const bool rawMouseSupported = glfwRawMouseMotionSupported() == GLFW_TRUE;
+    if (rawMouseSupported) {
+        glfwSetInputMode(window.handle(), GLFW_RAW_MOUSE_MOTION, GLFW_FALSE);
+    }
 #endif
+    bool cursorCaptured = false;
     size_t debugFrameSerial = 0;
     while (!window.shouldClose()) {
+        FrameSync& frame = frames[currentFrame];
+        if (!waitFenceResponsive(frame.inFlight)) {
+            spdlog::error("Failed to wait for in-flight fence");
+            break;
+        }
+#if VOXEL_ENABLE_WINDOW
         window.poll();
+#endif
         uint32_t idx = 0;
-        VkResult acquireRes = vkAcquireNextImageKHR(vk.device(), swap.handle(), UINT64_MAX, acquireSem, VK_NULL_HANDLE, &idx);
+        VkResult acquireRes = vkAcquireNextImageKHR(vk.device(), swap.handle(), UINT64_MAX, frame.imageAvailable, VK_NULL_HANDLE, &idx);
         if (acquireRes != VK_SUCCESS) {
             spdlog::error("vkAcquireNextImageKHR failed ({})", int(acquireRes));
-            frameGraph.endFrame();
+            break;
+        }
+
+        if (idx < imagesInFlight.size() && imagesInFlight[idx] != VK_NULL_HANDLE) {
+            if (!waitFenceResponsive(imagesInFlight[idx])) {
+                spdlog::error("Failed to wait on image fence");
+                break;
+            }
+        }
+        if (idx < imagesInFlight.size()) {
+            imagesInFlight[idx] = frame.inFlight;
+        }
+
+        if (vkResetFences(vk.device(), 1, &frame.inFlight) != VK_SUCCESS) {
+            spdlog::error("vkResetFences failed");
             break;
         }
 
@@ -265,6 +343,25 @@ int App::run() {
         glm::vec3 forward;
         glm::vec3 up(0.0f, 0.0f, 1.0f);
 #if VOXEL_ENABLE_WINDOW
+        int captureState = glfwGetMouseButton(window.handle(), GLFW_MOUSE_BUTTON_LEFT);
+        bool capturePressed = (captureState == GLFW_PRESS);
+        if (capturePressed != cursorCaptured) {
+            cursorCaptured = capturePressed;
+            if (cursorCaptured) {
+                glfwSetInputMode(window.handle(), GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                if (rawMouseSupported) {
+                    glfwSetInputMode(window.handle(), GLFW_RAW_MOUSE_MOTION, GLFW_TRUE);
+                }
+                firstMouse = true;
+            } else {
+                glfwSetInputMode(window.handle(), GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                if (rawMouseSupported) {
+                    glfwSetInputMode(window.handle(), GLFW_RAW_MOUSE_MOTION, GLFW_FALSE);
+                }
+                firstMouse = true;
+            }
+        }
+
         double mouseX, mouseY;
         glfwGetCursorPos(window.handle(), &mouseX, &mouseY);
         if (firstMouse) {
@@ -272,10 +369,18 @@ int App::run() {
             lastY = mouseY;
             firstMouse = false;
         }
-        double xoffset = mouseX - lastX;
-        double yoffset = mouseY - lastY;
+        double xoffset = 0.0;
+        double yoffset = 0.0;
+        if (cursorCaptured) {
+            xoffset = mouseX - lastX;
+            yoffset = mouseY - lastY;
+        }
         lastX = mouseX;
         lastY = mouseY;
+        if (!cursorCaptured) {
+            xoffset = 0.0;
+            yoffset = 0.0;
+        }
         const float sensitivity = 0.08f;
         yawDeg += static_cast<float>(xoffset) * sensitivity;
         pitchDeg += static_cast<float>(yoffset) * sensitivity;
@@ -452,7 +557,7 @@ int App::run() {
         prevProjMat = P;
         prevRenderOrigin = camWorld;
 
-        constexpr size_t kOverlayMaxCols = 64;
+        constexpr size_t kOverlayMaxCols = 96;
         const auto statsOverlay = streaming.stats();
         std::vector<std::string> overlayLines;
         overlayLines.reserve(6);
@@ -603,6 +708,9 @@ int App::run() {
                                  1, &barrier);
         });
 
+        VkCommandBuffer cb = commandBuffers[currentFrame];
+        vkResetCommandBuffer(cb, 0);
+
         VkCommandBufferBeginInfo bi{};
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         vkBeginCommandBuffer(cb, &bi);
@@ -616,25 +724,29 @@ int App::run() {
         VkSubmitInfo si{};
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.waitSemaphoreCount = 1;
-        si.pWaitSemaphores = &acquireSem;
+        si.pWaitSemaphores = &frame.imageAvailable;
         si.pWaitDstStageMask = &waitStage;
         si.commandBufferCount = 1;
         si.pCommandBuffers = &cb;
         si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &finishSem;
+        si.pSignalSemaphores = &frame.renderFinished;
         auto submitStart = std::chrono::steady_clock::now();
-        vkQueueSubmit(vk.graphicsQueue(), 1, &si, VK_NULL_HANDLE);
+        VkResult submitRes = vkQueueSubmit(vk.graphicsQueue(), 1, &si, frame.inFlight);
         auto submitEnd = std::chrono::steady_clock::now();
         if (logFrame) {
             double submitMs = std::chrono::duration<double, std::milli>(submitEnd - submitStart).count();
             spdlog::info("Frame {} submitted ({:.3f} ms)", debugFrameSerial, submitMs);
+        }
+        if (submitRes != VK_SUCCESS) {
+            spdlog::error("vkQueueSubmit failed ({})", int(submitRes));
+            break;
         }
 
         VkPresentInfoKHR pi{};
         pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         VkSwapchainKHR sc = swap.handle();
         pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &finishSem;
+        pi.pWaitSemaphores = &frame.renderFinished;
         pi.swapchainCount = 1;
         pi.pSwapchains = &sc;
         pi.pImageIndices = &idx;
@@ -644,19 +756,6 @@ int App::run() {
         if (logFrame) {
             double presentMs = std::chrono::duration<double, std::milli>(presentEnd - presentStart).count();
             spdlog::info("Frame {} presented ({:.3f} ms)", debugFrameSerial, presentMs);
-        }
-        auto waitStart = std::chrono::steady_clock::now();
-        VkResult waitRes = vkQueueWaitIdle(vk.graphicsQueue());
-        auto waitEnd = std::chrono::steady_clock::now();
-        if (logFrame) {
-            double waitMs = std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();
-            spdlog::info("Frame {} queue idle ({:.3f} ms)", debugFrameSerial, waitMs);
-        }
-
-        if (waitRes != VK_SUCCESS) {
-            spdlog::error("vkQueueWaitIdle failed ({})", int(waitRes));
-            frameGraph.endFrame();
-            break;
         }
 
         ray.collectGpuTimings(vk, currentFrameIdx);
@@ -671,9 +770,15 @@ int App::run() {
         if (logFrame) {
             spdlog::info("Frame {} loop end", debugFrameSerial);
         }
+        currentFrame = (currentFrame + 1) % maxFramesInFlight;
     }
 
-    vkDestroySemaphore(vk.device(), finishSem, nullptr); vkDestroySemaphore(vk.device(), acquireSem, nullptr);
+    vkFreeCommandBuffers(vk.device(), vk.commandPool(), static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
+    for (auto& frame : frames) {
+        if (frame.imageAvailable) vkDestroySemaphore(vk.device(), frame.imageAvailable, nullptr);
+        if (frame.renderFinished) vkDestroySemaphore(vk.device(), frame.renderFinished, nullptr);
+        if (frame.inFlight) vkDestroyFence(vk.device(), frame.inFlight, nullptr);
+    }
     streaming.shutdown();
     jobs.stop();
     ray.shutdown(vk);

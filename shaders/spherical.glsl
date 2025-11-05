@@ -4,9 +4,11 @@
 const float PERSISTENCE_CONTINENT = 0.55;
 const float PERSISTENCE_DETAIL    = 0.5;
 const float PERSISTENCE_CAVE      = 0.5;
+const float HASH_SCALE            = 1.0 / 512.0;
 
-float hash13(vec3 p, float seed) {
-    return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719)) + seed) * 43758.5453);
+float hash13(vec3 p, uint seed) {
+    float n = dot(p, vec3(12.9898, 78.233, 37.719)) + float(seed) * HASH_SCALE;
+    return fract(sin(n) * 43758.5453);
 }
 
 uint pcgHash32(uint v) {
@@ -31,20 +33,20 @@ vec3 fade3(vec3 v) {
     return vec3(fade1(v.x), fade1(v.y), fade1(v.z));
 }
 
-float valueNoise(vec3 p, float seed) {
+float valueNoise(vec3 p, uint seed) {
     vec3 i = floor(p);
     vec3 f = fract(p);
     vec3 u = fade3(f);
     ivec3 cell = ivec3(i);
-    uint baseSeed = uint(seed);
-    float c000 = hash13(i + vec3(0.0, 0.0, 0.0), float(latticeHash(cell + ivec3(0, 0, 0), baseSeed)));
-    float c100 = hash13(i + vec3(1.0, 0.0, 0.0), float(latticeHash(cell + ivec3(1, 0, 0), baseSeed)));
-    float c010 = hash13(i + vec3(0.0, 1.0, 0.0), float(latticeHash(cell + ivec3(0, 1, 0), baseSeed)));
-    float c110 = hash13(i + vec3(1.0, 1.0, 0.0), float(latticeHash(cell + ivec3(1, 1, 0), baseSeed)));
-    float c001 = hash13(i + vec3(0.0, 0.0, 1.0), float(latticeHash(cell + ivec3(0, 0, 1), baseSeed)));
-    float c101 = hash13(i + vec3(1.0, 0.0, 1.0), float(latticeHash(cell + ivec3(1, 0, 1), baseSeed)));
-    float c011 = hash13(i + vec3(0.0, 1.0, 1.0), float(latticeHash(cell + ivec3(0, 1, 1), baseSeed)));
-    float c111 = hash13(i + vec3(1.0, 1.0, 1.0), float(latticeHash(cell + ivec3(1, 1, 1), baseSeed)));
+    uint baseSeed = seed;
+    float c000 = hash13(i + vec3(0.0, 0.0, 0.0), latticeHash(cell + ivec3(0, 0, 0), baseSeed));
+    float c100 = hash13(i + vec3(1.0, 0.0, 0.0), latticeHash(cell + ivec3(1, 0, 0), baseSeed));
+    float c010 = hash13(i + vec3(0.0, 1.0, 0.0), latticeHash(cell + ivec3(0, 1, 0), baseSeed));
+    float c110 = hash13(i + vec3(1.0, 1.0, 0.0), latticeHash(cell + ivec3(1, 1, 0), baseSeed));
+    float c001 = hash13(i + vec3(0.0, 0.0, 1.0), latticeHash(cell + ivec3(0, 0, 1), baseSeed));
+    float c101 = hash13(i + vec3(1.0, 0.0, 1.0), latticeHash(cell + ivec3(1, 0, 1), baseSeed));
+    float c011 = hash13(i + vec3(0.0, 1.0, 1.0), latticeHash(cell + ivec3(0, 1, 1), baseSeed));
+    float c111 = hash13(i + vec3(1.0, 1.0, 1.0), latticeHash(cell + ivec3(1, 1, 1), baseSeed));
 
     float nx00 = mix(c000, c100, u.x);
     float nx10 = mix(c010, c110, u.x);
@@ -55,13 +57,17 @@ float valueNoise(vec3 p, float seed) {
     return mix(nxy0, nxy1, u.z);
 }
 
-float fbm(vec3 p, float baseFrequency, int octaves, float persistence, float seedOffset) {
+float fbm(vec3 p, float baseFrequency, int octaves, float persistence, uint seed) {
+    if (baseFrequency <= 0.0 || octaves <= 0) {
+        return 0.0;
+    }
     float amplitude = 1.0;
     float frequency = baseFrequency;
     float sum = 0.0;
     float norm = 0.0;
     for (int i = 0; i < octaves; ++i) {
-        sum += amplitude * valueNoise(p * frequency, seedOffset + float(i) * 97.0);
+        uint octaveSeed = seed + uint(i) * 97u;
+        sum += amplitude * valueNoise(p * frequency, octaveSeed);
         norm += amplitude;
         frequency *= 2.0;
         amplitude *= persistence;
@@ -71,12 +77,35 @@ float fbm(vec3 p, float baseFrequency, int octaves, float persistence, float see
     return result * 2.0 - 1.0;
 }
 
+void enu(vec3 p, out vec3 east, out vec3 north, out vec3 up) {
+    up = normalize(p);
+    if (dot(up, up) <= 0.0) {
+        up = vec3(0.0, 0.0, 1.0);
+    }
+    vec3 z = vec3(0.0, 0.0, 1.0);
+    east = normalize(cross(z, up));
+    if (dot(east, east) < 1e-6) {
+        east = vec3(1.0, 0.0, 0.0);
+    }
+    north = cross(up, east);
+}
+
+float smoothClamp(float value, float lo, float hi, float transition) {
+    if (transition <= 0.0 || hi <= lo) {
+        return clamp(value, lo, hi);
+    }
+    float tLo = smoothstep(lo - transition, lo + transition, value);
+    float vLo = mix(lo, value, tLo);
+    float tHi = smoothstep(hi - transition, hi + transition, value);
+    return mix(vLo, hi, tHi);
+}
+
 vec3 domainWarp(vec3 p) {
     if (g.noiseWarpAmp <= 0.0 || g.noiseWarpFreq <= 0.0) return p;
     int detailOct = max(int(g.noiseDetailOctaves), 1);
-    float fx = fbm(p + vec3(31.7, 17.3, 13.1), g.noiseWarpFreq, detailOct, PERSISTENCE_DETAIL, float(g.noiseSeed) + 233.0);
-    float fy = fbm(p + vec3(11.1, 53.2, 27.8), g.noiseWarpFreq, detailOct, PERSISTENCE_DETAIL, float(g.noiseSeed) + 389.0);
-    float fz = fbm(p + vec3(91.7, 45.3, 67.1), g.noiseWarpFreq, detailOct, PERSISTENCE_DETAIL, float(g.noiseSeed) + 521.0);
+    float fx = fbm(p + vec3(31.7, 17.3, 13.1), g.noiseWarpFreq, detailOct, PERSISTENCE_DETAIL, g.noiseSeed + 233u);
+    float fy = fbm(p + vec3(11.1, 53.2, 27.8), g.noiseWarpFreq, detailOct, PERSISTENCE_DETAIL, g.noiseSeed + 389u);
+    float fz = fbm(p + vec3(91.7, 45.3, 67.1), g.noiseWarpFreq, detailOct, PERSISTENCE_DETAIL, g.noiseSeed + 521u);
     vec3 warp = vec3(fx, fy, fz);
     return p + warp * g.noiseWarpAmp;
 }
@@ -88,15 +117,43 @@ float F_crust(in vec3 p) {
     vec3 warped = domainWarp(dir);
     int contOct = max(int(g.noiseContinentOctaves), 1);
     int detailOct = max(int(g.noiseDetailOctaves), 1);
-    int caveOct = max(int(g.noiseCaveOctaves), 1);
-    float continents = fbm(warped, g.noiseContinentFreq, contOct, PERSISTENCE_CONTINENT, float(g.noiseSeed));
-    float detail = fbm(warped * 2.0, g.noiseDetailFreq, detailOct, PERSISTENCE_DETAIL, float(g.noiseSeed) + 613.0);
-    float height = g.noiseContinentAmp * continents + g.noiseDetailAmp * detail;
-    height = clamp(height, g.noiseMinHeight, g.noiseMaxHeight);
+    float continents = fbm(warped, g.noiseContinentFreq, contOct, PERSISTENCE_CONTINENT, g.noiseSeed);
+    float detail = fbm(warped * 2.0, g.noiseDetailFreq, detailOct, PERSISTENCE_DETAIL, g.noiseSeed + 613u);
+
+    float continentHeight = g.noiseContinentAmp * continents;
+
+    float slopeMask = 0.0;
+    if (g.noiseContinentAmp > 0.0 && g.noiseContinentFreq > 0.0) {
+        vec3 east, north, up;
+        enu(dir, east, north, up);
+        float gradStep = 0.02;
+        int slopeOct = contOct;
+        float continentsEast = fbm(warped + east * gradStep, g.noiseContinentFreq, slopeOct, PERSISTENCE_CONTINENT, g.noiseSeed);
+        float continentsNorth = fbm(warped + north * gradStep, g.noiseContinentFreq, slopeOct, PERSISTENCE_CONTINENT, g.noiseSeed);
+        float slope = length(vec2(continentsEast - continents, continentsNorth - continents)) / gradStep;
+        slopeMask = smoothstep(0.3, 1.2, slope);
+    }
+
+    float detailMask = 1.0 - smoothstep(0.55, 0.95, continents * 0.5 + 0.5);
+    float detailStrength = mix(1.0, 0.25, slopeMask);
+    float detailContribution = g.noiseDetailAmp * detailMask * detailStrength * detail;
+    float height = continentHeight + detailContribution;
+    if (slopeMask > 0.0) {
+        float slopeFlatten = mix(0.0, g.noiseContinentAmp * 0.3, slopeMask);
+        height = mix(height, height - slopeFlatten, slopeMask);
+    }
+
+    float minHeight = g.noiseMinHeight;
+    float maxHeight = g.noiseMaxHeight;
+    float trench = -minHeight;
+    float plateau = max(12.0, max(trench * 0.35, maxHeight * 0.4));
+    height = smoothClamp(height, minHeight, maxHeight, plateau);
+
     float surfaceRadius = g.planetRadius + height;
     float field = r - surfaceRadius;
-    if (field < 0.0 && g.noiseCaveAmp > 0.0) {
-        float cave = fbm(p, g.noiseCaveFreq, caveOct, PERSISTENCE_CAVE, float(g.noiseSeed) + 997.0);
+    if (field < 0.0 && g.noiseCaveAmp > 0.0 && g.noiseCaveFreq > 0.0) {
+        int caveOct = max(int(g.noiseCaveOctaves), 1);
+        float cave = fbm(p, g.noiseCaveFreq, caveOct, PERSISTENCE_CAVE, g.noiseSeed + 997u);
         float cavity = cave - g.noiseCaveThreshold;
         if (cavity > 0.0) {
             field += -g.noiseCaveAmp * cavity;

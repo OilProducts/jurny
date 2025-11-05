@@ -5,6 +5,7 @@
 // BrickFormats — packed GPU layouts and flags.
 namespace world {
 constexpr uint32_t kInvalidOffset = 0xFFFFFFFFu;
+constexpr int      kFieldApron    = 1;
 
 enum BrickFlags : uint16_t {
     kBrickUses4Bit = 1u << 0

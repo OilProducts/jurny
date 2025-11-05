@@ -93,7 +93,7 @@ void VulkanContext::setupDebugMessenger(bool enableValidation) {
     }
 }
 
-static bool supportsQueueFlags(VkQueueFamilyProperties2& props2, VkQueueFlags flags) {
+[[maybe_unused]] static bool supportsQueueFlags(VkQueueFamilyProperties2& props2, VkQueueFlags flags) {
     return (props2.queueFamilyProperties.queueFlags & flags) == flags;
 }
 

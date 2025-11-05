@@ -267,8 +267,10 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
     uint32_t count = firstLogs.load(std::memory_order_relaxed);
     if (count < 32) {
         if (firstLogs.compare_exchange_strong(count, count + 1, std::memory_order_relaxed)) {
-            spdlog::info("BrickStore::computeBrickData begin bc=({}, {}, {}) voxelSize={} brickSize={}",
-                         bc.x, bc.y, bc.z, voxelSize, brickSize);
+            spdlog::info("BrickStore::computeBrickData begin bc=({}, {}, {}) voxelSize={} brickSize={} shell=[{}, {}]",
+                         bc.x, bc.y, bc.z, voxelSize, brickSize,
+                         static_cast<float>(params_.R) - static_cast<float>(params_.T),
+                         static_cast<float>(params_.R) + static_cast<float>(params_.Hmax));
         }
     }
 
@@ -368,7 +370,13 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
                     any = true;
                 }
 
-                outMaterials[idx] = static_cast<uint16_t>(classifyMaterial(centerPos));
+                constexpr float kInteriorBias = 0.75f;
+                const float interiorThreshold = -voxelSize * kInteriorBias;
+                uint16_t materialId = 0u; // subterranean rock default
+                if (voxelField > interiorThreshold) {
+                    materialId = static_cast<uint16_t>(classifyMaterial(centerPos));
+                }
+                outMaterials[idx] = materialId;
             }
         }
     }
@@ -377,7 +385,8 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
         uint32_t cnt = firstLogs.load(std::memory_order_relaxed);
         if (cnt < 64) {
             if (firstLogs.compare_exchange_strong(cnt, cnt + 1, std::memory_order_relaxed)) {
-                spdlog::info("BrickStore::computeBrickData empty bc=({}, {}, {})", bc.x, bc.y, bc.z);
+                spdlog::info("BrickStore::computeBrickData empty bc=({}, {}, {}) minF={} maxF={}",
+                             bc.x, bc.y, bc.z, minFieldSample, maxFieldSample);
             }
         }
         outOcc.clear();
@@ -388,16 +397,18 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
 
     constexpr bool kCacheFieldSamples = true;
     if (kCacheFieldSamples) {
-        const int samplesPerAxis = brickDim + 1;
+        const int fieldApron = kFieldApron;
+        const int samplesPerAxis = brickDim + 1 + 2 * fieldApron;
         const size_t samplesPerBrick = static_cast<size_t>(samplesPerAxis) *
                                        static_cast<size_t>(samplesPerAxis) *
                                        static_cast<size_t>(samplesPerAxis);
         outField.resize(samplesPerBrick);
         size_t sampleIdx = 0;
+        const glm::vec3 fieldOrigin = brickOrigin - glm::vec3(fieldApron) * voxelSize;
         for (int iz = 0; iz < samplesPerAxis; ++iz) {
             for (int iy = 0; iy < samplesPerAxis; ++iy) {
                 for (int ix = 0; ix < samplesPerAxis; ++ix, ++sampleIdx) {
-                    glm::vec3 vertexPos = brickOrigin + glm::vec3(ix, iy, iz) * voxelSize;
+                    glm::vec3 vertexPos = fieldOrigin + glm::vec3(ix, iy, iz) * voxelSize;
                     float f = sampleField(vertexPos);
                     minFieldSample = std::min(minFieldSample, f);
                     maxFieldSample = std::max(maxFieldSample, f);

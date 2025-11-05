@@ -111,7 +111,8 @@ layout(set = 0, binding = 26, std430) readonly buffer FieldSamplesBuf {
   float fieldSamples[];
 };
 
-const uint FIELD_DIM   = uint(VOXEL_BRICK_SIZE + 1);
+const uint FIELD_APRON = 1u;
+const uint FIELD_DIM   = uint(VOXEL_BRICK_SIZE) + 1u + 2u * FIELD_APRON;
 const uint FIELD_PLANE = FIELD_DIM * FIELD_DIM;
 const uint FIELD_COUNT_PER_BRICK = FIELD_DIM * FIELD_PLANE;
 
@@ -221,18 +222,18 @@ bool brickHasOccupancy(const BrickHeader h) {
 
 float sampleBrickField(uint baseIndex, vec3 worldPos, const BrickHeader h) {
   vec3 brickOriginWorld = vec3(h.bx, h.by, h.bz) * g.brickSize;
-  vec3 local = (worldPos - brickOriginWorld) / g.voxelSize;
+  vec3 local = (worldPos - brickOriginWorld) / g.voxelSize + vec3(float(FIELD_APRON));
 
-  float fx = clamp(local.x, 0.0, float(VOXEL_BRICK_SIZE));
-  float fy = clamp(local.y, 0.0, float(VOXEL_BRICK_SIZE));
-  float fz = clamp(local.z, 0.0, float(VOXEL_BRICK_SIZE));
+  float fx = clamp(local.x, 0.0, float(FIELD_DIM - 1u));
+  float fy = clamp(local.y, 0.0, float(FIELD_DIM - 1u));
+  float fz = clamp(local.z, 0.0, float(FIELD_DIM - 1u));
 
-  int ix0 = clamp(int(floor(fx)), 0, VOXEL_BRICK_SIZE);
-  int iy0 = clamp(int(floor(fy)), 0, VOXEL_BRICK_SIZE);
-  int iz0 = clamp(int(floor(fz)), 0, VOXEL_BRICK_SIZE);
-  int ix1 = min(ix0 + 1, VOXEL_BRICK_SIZE);
-  int iy1 = min(iy0 + 1, VOXEL_BRICK_SIZE);
-  int iz1 = min(iz0 + 1, VOXEL_BRICK_SIZE);
+  int ix0 = clamp(int(floor(fx)), 0, int(FIELD_DIM) - 1);
+  int iy0 = clamp(int(floor(fy)), 0, int(FIELD_DIM) - 1);
+  int iz0 = clamp(int(floor(fz)), 0, int(FIELD_DIM) - 1);
+  int ix1 = min(ix0 + 1, int(FIELD_DIM) - 1);
+  int iy1 = min(iy0 + 1, int(FIELD_DIM) - 1);
+  int iz1 = min(iz0 + 1, int(FIELD_DIM) - 1);
 
   float tx = clamp(fx - float(ix0), 0.0, 1.0);
   float ty = clamp(fy - float(iy0), 0.0, 1.0);
