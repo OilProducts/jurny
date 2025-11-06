@@ -185,6 +185,16 @@ bool VulkanContext::createDevice(bool enableValidation, VkSurfaceKHR surface) {
             return false;
         }
     }
+    const bool wantsDynamicRenderingExt = deviceInfo_.apiVersion < VK_MAKE_VERSION(1, 3, 0);
+    bool dynamicRenderingViaExtension = false;
+    if (wantsDynamicRenderingExt) {
+        dynamicRenderingViaExtension = requestExtension(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, true);
+        if (!dynamicRenderingViaExtension) {
+            return false;
+        }
+    } else {
+        requestExtension(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, false);
+    }
 
     // Features chain
     VkPhysicalDeviceFeatures2 feats2{};
@@ -198,6 +208,8 @@ bool VulkanContext::createDevice(bool enableValidation, VkSurfaceKHR surface) {
     v13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     VkPhysicalDeviceSynchronization2FeaturesKHR sync2{};
     sync2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
+    VkPhysicalDeviceDynamicRenderingFeaturesKHR dynRendering{};
+    dynRendering.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR;
 
     feats2.pNext = &descIdx;
     descIdx.pNext = &v12;
@@ -205,11 +217,21 @@ bool VulkanContext::createDevice(bool enableValidation, VkSurfaceKHR surface) {
 
     const bool supportsVulkan13 = deviceInfo_.apiVersion >= VK_MAKE_VERSION(1, 3, 0);
     if (supportsVulkan13) {
-        v13.pNext = feats2.pNext;
+        dynRendering.pNext = feats2.pNext;
+        sync2.pNext = &dynRendering;
+        v13.pNext = &sync2;
         feats2.pNext = &v13;
-    } else if (sync2ViaExtension) {
-        sync2.pNext = feats2.pNext;
-        feats2.pNext = &sync2;
+    } else {
+        void* tail = feats2.pNext;
+        if (sync2ViaExtension) {
+            sync2.pNext = tail;
+            tail = &sync2;
+        }
+        if (dynamicRenderingViaExtension) {
+            dynRendering.pNext = tail;
+            tail = &dynRendering;
+        }
+        feats2.pNext = tail;
     }
 
     vkGetPhysicalDeviceFeatures2(physicalDevice_, &feats2);
@@ -234,10 +256,15 @@ bool VulkanContext::createDevice(bool enableValidation, VkSurfaceKHR surface) {
     feats2.features.shaderStorageImageExtendedFormats = VK_TRUE;
 
     bool sync2Supported = false;
+    bool dynamicRenderingSupported = false;
     if (supportsVulkan13) {
         if (v13.synchronization2) {
             v13.synchronization2 = VK_TRUE;
             sync2Supported = true;
+        }
+        if (v13.dynamicRendering) {
+            v13.dynamicRendering = VK_TRUE;
+            dynamicRenderingSupported = true;
         }
     } else if (sync2ViaExtension) {
         if (sync2.synchronization2) {
@@ -249,10 +276,25 @@ bool VulkanContext::createDevice(bool enableValidation, VkSurfaceKHR surface) {
         spdlog::error("Vulkan Synchronization2 is required but not supported by this device.");
         return false;
     }
+    if (supportsVulkan13) {
+        if (!dynamicRenderingSupported && !dynamicRenderingViaExtension) {
+            spdlog::error("Dynamic rendering is required but not supported by this device.");
+            return false;
+        }
+    } else if (dynamicRenderingViaExtension) {
+        if (dynRendering.dynamicRendering == VK_TRUE) {
+            dynRendering.dynamicRendering = VK_TRUE;
+            dynamicRenderingSupported = true;
+        } else {
+            spdlog::error("Dynamic rendering extension did not expose feature.");
+            return false;
+        }
+    }
 
     deviceInfo_.hasTimelineSemaphore = timelineSupported;
     deviceInfo_.hasDescriptorIndexing = descIdx.runtimeDescriptorArray == VK_TRUE;
     deviceInfo_.hasSynchronization2 = sync2Supported;
+    deviceInfo_.hasDynamicRendering = dynamicRenderingSupported;
 
     // Queues
     float prio = 1.0f;

@@ -181,7 +181,11 @@ def main(argv: List[str]) -> int:
     includes = [Path(p).resolve() for p in args.include]
     sources = [Path(p).resolve() for p in args.source]
     if not sources:
-        sources = sorted(source_dir.glob("**/*.comp"))
+        patterns = ("**/*.comp", "**/*.vert", "**/*.frag")
+        collected = []
+        for pat in patterns:
+            collected.extend(source_dir.glob(pat))
+        sources = sorted({path.resolve() for path in collected})
     if not sources:
         ensure_dir(output_dir)
         if args.manifest:

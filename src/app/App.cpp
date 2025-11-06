@@ -4,6 +4,7 @@
 #include "platform/Window.h"
 #include "platform/Swapchain.h"
 #include "render/Raytracer.h"
+#include "render/MeshRenderer.h"
 #endif
 
 #include <volk.h>
@@ -179,12 +180,16 @@ int App::run() {
 
     // Initialize Raytracer M1 skeleton
     render::Raytracer ray;
+    render::MeshRenderer meshRenderer;
     if (assetsReady) {
         ray.setAssetRegistry(&assetRegistry);
     }
     if (!ray.init(vk, swap)) {
         spdlog::error("Raytracer init failed.");
         return 1;
+    }
+    if (!meshRenderer.init(vk, swap)) {
+        spdlog::warn("Mesh renderer initialization failed; avatar rendering disabled");
     }
     spdlog::debug("Raytracer initialized");
     const float eyeHeight = 1.7f;
@@ -225,11 +230,16 @@ int App::run() {
     glm::mat4 prevProjMat(1.0f);
     float yawDeg = 180.0f;
     float pitchDeg = 0.0f;
-    enum class CameraMode { FreeFly, SurfaceWalk };
+    enum class CameraMode { FreeFly, SurfaceWalk, ThirdPerson };
     CameraMode cameraMode = CameraMode::FreeFly;
     bool surfaceTogglePrev = false;
     glm::dvec3 walkPos = camWorld;
     bool walkPosValid = false;
+    glm::dvec3 avatarPos = camWorld;
+    bool avatarValid = false;
+    float avatarYawDeg = yawDeg;
+    bool thirdPersonTogglePrev = false;
+    const float thirdPersonDistance = 5.0f;
     auto sampleSurface = [&](const glm::dvec3& guess) -> std::pair<glm::dvec3, glm::dvec3> {
         if (!brickStore) {
             glm::dvec3 dir = glm::length(guess) > 1e-6 ? glm::normalize(guess) : glm::dvec3(0.0, 0.0, 1.0);
@@ -246,12 +256,11 @@ int App::run() {
             normal = glm::normalize(brickStore->worldGen().crustNormal(p, eps));
             p -= normal * field;
         }
-        normal = glm::normalize(brickStore->worldGen().crustNormal(p, eps));
-        if (glm::length(normal) < 1e-4f) {
-            glm::vec3 dir = glm::length(p) > 1e-6f ? glm::normalize(p) : glm::vec3(0.0f, 0.0f, 1.0f);
-            normal = dir;
-        }
-        return {glm::dvec3(p), glm::dvec3(normal)};
+        glm::dvec3 surfacePos = glm::dvec3(p);
+        glm::dvec3 radial = glm::length(surfacePos) > 1e-6
+            ? glm::normalize(surfacePos)
+            : glm::dvec3(0.0, 0.0, 1.0);
+        return {surfacePos, radial};
     };
     bool firstMouse = true;
     double lastX = 0.0, lastY = 0.0;
@@ -382,7 +391,7 @@ int App::run() {
             yoffset = 0.0;
         }
         const float sensitivity = 0.08f;
-        yawDeg += static_cast<float>(xoffset) * sensitivity;
+        yawDeg -= static_cast<float>(xoffset) * sensitivity;
         pitchDeg += static_cast<float>(yoffset) * sensitivity;
         pitchDeg = std::clamp(pitchDeg, -89.0f, 89.0f);
 
@@ -405,7 +414,25 @@ int App::run() {
         }
         surfaceTogglePrev = surfacePressed;
 
+        int thirdPersonKeyState = glfwGetKey(window.handle(), GLFW_KEY_G);
+        bool thirdPressed = (thirdPersonKeyState == GLFW_PRESS);
+        if (thirdPressed && !thirdPersonTogglePrev) {
+            if (cameraMode == CameraMode::ThirdPerson) {
+                cameraMode = CameraMode::FreeFly;
+                avatarValid = false;
+            } else {
+                cameraMode = CameraMode::ThirdPerson;
+                auto surfaceSample = sampleSurface(camWorld);
+                avatarPos = surfaceSample.first;
+                avatarValid = true;
+            }
+        }
+        thirdPersonTogglePrev = thirdPressed;
+
         glm::vec3 worldUp(0.0f, 0.0f, 1.0f);
+        glm::vec3 avatarForwardVec(0.0f);
+        glm::vec3 avatarUpVec(0.0f);
+        glm::vec3 avatarRightVec(0.0f);
         if (cameraMode == CameraMode::FreeFly) {
             forward.x = std::cos(pitchRad) * std::cos(yawRad);
             forward.y = std::cos(pitchRad) * std::sin(yawRad);
@@ -427,7 +454,7 @@ int App::run() {
             if (glfwGetKey(window.handle(), GLFW_KEY_D) == GLFW_PRESS) camWorld += glm::dvec3(right)   * double(moveSpeed * dt);
             if (glfwGetKey(window.handle(), GLFW_KEY_SPACE) == GLFW_PRESS) camWorld += glm::dvec3(up) * double(moveSpeed * dt);
             if (glfwGetKey(window.handle(), GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS) camWorld -= glm::dvec3(up) * double(moveSpeed * dt);
-        } else {
+        } else if (cameraMode == CameraMode::SurfaceWalk) {
             if (!walkPosValid) {
                 auto surfaceSample = sampleSurface(camWorld);
                 walkPos = surfaceSample.first;
@@ -473,10 +500,96 @@ int App::run() {
             glm::dvec3 viewForwardD = glm::normalize(heading * cosPitch + upD * sinPitch);
             forward = glm::vec3(viewForwardD);
             up = glm::vec3(upD);
+        } else if (cameraMode == CameraMode::ThirdPerson) {
+            if (!avatarValid) {
+                auto surfaceSample = sampleSurface(camWorld);
+                avatarPos = surfaceSample.first;
+                avatarValid = true;
+            }
+
+            auto surfaceSample = sampleSurface(avatarPos);
+            avatarPos = surfaceSample.first;
+            glm::vec3 upVec = glm::normalize(glm::vec3(surfaceSample.second));
+            if (!std::isfinite(upVec.x) || glm::length(upVec) < 1e-6f) {
+                upVec = worldUp;
+            }
+
+            glm::vec3 east, north, upCheck;
+            math::ENU(glm::vec3(avatarPos), east, north, upCheck);
+            if (glm::length(upVec) < 1e-6f) upVec = upCheck;
+            double cosYaw = std::cos(static_cast<double>(yawRad));
+            double sinYaw = std::sin(static_cast<double>(yawRad));
+            glm::vec3 heading = glm::normalize(east * static_cast<float>(cosYaw) + north * static_cast<float>(sinYaw));
+            glm::vec3 rightVec = glm::normalize(glm::cross(heading, upVec));
+            if (!std::isfinite(rightVec.x) || glm::length(rightVec) < 1e-6f) {
+                rightVec = glm::vec3(1.0f, 0.0f, 0.0f);
+            }
+            heading = glm::normalize(glm::cross(upVec, rightVec));
+
+            glm::dvec3 moveDir(0.0);
+            float moveSpeed = 5.0f;
+            if (glfwGetKey(window.handle(), GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS || glfwGetKey(window.handle(), GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
+                moveSpeed *= 2.0f;
+            }
+            if (glfwGetKey(window.handle(), GLFW_KEY_W) == GLFW_PRESS) moveDir += glm::dvec3(heading);
+            if (glfwGetKey(window.handle(), GLFW_KEY_S) == GLFW_PRESS) moveDir -= glm::dvec3(heading);
+            if (glfwGetKey(window.handle(), GLFW_KEY_A) == GLFW_PRESS) moveDir -= glm::dvec3(rightVec);
+            if (glfwGetKey(window.handle(), GLFW_KEY_D) == GLFW_PRESS) moveDir += glm::dvec3(rightVec);
+            if (glm::length(moveDir) > 1e-6) {
+                moveDir = glm::normalize(moveDir);
+                avatarPos += moveDir * double(moveSpeed * dt);
+                auto adjustSample = sampleSurface(avatarPos);
+                avatarPos = adjustSample.first;
+                upVec = glm::normalize(glm::vec3(adjustSample.second));
+                if (!std::isfinite(upVec.x) || glm::length(upVec) < 1e-6f) {
+                    upVec = worldUp;
+                }
+                math::ENU(glm::vec3(avatarPos), east, north, upCheck);
+                if (glm::length(upVec) < 1e-6f) upVec = upCheck;
+                heading = glm::normalize(east * static_cast<float>(cosYaw) + north * static_cast<float>(sinYaw));
+                rightVec = glm::normalize(glm::cross(heading, upVec));
+                if (!std::isfinite(rightVec.x) || glm::length(rightVec) < 1e-6f) {
+                    rightVec = glm::vec3(1.0f, 0.0f, 0.0f);
+                }
+                heading = glm::normalize(glm::cross(upVec, rightVec));
+            }
+
+            float thirdPitch = std::clamp(pitchDeg, -60.0f, 60.0f);
+            pitchDeg = thirdPitch;
+            float thirdPitchRad = glm::radians(thirdPitch);
+            glm::vec3 orbitDir = glm::normalize(heading * std::cos(thirdPitchRad) + upVec * std::sin(thirdPitchRad));
+            glm::vec3 target = glm::vec3(avatarPos) + upVec * eyeHeight;
+            glm::vec3 cameraPos = target - orbitDir * thirdPersonDistance + upVec * 0.5f;
+            camWorld = glm::dvec3(cameraPos);
+            forward = glm::normalize(target - glm::vec3(camWorld));
+            up = upVec;
+            avatarForwardVec = heading;
+            avatarUpVec = upVec;
+            avatarRightVec = rightVec;
+            avatarYawDeg = yawDeg;
         }
 #else
         forward = glm::vec3(-1.0f, 0.0f, 0.0f);
 #endif
+
+        if (meshRenderer.ready()) {
+            if (cameraMode == CameraMode::ThirdPerson && avatarValid) {
+                if (glm::length(avatarForwardVec) < 1e-6f || glm::length(avatarUpVec) < 1e-6f) {
+                    math::ENU(glm::vec3(avatarPos), avatarRightVec, avatarForwardVec, avatarUpVec);
+                }
+                glm::mat4 model(1.0f);
+                model[0] = glm::vec4(avatarRightVec, 0.0f);
+                model[1] = glm::vec4(avatarUpVec, 0.0f);
+                model[2] = glm::vec4(avatarForwardVec, 0.0f);
+                model[3] = glm::vec4(glm::vec3(avatarPos), 1.0f);
+                render::MeshInstance inst{};
+                inst.model = model;
+                inst.color = glm::vec4(0.6f, 0.15f, 0.9f, 1.0f);
+                meshRenderer.updateInstances(std::vector<render::MeshInstance>{inst});
+            } else {
+                meshRenderer.updateInstances(std::vector<render::MeshInstance>{});
+            }
+        }
 
         glm::vec3 camPosF = glm::vec3(camWorld);
         streaming.update(camPosF, frameCounter);
@@ -523,6 +636,10 @@ int App::run() {
         glm::mat4 P = glm::perspective(glm::radians(45.0f), aspect, 0.05f, 2000.0f);
         glm::mat4 invV = glm::inverse(V);
         glm::mat4 invP = glm::inverse(P);
+        if (meshRenderer.ready()) {
+            glm::mat4 VP = P * V;
+            meshRenderer.setCamera(VP, glm::vec3(0.4f, 1.0f, 0.3f));
+        }
         std::memcpy(data.currView, &V[0][0], sizeof(float) * 16);
         std::memcpy(data.currProj, &P[0][0], sizeof(float) * 16);
         std::memcpy(data.currViewInv, &invV[0][0], sizeof(float) * 16);
@@ -538,12 +655,45 @@ int App::run() {
         data.originDeltaPrevToCurr[1] = originDelta.y;
         data.originDeltaPrevToCurr[2] = originDelta.z;
         data.originDeltaPrevToCurr[3] = 0.0f;
-        data.voxelSize = 0.5f;
-        data.brickSize = 4.0f;
-        data.Rin = R - 20.0f;
-        data.Rout = R + 80.0f;
-        data.Rsea = R;
-        data.planetRadius = R;
+        float voxelSize = 0.5f;
+        float brickSize = 4.0f;
+        float Rin = R - 20.0f;
+        float Rout = R + 80.0f;
+        float Rsea = R;
+        float planetRadiusForUBO = R;
+        float warpBand = 8.0f * brickSize;
+        if (brickStore) {
+            voxelSize = brickStore->voxelSize();
+            brickSize = brickStore->brickSize();
+            warpBand = 8.0f * brickSize;
+            const auto& params = brickStore->params();
+            const float trenchDepth = static_cast<float>(params.T);
+            const float maxHeight = static_cast<float>(params.Hmax);
+            const float seaRadius = static_cast<float>(params.sea);
+            const float innerBand = std::max(trenchDepth, 6.0f);
+            const float shellMargin = brickSize;
+            Rin = std::max(planetRadius - innerBand, 0.0f);
+            Rout = planetRadius + maxHeight + shellMargin;
+            if (Rout <= Rin) {
+                Rout = Rin + std::max(shellMargin, 1.0f);
+            }
+            const float hasSea = (seaRadius > 0.0f) ? seaRadius : planetRadius;
+            // Keep warp band around actual sea instead of base radius when shifted.
+            if (seaRadius > 0.0f && seaRadius != planetRadius) {
+                Rsea = hasSea;
+                Rin = std::max(0.0f, std::min(Rin, Rsea - warpBand));
+                Rout = std::max(Rout, Rsea + warpBand);
+            } else {
+                Rsea = planetRadius;
+            }
+            planetRadiusForUBO = static_cast<float>(params.R);
+        }
+        data.voxelSize = voxelSize;
+        data.brickSize = brickSize;
+        data.Rin = Rin;
+        data.Rout = Rout;
+        data.Rsea = Rsea;
+        data.planetRadius = planetRadiusForUBO;
         data.exposure = 1.0f;
         data.frameIdx = frameCounter;
         data.maxBounces = 0;
@@ -682,6 +832,15 @@ int App::run() {
             ray.record(vk, swap, cmd, idx);
         });
 
+        frameGraph.addPass("MeshAvatar", [&, idx](VkCommandBuffer cmd) {
+            if (!meshRenderer.ready() || !meshRenderer.hasInstances()) {
+                return;
+            }
+            VkImage image = swap.image(idx);
+            VkImageView view = swap.imageViews()[idx];
+            meshRenderer.record(cmd, image, view);
+        });
+
         frameGraph.addPass("OverlayHUD", [&, idx](VkCommandBuffer cmd) {
             ray.recordOverlay(cmd, idx);
         });
@@ -689,7 +848,7 @@ int App::run() {
         frameGraph.addPass("TransitionToPresent", [&, idx](VkCommandBuffer cmd) {
             VkImageMemoryBarrier barrier{};
             barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             barrier.dstAccessMask = 0;
             barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
             barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
@@ -700,7 +859,7 @@ int App::run() {
             barrier.subresourceRange.levelCount = 1;
             barrier.subresourceRange.layerCount = 1;
             vkCmdPipelineBarrier(cmd,
-                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                  VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                  0,
                                  0, nullptr,
@@ -781,6 +940,7 @@ int App::run() {
     }
     streaming.shutdown();
     jobs.stop();
+    meshRenderer.shutdown(vk);
     ray.shutdown(vk);
     swap.destroy(vk.device());
     vk.shutdown();

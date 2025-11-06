@@ -33,6 +33,7 @@ struct DeviceInfo {
     bool hasDescriptorIndexing = true;
     bool hasBufferDeviceAddress = false;
     bool hasSynchronization2 = false;
+    bool hasDynamicRendering = false;
 };
 
 class VulkanContext {
