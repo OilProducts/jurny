@@ -14,33 +14,62 @@ namespace render {
 
 namespace {
 struct AvatarGeometry {
-    std::array<MeshVertex, 8> vertices;
+    std::array<MeshVertex, 24> vertices;
     std::array<uint32_t, 36> indices;
 };
 
 AvatarGeometry makeAvatarCube(float width, float height, float depth) {
     const float hw = width * 0.5f;
     const float hd = depth * 0.5f;
-    AvatarGeometry geo{};
+    const float invHeight = height > 0.0f ? (1.0f / height) : 0.0f;
 
-    geo.vertices = {
-        MeshVertex{{-hw, 0.0f, -hd}, { -1.0f,  0.0f,  0.0f }},
-        MeshVertex{{ hw, 0.0f, -hd}, {  1.0f,  0.0f,  0.0f }},
-        MeshVertex{{ hw, height, -hd}, {  1.0f,  0.0f,  0.0f }},
-        MeshVertex{{-hw, height, -hd}, { -1.0f,  0.0f,  0.0f }},
-        MeshVertex{{-hw, 0.0f,  hd}, { -1.0f,  0.0f,  0.0f }},
-        MeshVertex{{ hw, 0.0f,  hd}, {  1.0f,  0.0f,  0.0f }},
-        MeshVertex{{ hw, height,  hd}, {  1.0f,  0.0f,  0.0f }},
-        MeshVertex{{-hw, height,  hd}, { -1.0f,  0.0f,  0.0f }},
+    auto buildVertex = [&](float x, float y, float z, glm::vec3 normal) -> MeshVertex {
+        MeshVertex v{};
+        v.position = glm::vec3(x, y, z);
+        v.normal = normal;
+        v.heightRatio = glm::clamp((y) * invHeight, 0.0f, 1.0f);
+        return v;
     };
+
+    AvatarGeometry geo{};
+    // Front (+Z)
+    geo.vertices[0]  = buildVertex(-hw, 0.0f,  hd, {0.0f, 0.0f, 1.0f});
+    geo.vertices[1]  = buildVertex( hw, 0.0f,  hd, {0.0f, 0.0f, 1.0f});
+    geo.vertices[2]  = buildVertex( hw, height,  hd, {0.0f, 0.0f, 1.0f});
+    geo.vertices[3]  = buildVertex(-hw, height,  hd, {0.0f, 0.0f, 1.0f});
+    // Back (-Z)
+    geo.vertices[4]  = buildVertex( hw, 0.0f, -hd, {0.0f, 0.0f, -1.0f});
+    geo.vertices[5]  = buildVertex(-hw, 0.0f, -hd, {0.0f, 0.0f, -1.0f});
+    geo.vertices[6]  = buildVertex(-hw, height, -hd, {0.0f, 0.0f, -1.0f});
+    geo.vertices[7]  = buildVertex( hw, height, -hd, {0.0f, 0.0f, -1.0f});
+    // Left (-X)
+    geo.vertices[8]  = buildVertex(-hw, 0.0f, -hd, {-1.0f, 0.0f, 0.0f});
+    geo.vertices[9]  = buildVertex(-hw, 0.0f,  hd, {-1.0f, 0.0f, 0.0f});
+    geo.vertices[10] = buildVertex(-hw, height,  hd, {-1.0f, 0.0f, 0.0f});
+    geo.vertices[11] = buildVertex(-hw, height, -hd, {-1.0f, 0.0f, 0.0f});
+    // Right (+X)
+    geo.vertices[12] = buildVertex( hw, 0.0f,  hd, {1.0f, 0.0f, 0.0f});
+    geo.vertices[13] = buildVertex( hw, 0.0f, -hd, {1.0f, 0.0f, 0.0f});
+    geo.vertices[14] = buildVertex( hw, height, -hd, {1.0f, 0.0f, 0.0f});
+    geo.vertices[15] = buildVertex( hw, height,  hd, {1.0f, 0.0f, 0.0f});
+    // Top (+Y)
+    geo.vertices[16] = buildVertex(-hw, height,  hd, {0.0f, 1.0f, 0.0f});
+    geo.vertices[17] = buildVertex( hw, height,  hd, {0.0f, 1.0f, 0.0f});
+    geo.vertices[18] = buildVertex( hw, height, -hd, {0.0f, 1.0f, 0.0f});
+    geo.vertices[19] = buildVertex(-hw, height, -hd, {0.0f, 1.0f, 0.0f});
+    // Bottom (-Y)
+    geo.vertices[20] = buildVertex(-hw, 0.0f, -hd, {0.0f, -1.0f, 0.0f});
+    geo.vertices[21] = buildVertex( hw, 0.0f, -hd, {0.0f, -1.0f, 0.0f});
+    geo.vertices[22] = buildVertex( hw, 0.0f,  hd, {0.0f, -1.0f, 0.0f});
+    geo.vertices[23] = buildVertex(-hw, 0.0f,  hd, {0.0f, -1.0f, 0.0f});
 
     geo.indices = {
         0, 1, 2, 2, 3, 0,
         4, 5, 6, 6, 7, 4,
-        0, 4, 7, 7, 3, 0,
-        1, 5, 6, 6, 2, 1,
-        3, 2, 6, 6, 7, 3,
-        0, 1, 5, 5, 4, 0
+        8, 9,10,10,11, 8,
+        12,13,14,14,15,12,
+        16,17,18,18,19,16,
+        20,21,22,22,23,20
     };
     return geo;
 }
@@ -311,20 +340,21 @@ bool MeshRenderer::createPipeline(platform::VulkanContext&, platform::Swapchain&
     bindings[1].stride = sizeof(MeshInstance);
     bindings[1].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
 
-    VkVertexInputAttributeDescription attrs[7]{};
+    VkVertexInputAttributeDescription attrs[8]{};
     attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(MeshVertex, position)};
     attrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(MeshVertex, normal)};
-    attrs[2] = {2, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshInstance, model)};
-    attrs[3] = {3, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshInstance, model) + sizeof(glm::vec4)};
-    attrs[4] = {4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshInstance, model) + sizeof(glm::vec4) * 2};
-    attrs[5] = {5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshInstance, model) + sizeof(glm::vec4) * 3};
-    attrs[6] = {6, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshInstance, color)};
+    attrs[2] = {2, 0, VK_FORMAT_R32_SFLOAT, offsetof(MeshVertex, heightRatio)};
+    attrs[3] = {3, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshInstance, model)};
+    attrs[4] = {4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshInstance, model) + sizeof(glm::vec4)};
+    attrs[5] = {5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshInstance, model) + sizeof(glm::vec4) * 2};
+    attrs[6] = {6, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshInstance, model) + sizeof(glm::vec4) * 3};
+    attrs[7] = {7, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshInstance, color)};
 
     VkPipelineVertexInputStateCreateInfo vi{};
     vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vi.vertexBindingDescriptionCount = 2;
     vi.pVertexBindingDescriptions = bindings;
-    vi.vertexAttributeDescriptionCount = 7;
+    vi.vertexAttributeDescriptionCount = 8;
     vi.pVertexAttributeDescriptions = attrs;
 
     VkPipelineInputAssemblyStateCreateInfo ia{};
@@ -345,7 +375,7 @@ bool MeshRenderer::createPipeline(platform::VulkanContext&, platform::Swapchain&
     VkPipelineRasterizationStateCreateInfo rs{};
     rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode = VK_CULL_MODE_BACK_BIT;
+    rs.cullMode = VK_CULL_MODE_NONE;
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.0f;
 

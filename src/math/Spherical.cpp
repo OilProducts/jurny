@@ -6,6 +6,7 @@
 #include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
 #include <glm/geometric.hpp>
+#include <glm/gtc/constants.hpp>
 
 namespace math {
 namespace {
@@ -99,27 +100,27 @@ float fbmInternal(const glm::vec3& p,
     return result * 2.0f - 1.0f; // [-1, 1]
 }
 
-glm::vec3 applyDomainWarpInternal(const glm::vec3& dir,
+glm::vec3 applyDomainWarpInternal(const glm::vec3& domain,
                                   const NoiseParams& noise,
                                   std::uint32_t seed) {
     if (noise.warpAmplitude <= 0.0f || noise.warpFrequency <= 0.0f) {
-        return dir;
+        return domain;
     }
     const int detailOct = std::max(noise.detailOctaves, 1);
     const glm::vec3 offX(31.7f, 17.3f, 13.1f);
     const glm::vec3 offY(11.1f, 53.2f, 27.8f);
     const glm::vec3 offZ(91.7f, 45.3f, 67.1f);
-    const float fx = fbmInternal(dir + offX, noise.warpFrequency,
+    const float fx = fbmInternal(domain + offX, noise.warpFrequency,
                                  detailOct, kPersistenceDetail,
                                  seed + 233u);
-    const float fy = fbmInternal(dir + offY, noise.warpFrequency,
+    const float fy = fbmInternal(domain + offY, noise.warpFrequency,
                                  detailOct, kPersistenceDetail,
                                  seed + 389u);
-    const float fz = fbmInternal(dir + offZ, noise.warpFrequency,
+    const float fz = fbmInternal(domain + offZ, noise.warpFrequency,
                                  detailOct, kPersistenceDetail,
                                  seed + 521u);
     const glm::vec3 warp(fx, fy, fz);
-    return dir + warp * noise.warpAmplitude;
+    return domain + warp * noise.warpAmplitude;
 }
 
 CrustSample evaluateCrust(const glm::vec3& p,
@@ -137,7 +138,9 @@ CrustSample evaluateCrust(const glm::vec3& p,
     }
 
     const glm::vec3 dir = p / r;
-    const glm::vec3 warped = applyDomainWarpInternal(dir, noise, seed);
+    const float baseRadius = static_cast<float>(planet.R);
+    const glm::vec3 surfacePoint = dir * baseRadius;
+    const glm::vec3 warped = applyDomainWarpInternal(surfacePoint, noise, seed);
 
     const int contOct = std::max(noise.continentOctaves, 1);
     const int detailOct = std::max(noise.detailOctaves, 1);
@@ -148,7 +151,7 @@ CrustSample evaluateCrust(const glm::vec3& p,
         kPersistenceContinent,
         seed);
     const float detail = fbmInternal(
-        warped * 2.0f,
+        warped * noise.detailWarpMultiplier,
         noise.detailFrequency,
         detailOct,
         kPersistenceDetail,
@@ -160,7 +163,7 @@ CrustSample evaluateCrust(const glm::vec3& p,
     if (noise.continentAmplitude > 0.0f && noise.continentFrequency > 0.0f) {
         glm::vec3 east, north, upVec;
         ENU(dir, east, north, upVec);
-        const float gradStep = 0.02f;
+        const float gradStep = std::max(noise.slopeSampleDistance, 1e-3f);
         auto sampleContinents = [&](const glm::vec3& w) {
             return fbmInternal(w,
                                noise.continentFrequency,
@@ -178,7 +181,7 @@ CrustSample evaluateCrust(const glm::vec3& p,
     float detailMask = 1.0f - glm::smoothstep(0.55f, 0.95f, continents * 0.5f + 0.5f);
     float detailStrength = glm::mix(1.0f, 0.25f, slopeMask);
     float detailContribution = noise.detailAmplitude * detailMask * detailStrength * detail;
-    float height = continentHeight + detailContribution;
+    float height = noise.baseHeightOffset + continentHeight + detailContribution;
     if (slopeMask > 0.0f) {
         const float slopeFlatten = glm::mix(0.0f, noise.continentAmplitude * 0.3f, slopeMask);
         height = glm::mix(height, height - slopeFlatten, slopeMask);
@@ -244,6 +247,40 @@ inline bool intersectSphere(const glm::vec3& o, const glm::vec3& d, float R,
 }
 } // namespace
 
+NoiseParams BuildNoiseParams(const NoiseTuning& tuning, const PlanetParams& planet) {
+    NoiseParams params{};
+    const float radius = static_cast<float>(planet.R);
+    const float circumference = radius > 0.0f ? radius * glm::two_pi<float>() : 0.0f;
+
+    auto wavelengthToFrequency = [](float wavelengthMeters) -> float {
+        return (wavelengthMeters > 0.0f) ? (1.0f / wavelengthMeters) : 0.0f;
+    };
+
+    params.continentFrequency = (tuning.continentsPerCircumference > 0.0f && circumference > 0.0f)
+        ? (tuning.continentsPerCircumference / circumference)
+        : 0.0f;
+    params.continentAmplitude = tuning.continentAmplitude;
+    params.continentOctaves   = tuning.continentOctaves;
+
+    params.detailFrequency    = wavelengthToFrequency(tuning.detailWavelength);
+    params.detailAmplitude    = tuning.detailAmplitude;
+    params.detailOctaves      = tuning.detailOctaves;
+    params.detailWarpMultiplier = std::max(tuning.detailWarpMultiplier, 0.1f);
+    params.baseHeightOffset   = tuning.baseHeightOffset;
+
+    params.warpFrequency      = wavelengthToFrequency(tuning.warpWavelength);
+    params.warpAmplitude      = tuning.warpAmplitude;
+    params.slopeSampleDistance = std::max(tuning.slopeSampleDistance, 1.0f);
+
+    params.caveFrequency      = wavelengthToFrequency(tuning.caveWavelength);
+    params.caveAmplitude      = tuning.caveAmplitude;
+    params.caveThreshold      = tuning.caveThreshold;
+
+    params.moistureFrequency  = wavelengthToFrequency(tuning.moistureWavelength);
+    params.moistureOctaves    = tuning.moistureOctaves;
+    return params;
+}
+
 NoiseParams NoiseParams::disabled() {
     NoiseParams n{};
     n.continentFrequency = 0.0f;
@@ -252,8 +289,11 @@ NoiseParams NoiseParams::disabled() {
     n.detailFrequency    = 0.0f;
     n.detailAmplitude    = 0.0f;
     n.detailOctaves      = 0;
+    n.detailWarpMultiplier = 1.0f;
+    n.baseHeightOffset   = 0.0f;
     n.warpFrequency      = 0.0f;
     n.warpAmplitude      = 0.0f;
+    n.slopeSampleDistance = 1.0f;
     n.caveFrequency      = 0.0f;
     n.caveAmplitude      = 0.0f;
     n.caveThreshold      = 1.0f;
@@ -262,10 +302,10 @@ NoiseParams NoiseParams::disabled() {
     return n;
 }
 
-glm::vec3 ApplyDomainWarp(const glm::vec3& unitDir,
+glm::vec3 ApplyDomainWarp(const glm::vec3& surfacePoint,
                           const NoiseParams& noise,
                           std::uint32_t seed) {
-    return applyDomainWarpInternal(unitDir, noise, seed);
+    return applyDomainWarpInternal(surfacePoint, noise, seed);
 }
 
 float FractalBrownianMotion(const glm::vec3& p, float baseFrequency,

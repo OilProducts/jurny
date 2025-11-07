@@ -8,24 +8,48 @@ namespace math {
 struct PlanetParams { double R{}, T{}, sea{}, Hmax{}; };
 
 struct NoiseParams {
-    float continentFrequency = 0.04f;
-    float continentAmplitude = 12.0f;
+    float continentFrequency = 0.04f;   // cycles per meter
+    float continentAmplitude = 12.0f;   // meters
     int   continentOctaves   = 5;
-    float detailFrequency    = 0.12f;
-    float detailAmplitude    = 3.0f;
+    float detailFrequency    = 0.12f;   // cycles per meter
+    float detailAmplitude    = 3.0f;    // meters
     int   detailOctaves      = 3;
-    float warpFrequency      = 0.18f;
-    float warpAmplitude      = 0.6f;
-    float caveFrequency      = 0.35f;
-    float caveAmplitude      = 4.0f;
+    float detailWarpMultiplier = 2.0f;  // scales the detail domain
+    float baseHeightOffset   = 0.0f;    // meters added after noise
+    float warpFrequency      = 0.18f;   // cycles per meter
+    float warpAmplitude      = 0.6f;    // meters
+    float slopeSampleDistance = 20.0f;  // meters along surface for slope mask
+    float caveFrequency      = 0.35f;   // cycles per meter (world space)
+    float caveAmplitude      = 4.0f;    // meters
     float caveThreshold      = 0.25f;
-    float moistureFrequency  = 0.5f;
+    float moistureFrequency  = 0.5f;    // cycles per meter
     int   moistureOctaves    = 3;
 
     static NoiseParams disabled();
 };
 
 inline constexpr int kNoiseCaveOctaves = 4;
+
+struct NoiseTuning {
+    float continentsPerCircumference = 4.0f; // approximate count around equator
+    float continentAmplitude = 120.0f;       // meters
+    int   continentOctaves   = 6;
+    float detailWavelength   = 32.0f;        // meters
+    float detailAmplitude    = 18.0f;        // meters
+    int   detailOctaves      = 4;
+    float detailWarpMultiplier = 2.5f;
+    float baseHeightOffset   = 0.0f;         // meters
+    float warpWavelength     = 140.0f;       // meters
+    float warpAmplitude      = 45.0f;        // meters
+    float slopeSampleDistance = 48.0f;       // meters
+    float caveWavelength     = 18.0f;        // meters
+    float caveAmplitude      = 6.0f;         // meters
+    float caveThreshold      = 0.35f;
+    float moistureWavelength = 900.0f;       // meters
+    int   moistureOctaves    = 4;
+};
+
+NoiseParams BuildNoiseParams(const NoiseTuning& tuning, const PlanetParams& planet);
 
 struct CrustSample {
     float field = 0.0f;   // Signed distance-like value (neg = solid).
@@ -54,7 +78,9 @@ bool IntersectSphereShell(const glm::vec3& o, const glm::vec3& d,
 void ENU(const glm::vec3& p, glm::vec3& east, glm::vec3& north, glm::vec3& up);
 
 // Expose noise utilities so world generation can stay in sync with rendering.
-glm::vec3 ApplyDomainWarp(const glm::vec3& unitDir,
+// Apply shared domain warp in world-space (meters). Expects the input position
+// to lie on the planet surface (normalized direction * radius).
+glm::vec3 ApplyDomainWarp(const glm::vec3& surfacePoint,
                           const NoiseParams& noise, std::uint32_t seed);
 float FractalBrownianMotion(const glm::vec3& p, float baseFrequency,
                             int octaves, float persistence,

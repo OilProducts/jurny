@@ -17,6 +17,8 @@ function(voxel_compile_shaders)
 
   file(GLOB_RECURSE GLSL_SOURCES CONFIGURE_DEPENDS
     "${VOXEL_SHADERS_SOURCE_DIR}/*.comp"
+    "${VOXEL_SHADERS_SOURCE_DIR}/*.vert"
+    "${VOXEL_SHADERS_SOURCE_DIR}/*.frag"
   )
   # Also track includes so modifying shared headers triggers rebuilds.
   file(GLOB_RECURSE GLSL_INCLUDES CONFIGURE_DEPENDS

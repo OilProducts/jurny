@@ -237,7 +237,6 @@ int App::run() {
     bool walkPosValid = false;
     glm::dvec3 avatarPos = camWorld;
     bool avatarValid = false;
-    float avatarYawDeg = yawDeg;
     bool thirdPersonTogglePrev = false;
     const float thirdPersonDistance = 5.0f;
     auto sampleSurface = [&](const glm::dvec3& guess) -> std::pair<glm::dvec3, glm::dvec3> {
@@ -430,9 +429,6 @@ int App::run() {
         thirdPersonTogglePrev = thirdPressed;
 
         glm::vec3 worldUp(0.0f, 0.0f, 1.0f);
-        glm::vec3 avatarForwardVec(0.0f);
-        glm::vec3 avatarUpVec(0.0f);
-        glm::vec3 avatarRightVec(0.0f);
         if (cameraMode == CameraMode::FreeFly) {
             forward.x = std::cos(pitchRad) * std::cos(yawRad);
             forward.y = std::cos(pitchRad) * std::sin(yawRad);
@@ -509,7 +505,7 @@ int App::run() {
 
             auto surfaceSample = sampleSurface(avatarPos);
             avatarPos = surfaceSample.first;
-            glm::vec3 upVec = glm::normalize(glm::vec3(surfaceSample.second));
+            glm::vec3 upVec = glm::normalize(glm::vec3(avatarPos));
             if (!std::isfinite(upVec.x) || glm::length(upVec) < 1e-6f) {
                 upVec = worldUp;
             }
@@ -540,7 +536,7 @@ int App::run() {
                 avatarPos += moveDir * double(moveSpeed * dt);
                 auto adjustSample = sampleSurface(avatarPos);
                 avatarPos = adjustSample.first;
-                upVec = glm::normalize(glm::vec3(adjustSample.second));
+                upVec = glm::normalize(glm::vec3(avatarPos));
                 if (!std::isfinite(upVec.x) || glm::length(upVec) < 1e-6f) {
                     upVec = worldUp;
                 }
@@ -563,10 +559,6 @@ int App::run() {
             camWorld = glm::dvec3(cameraPos);
             forward = glm::normalize(target - glm::vec3(camWorld));
             up = upVec;
-            avatarForwardVec = heading;
-            avatarUpVec = upVec;
-            avatarRightVec = rightVec;
-            avatarYawDeg = yawDeg;
         }
 #else
         forward = glm::vec3(-1.0f, 0.0f, 0.0f);
@@ -574,17 +566,41 @@ int App::run() {
 
         if (meshRenderer.ready()) {
             if (cameraMode == CameraMode::ThirdPerson && avatarValid) {
-                if (glm::length(avatarForwardVec) < 1e-6f || glm::length(avatarUpVec) < 1e-6f) {
-                    math::ENU(glm::vec3(avatarPos), avatarRightVec, avatarForwardVec, avatarUpVec);
+                glm::vec3 east, north, upCheck;
+                math::ENU(glm::vec3(avatarPos), east, north, upCheck);
+
+                glm::vec3 upAxis = glm::normalize(glm::vec3(avatarPos));
+                if (!std::isfinite(upAxis.x) || glm::length(upAxis) < 1e-6f) {
+                    upAxis = upCheck;
                 }
+                if (!std::isfinite(upAxis.x) || glm::length(upAxis) < 1e-6f) {
+                    upAxis = glm::vec3(0.0f, 0.0f, 1.0f);
+                }
+                if (glm::length(east) < 1e-6f) {
+                    east = glm::normalize(glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), upAxis));
+                }
+                if (glm::length(east) < 1e-6f) {
+                    east = glm::vec3(1.0f, 0.0f, 0.0f);
+                }
+                if (glm::length(north) < 1e-6f) {
+                    north = glm::normalize(glm::cross(upAxis, east));
+                }
+                glm::vec3 heading = glm::normalize(east * std::cos(static_cast<float>(yawRad)) + north * std::sin(static_cast<float>(yawRad)));
+                if (glm::length(heading) < 1e-6f) heading = north;
+                glm::vec3 rightAxis = glm::normalize(glm::cross(heading, upAxis));
+                if (!std::isfinite(rightAxis.x) || glm::length(rightAxis) < 1e-6f) {
+                    rightAxis = east;
+                }
+                glm::vec3 forwardAxis = glm::normalize(glm::cross(upAxis, rightAxis));
+
                 glm::mat4 model(1.0f);
-                model[0] = glm::vec4(avatarRightVec, 0.0f);
-                model[1] = glm::vec4(avatarUpVec, 0.0f);
-                model[2] = glm::vec4(avatarForwardVec, 0.0f);
+                model[0] = glm::vec4(rightAxis, 0.0f);
+                model[1] = glm::vec4(upAxis, 0.0f);
+                model[2] = glm::vec4(forwardAxis, 0.0f);
                 model[3] = glm::vec4(glm::vec3(avatarPos), 1.0f);
                 render::MeshInstance inst{};
                 inst.model = model;
-                inst.color = glm::vec4(0.6f, 0.15f, 0.9f, 1.0f);
+                inst.color = glm::vec4(0.85f, 0.2f, 0.95f, 1.0f);
                 meshRenderer.updateInstances(std::vector<render::MeshInstance>{inst});
             } else {
                 meshRenderer.updateInstances(std::vector<render::MeshInstance>{});

@@ -42,7 +42,8 @@ struct GlobalsUBOData {
     uint32_t historyValid;
     float noiseContinentFreq, noiseContinentAmp, noiseDetailFreq, noiseDetailAmp;
     float noiseWarpFreq, noiseWarpAmp, noiseCaveFreq, noiseCaveAmp;
-    float noiseCaveThreshold, noiseMinHeight, noiseMaxHeight, noisePad2;
+    float noiseCaveThreshold, noiseMinHeight, noiseMaxHeight, noiseDetailWarp;
+    float noiseSlopeSampleDist, noiseBaseHeightOffset, noisePad2, noisePad3;
     uint32_t noiseSeed, noiseContinentOctaves, noiseDetailOctaves, noiseCaveOctaves;
 };
 static_assert(sizeof(GlobalsUBOData) % 16 == 0, "GlobalsUBOData must align to 16 bytes");

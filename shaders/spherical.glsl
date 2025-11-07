@@ -100,25 +100,27 @@ float smoothClamp(float value, float lo, float hi, float transition) {
     return mix(vLo, hi, tHi);
 }
 
-vec3 domainWarp(vec3 p) {
-    if (g.noiseWarpAmp <= 0.0 || g.noiseWarpFreq <= 0.0) return p;
+vec3 domainWarp(vec3 posMeters) {
+    if (g.noiseWarpAmp <= 0.0 || g.noiseWarpFreq <= 0.0) return posMeters;
     int detailOct = max(int(g.noiseDetailOctaves), 1);
-    float fx = fbm(p + vec3(31.7, 17.3, 13.1), g.noiseWarpFreq, detailOct, PERSISTENCE_DETAIL, g.noiseSeed + 233u);
-    float fy = fbm(p + vec3(11.1, 53.2, 27.8), g.noiseWarpFreq, detailOct, PERSISTENCE_DETAIL, g.noiseSeed + 389u);
-    float fz = fbm(p + vec3(91.7, 45.3, 67.1), g.noiseWarpFreq, detailOct, PERSISTENCE_DETAIL, g.noiseSeed + 521u);
+    float fx = fbm(posMeters + vec3(31.7, 17.3, 13.1), g.noiseWarpFreq, detailOct, PERSISTENCE_DETAIL, g.noiseSeed + 233u);
+    float fy = fbm(posMeters + vec3(11.1, 53.2, 27.8), g.noiseWarpFreq, detailOct, PERSISTENCE_DETAIL, g.noiseSeed + 389u);
+    float fz = fbm(posMeters + vec3(91.7, 45.3, 67.1), g.noiseWarpFreq, detailOct, PERSISTENCE_DETAIL, g.noiseSeed + 521u);
     vec3 warp = vec3(fx, fy, fz);
-    return p + warp * g.noiseWarpAmp;
+    return posMeters + warp * g.noiseWarpAmp;
 }
 
 float F_crust(in vec3 p) {
     float r = length(p);
     if (r <= 0.0) return -g.noiseMinHeight;
     vec3 dir = p / r;
-    vec3 warped = domainWarp(dir);
+    float baseRadius = g.planetRadius;
+    vec3 surface = dir * baseRadius;
+    vec3 warped = domainWarp(surface);
     int contOct = max(int(g.noiseContinentOctaves), 1);
     int detailOct = max(int(g.noiseDetailOctaves), 1);
     float continents = fbm(warped, g.noiseContinentFreq, contOct, PERSISTENCE_CONTINENT, g.noiseSeed);
-    float detail = fbm(warped * 2.0, g.noiseDetailFreq, detailOct, PERSISTENCE_DETAIL, g.noiseSeed + 613u);
+    float detail = fbm(warped * g.noiseDetailWarp, g.noiseDetailFreq, detailOct, PERSISTENCE_DETAIL, g.noiseSeed + 613u);
 
     float continentHeight = g.noiseContinentAmp * continents;
 
@@ -126,7 +128,7 @@ float F_crust(in vec3 p) {
     if (g.noiseContinentAmp > 0.0 && g.noiseContinentFreq > 0.0) {
         vec3 east, north, up;
         enu(dir, east, north, up);
-        float gradStep = 0.02;
+        float gradStep = max(g.noiseSlopeSampleDist, 1e-3);
         int slopeOct = contOct;
         float continentsEast = fbm(warped + east * gradStep, g.noiseContinentFreq, slopeOct, PERSISTENCE_CONTINENT, g.noiseSeed);
         float continentsNorth = fbm(warped + north * gradStep, g.noiseContinentFreq, slopeOct, PERSISTENCE_CONTINENT, g.noiseSeed);
@@ -137,7 +139,7 @@ float F_crust(in vec3 p) {
     float detailMask = 1.0 - smoothstep(0.55, 0.95, continents * 0.5 + 0.5);
     float detailStrength = mix(1.0, 0.25, slopeMask);
     float detailContribution = g.noiseDetailAmp * detailMask * detailStrength * detail;
-    float height = continentHeight + detailContribution;
+    float height = g.noiseBaseHeightOffset + continentHeight + detailContribution;
     if (slopeMask > 0.0) {
         float slopeFlatten = mix(0.0, g.noiseContinentAmp * 0.3, slopeMask);
         height = mix(height, height - slopeFlatten, slopeMask);

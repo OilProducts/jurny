@@ -40,6 +40,9 @@ struct GlobalsUBO_t {
   float noiseCaveThreshold;
   float noiseMinHeight;
   float noiseMaxHeight;
+  float noiseDetailWarp;
+  float noiseSlopeSampleDist;
+  float noiseBaseHeightOffset;
   float noisePad2;
   uint noiseSeed;
   uint noiseContinentOctaves;

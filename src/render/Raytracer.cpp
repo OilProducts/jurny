@@ -606,17 +606,24 @@ bool Raytracer::createWorld(platform::VulkanContext& vk) {
     brickStore_ = std::make_unique<world::BrickStore>();
     auto& store = *brickStore_;
     math::PlanetParams P{ 100.0, 120.0, 100.0, 160.0 }; // base radius, trench depth, sea level, max height
-    noiseParams_.continentFrequency = 0.02f;
-    noiseParams_.continentAmplitude = 120.0f;
-    noiseParams_.continentOctaves   = 6;
-    noiseParams_.detailFrequency    = 0.12f;
-    noiseParams_.detailAmplitude    = 20.0f;
-    noiseParams_.detailOctaves      = 4;
-    noiseParams_.warpFrequency      = 0.18f;
-    noiseParams_.warpAmplitude      = 2.5f;
-    noiseParams_.caveFrequency      = 0.4f;
-    noiseParams_.caveAmplitude      = 6.0f;
-    noiseParams_.caveThreshold      = 0.35f;
+    math::NoiseTuning tuning{};
+    tuning.continentsPerCircumference = 3.2f;
+    tuning.continentAmplitude         = 110.0f;
+    tuning.continentOctaves           = 5;
+    tuning.detailWavelength           = 55.0f;
+    tuning.detailAmplitude            = 16.0f;
+    tuning.detailOctaves              = 3;
+    tuning.detailWarpMultiplier       = 1.8f;
+    tuning.baseHeightOffset           = 14.0f;
+    tuning.warpWavelength             = 240.0f;
+    tuning.warpAmplitude              = 24.0f;
+    tuning.slopeSampleDistance        = 100.0f;
+    tuning.caveWavelength             = 36.0f;
+    tuning.caveAmplitude              = 5.0f;
+    tuning.caveThreshold              = 0.35f;
+    tuning.moistureWavelength         = 80.0f;
+    tuning.moistureOctaves            = 4;
+    noiseParams_ = math::BuildNoiseParams(tuning, P);
     worldSeed_ = 1337u;
     store.configure(P, /*voxelSize*/0.5f, /*brickDim*/VOXEL_BRICK_SIZE, noiseParams_, worldSeed_, assets_);
 
@@ -1336,11 +1343,15 @@ void Raytracer::updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData&
         d.noiseCaveThreshold = np.caveThreshold;
         d.noiseMinHeight     = -static_cast<float>(wg.planet().T);
         d.noiseMaxHeight     =  static_cast<float>(wg.planet().Hmax);
+        d.noiseDetailWarp    = np.detailWarpMultiplier;
+        d.noiseSlopeSampleDist = np.slopeSampleDistance;
+        d.noiseBaseHeightOffset = np.baseHeightOffset;
         d.noisePad2          = 0.0f;
-    d.noiseSeed          = wg.seed();
-    d.noiseContinentOctaves = static_cast<uint32_t>(np.continentOctaves);
-    d.noiseDetailOctaves    = static_cast<uint32_t>(np.detailOctaves);
-    d.noiseCaveOctaves      = static_cast<uint32_t>(math::kNoiseCaveOctaves);
+        d.noisePad3          = 0.0f;
+        d.noiseSeed          = wg.seed();
+        d.noiseContinentOctaves = static_cast<uint32_t>(np.continentOctaves);
+        d.noiseDetailOctaves    = static_cast<uint32_t>(np.detailOctaves);
+        d.noiseCaveOctaves      = static_cast<uint32_t>(math::kNoiseCaveOctaves);
     } else {
         d.noiseContinentFreq = d.noiseContinentAmp = 0.0f;
         d.noiseDetailFreq = d.noiseDetailAmp = 0.0f;
@@ -1348,7 +1359,10 @@ void Raytracer::updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData&
         d.noiseCaveFreq = d.noiseCaveAmp = 0.0f;
         d.noiseCaveThreshold = 0.0f;
         d.noiseMinHeight = d.noiseMaxHeight = 0.0f;
-        d.noisePad2 = 0.0f;
+        d.noiseDetailWarp = 0.0f;
+        d.noiseSlopeSampleDist = 0.0f;
+        d.noiseBaseHeightOffset = 0.0f;
+        d.noisePad2 = d.noisePad3 = 0.0f;
         d.noiseSeed = 0u;
         d.noiseContinentOctaves = d.noiseDetailOctaves = d.noiseCaveOctaves = 0u;
     }

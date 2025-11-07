@@ -608,10 +608,12 @@ void processRay(const RayPayload rayIn) {
     if (sea0 >= tMin && sea0 <= tMax) sea = min(sea, sea0);
     if (sea1 >= tMin && sea1 <= tMax) sea = min(sea, sea1);
     if (sea < INF_T * 0.5) {
-      float band = 8.0 * g.brickSize;
+      float baseBand = 8.0 * g.brickSize;
+      float bandBelow = max(baseBand, -g.noiseMinHeight + g.brickSize);
+      float bandAbove = max(baseBand, g.noiseMaxHeight + g.brickSize);
       float eps  = 1e-4 * g.brickSize;
-      tBandMin = max(shellEnter, sea - band) + eps;
-      tBandMax = min(shellExit, sea + band);
+      tBandMin = max(shellEnter, sea - bandBelow) + eps;
+      tBandMax = min(shellExit, sea + bandAbove);
     }
   }
 

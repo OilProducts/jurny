@@ -30,7 +30,9 @@ WorldGen::BiomeSample WorldGen::biomeSample(const glm::vec3& p) const {
 
     const float r = glm::length(p);
     const glm::vec3 dir = (r > 0.0f) ? (p / r) : glm::vec3(0.0f, 0.0f, 1.0f);
-    const glm::vec3 warped = math::ApplyDomainWarp(dir, params_, seed_);
+    const float baseRadius = static_cast<float>(planet_.R);
+    const glm::vec3 surfacePoint = dir * baseRadius;
+    const glm::vec3 warped = math::ApplyDomainWarp(surfacePoint, params_, seed_);
 
     const int moistOct = std::max(params_.moistureOctaves, 1);
     const float baseFreq = params_.moistureFrequency;

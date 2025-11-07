@@ -13,6 +13,7 @@ namespace render {
 struct MeshVertex {
     glm::vec3 position;
     glm::vec3 normal;
+    float heightRatio;
 };
 
 struct MeshInstance {
