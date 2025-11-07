@@ -230,7 +230,7 @@ uint32_t BrickStore::classifyMaterial(const glm::vec3& p) const {
     glm::vec3 normal = worldGen_.crustNormal(p, voxelSize_ * 0.75f);
     float slope = 1.0f - glm::clamp(std::abs(glm::dot(normal, up)), 0.0f, 1.0f);
 
-    if (height > 12.0f || temperature < 0.15f) {
+    if (height > 18.0f || temperature < 0.1f) {
         return 3u; // snow / ice
     }
 
@@ -238,17 +238,17 @@ uint32_t BrickStore::classifyMaterial(const glm::vec3& p) const {
         return height > 0.0f ? 5u : 0u; // cliffs vs subterranean rock
     }
 
-    if (height > 4.0f) {
-        return (moisture > 0.35f) ? 2u : 1u; // alpine grass vs dry soil
+    if (height > 6.0f) {
+        return (moisture > 0.30f) ? 2u : 1u; // alpine grass vs dry soil
     }
 
-    if (height > 1.5f) {
-        if (moisture > 0.55f && temperature > 0.25f) return 2u;
+    if (height > 2.0f) {
+        if (moisture > 0.40f && temperature > 0.2f) return 2u;
         return 1u;
     }
 
-    if (height > -1.0f) {
-        return (moisture > 0.35f) ? 4u : 1u; // sandier beaches near sea level
+    if (height > -0.5f) {
+        return (moisture > 0.30f) ? 4u : 1u; // sandier beaches near sea level
     }
 
     return 0u;
@@ -332,51 +332,103 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
         }
     }
 
+    const int fieldApron = kFieldApron;
+    const int samplesPerAxis = brickDim + 1 + 2 * fieldApron;
+    const size_t samplesPerBrick = static_cast<size_t>(samplesPerAxis) *
+                                   static_cast<size_t>(samplesPerAxis) *
+                                   static_cast<size_t>(samplesPerAxis);
+    std::vector<float> fieldSamplesLocal(samplesPerBrick);
+    const glm::vec3 fieldOrigin = brickOrigin - glm::vec3(fieldApron) * voxelSize;
+
+    size_t tsdfIndex = 0;
+    for (int iz = 0; iz < samplesPerAxis; ++iz) {
+        for (int iy = 0; iy < samplesPerAxis; ++iy) {
+            for (int ix = 0; ix < samplesPerAxis; ++ix, ++tsdfIndex) {
+                glm::vec3 vertexPos = fieldOrigin + glm::vec3(ix, iy, iz) * voxelSize;
+                float f = sampleField(vertexPos);
+                minFieldSample = std::min(minFieldSample, f);
+                maxFieldSample = std::max(maxFieldSample, f);
+                fieldSamplesLocal[tsdfIndex] = f;
+            }
+        }
+    }
+
+    auto sampleGrid = [&](int ix, int iy, int iz) -> float {
+        ix = std::clamp(ix, 0, samplesPerAxis - 1);
+        iy = std::clamp(iy, 0, samplesPerAxis - 1);
+        iz = std::clamp(iz, 0, samplesPerAxis - 1);
+        size_t idx = (static_cast<size_t>(iz) * samplesPerAxis + static_cast<size_t>(iy)) * samplesPerAxis + static_cast<size_t>(ix);
+        return fieldSamplesLocal[idx];
+    };
+
+    auto sampleTrilinear = [&](float x, float y, float z) -> float {
+        int ix = static_cast<int>(glm::floor(x));
+        int iy = static_cast<int>(glm::floor(y));
+        int iz = static_cast<int>(glm::floor(z));
+        float fx = x - static_cast<float>(ix);
+        float fy = y - static_cast<float>(iy);
+        float fz = z - static_cast<float>(iz);
+        ix = std::clamp(ix, 0, samplesPerAxis - 2);
+        iy = std::clamp(iy, 0, samplesPerAxis - 2);
+        iz = std::clamp(iz, 0, samplesPerAxis - 2);
+
+        float c000 = sampleGrid(ix,     iy,     iz);
+        float c100 = sampleGrid(ix + 1, iy,     iz);
+        float c010 = sampleGrid(ix,     iy + 1, iz);
+        float c110 = sampleGrid(ix + 1, iy + 1, iz);
+        float c001 = sampleGrid(ix,     iy,     iz + 1);
+        float c101 = sampleGrid(ix + 1, iy,     iz + 1);
+        float c011 = sampleGrid(ix,     iy + 1, iz + 1);
+        float c111 = sampleGrid(ix + 1, iy + 1, iz + 1);
+
+        float c00 = glm::mix(c000, c100, fx);
+        float c01 = glm::mix(c001, c101, fx);
+        float c10 = glm::mix(c010, c110, fx);
+        float c11 = glm::mix(c011, c111, fx);
+        float c0 = glm::mix(c00, c10, fy);
+        float c1 = glm::mix(c01, c11, fy);
+        return glm::mix(c0, c1, fz);
+    };
+
+    std::vector<float> centerFieldSamples(voxelsPerBrick, 0.0f);
     bool any = false;
     const glm::vec3 voxelSteps = glm::vec3(voxelSize);
 
     for (int vz = 0; vz < brickDim; ++vz) {
         for (int vy = 0; vy < brickDim; ++vy) {
             for (int vx = 0; vx < brickDim; ++vx) {
-                glm::vec3 voxelMin = brickOrigin + glm::vec3(vx, vy, vz) * voxelSize;
-                glm::vec3 centerPos = voxelMin + glm::vec3(0.5f) * voxelSteps;
-                float voxelField = sampleField(centerPos);
+                float relX = static_cast<float>(fieldApron + vx) + 0.5f;
+                float relY = static_cast<float>(fieldApron + vy) + 0.5f;
+                float relZ = static_cast<float>(fieldApron + vz) + 0.5f;
+                float voxelField = sampleTrilinear(relX, relY, relZ);
                 minFieldSample = std::min(minFieldSample, voxelField);
                 maxFieldSample = std::max(maxFieldSample, voxelField);
 
+                uint32_t idx = static_cast<uint32_t>(vx + vy * brickDim + vz * brickDim * brickDim);
+                centerFieldSamples[idx] = voxelField;
+
                 bool occupied = (voxelField < 0.0f);
                 if (!occupied) {
-                    // Check corners for a sign change so thin surfaces are not lost.
-                    for (int corner = 0; corner < 8 && !occupied; ++corner) {
-                        glm::vec3 offset(
-                            (corner & 1) ? 1.0f : 0.0f,
-                            (corner & 2) ? 1.0f : 0.0f,
-                            (corner & 4) ? 1.0f : 0.0f);
-                        glm::vec3 cornerPos = voxelMin + offset * voxelSteps;
-                    float cornerField = sampleField(cornerPos);
-                    minFieldSample = std::min(minFieldSample, cornerField);
-                    maxFieldSample = std::max(maxFieldSample, cornerField);
-                    if (cornerField < 0.0f) {
-                        occupied = true;
-                    }
+                    for (int corner = 0; corner < 8; ++corner) {
+                        int cx = fieldApron + vx + ((corner & 1) ? 1 : 0);
+                        int cy = fieldApron + vy + ((corner & 2) ? 1 : 0);
+                        int cz = fieldApron + vz + ((corner & 4) ? 1 : 0);
+                        float cornerField = sampleGrid(cx, cy, cz);
+                        minFieldSample = std::min(minFieldSample, cornerField);
+                        maxFieldSample = std::max(maxFieldSample, cornerField);
+                        if (cornerField < 0.0f) {
+                            occupied = true;
+                            break;
+                        }
                     }
                 }
 
-                uint32_t idx = static_cast<uint32_t>(vx + vy * brickDim + vz * brickDim * brickDim);
                 if (occupied) {
                     uint32_t w = idx >> 6u;
                     uint32_t b = idx & 63u;
                     outOcc[w] |= (1ull << b);
                     any = true;
                 }
-
-                constexpr float kInteriorBias = 0.75f;
-                const float interiorThreshold = -voxelSize * kInteriorBias;
-                uint16_t materialId = 0u; // subterranean rock default
-                if (voxelField > interiorThreshold) {
-                    materialId = static_cast<uint16_t>(classifyMaterial(centerPos));
-                }
-                outMaterials[idx] = materialId;
             }
         }
     }
@@ -395,29 +447,23 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
         return false;
     }
 
-    constexpr bool kCacheFieldSamples = true;
-    if (kCacheFieldSamples) {
-        const int fieldApron = kFieldApron;
-        const int samplesPerAxis = brickDim + 1 + 2 * fieldApron;
-        const size_t samplesPerBrick = static_cast<size_t>(samplesPerAxis) *
-                                       static_cast<size_t>(samplesPerAxis) *
-                                       static_cast<size_t>(samplesPerAxis);
-        outField.resize(samplesPerBrick);
-        size_t sampleIdx = 0;
-        const glm::vec3 fieldOrigin = brickOrigin - glm::vec3(fieldApron) * voxelSize;
-        for (int iz = 0; iz < samplesPerAxis; ++iz) {
-            for (int iy = 0; iy < samplesPerAxis; ++iy) {
-                for (int ix = 0; ix < samplesPerAxis; ++ix, ++sampleIdx) {
-                    glm::vec3 vertexPos = fieldOrigin + glm::vec3(ix, iy, iz) * voxelSize;
-                    float f = sampleField(vertexPos);
-                    minFieldSample = std::min(minFieldSample, f);
-                    maxFieldSample = std::max(maxFieldSample, f);
-                    outField[sampleIdx] = f;
+    constexpr float kInteriorBias = 0.75f;
+    const float interiorThreshold = -voxelSize * kInteriorBias;
+    for (int vz = 0; vz < brickDim; ++vz) {
+        for (int vy = 0; vy < brickDim; ++vy) {
+            for (int vx = 0; vx < brickDim; ++vx) {
+                glm::vec3 voxelMin = brickOrigin + glm::vec3(vx, vy, vz) * voxelSize;
+                glm::vec3 centerPos = voxelMin + glm::vec3(0.5f) * voxelSteps;
+                uint32_t idx = static_cast<uint32_t>(vx + vy * brickDim + vz * brickDim * brickDim);
+                float voxelField = centerFieldSamples[idx];
+
+                uint16_t materialId = 0u; // subterranean rock default
+                if (voxelField > interiorThreshold) {
+                    materialId = static_cast<uint16_t>(classifyMaterial(centerPos));
                 }
+                outMaterials[idx] = materialId;
             }
         }
-    } else {
-        outField.clear();
     }
 
     static std::atomic<uint32_t> loggingBudget{0};
@@ -439,6 +485,13 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
             spdlog::debug("BrickStore: surface-crossing brick ({}, {}, {}) minF={} maxF={}",
                           bc.x, bc.y, bc.z, minFieldSample, maxFieldSample);
         }
+    }
+
+    constexpr bool kCacheFieldSamples = true;
+    if (kCacheFieldSamples) {
+        outField = std::move(fieldSamplesLocal);
+    } else {
+        outField.clear();
     }
 
     return true;

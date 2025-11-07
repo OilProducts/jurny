@@ -29,7 +29,14 @@ void Jobs::start(int threads) {
     stopRequested_ = false;
     const auto hc = static_cast<int>(std::thread::hardware_concurrency());
     int desired = threads;
-    if (desired <= 0) desired = hc > 0 ? std::max(1, hc - 1) : 1;
+    if (desired <= 0) {
+        if (hc > 0) {
+            int half = hc / 2;
+            desired = std::max(1, half - 1);
+        } else {
+            desired = 1;
+        }
+    }
 
     threads_.reserve(static_cast<std::size_t>(desired));
     for (int i = 0; i < desired; ++i) {
