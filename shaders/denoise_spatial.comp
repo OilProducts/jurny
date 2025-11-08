@@ -1,0 +1,92 @@
+#version 460
+
+#define VOXEL_NO_DISPATCH_PUSH 1
+#include "common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 18, rgba16f) uniform readonly image2D albedoImage;
+layout(set = 0, binding = 19, rgba16f) uniform readonly image2D normalImage;
+layout(set = 0, binding = 22, rgba16f) uniform readonly image2D historyMomentsImage;
+
+layout(set = 0, binding = 29, rgba16f) uniform image2D spatialImage0;
+layout(set = 0, binding = 30, rgba16f) uniform image2D spatialImage1;
+
+layout(push_constant) uniform AtrousPush {
+  uint srcIndex;
+  uint dstIndex;
+  uint stepWidth;
+  float phiColor;
+  float phiNormal;
+  float phiDepth;
+  float phiLuminance;
+  float padding;
+} pc;
+
+const float kernel[5] = float[](1.0 / 16.0, 1.0 / 4.0, 3.0 / 8.0, 1.0 / 4.0, 1.0 / 16.0);
+
+vec4 loadSpatial(uint idx, ivec2 pix) {
+  return (idx == 0u) ? imageLoad(spatialImage0, pix)
+                     : imageLoad(spatialImage1, pix);
+}
+
+void storeSpatial(uint idx, ivec2 pix, vec4 value) {
+  if (idx == 0u) {
+    imageStore(spatialImage0, pix, value);
+  } else {
+    imageStore(spatialImage1, pix, value);
+  }
+}
+
+float luma(vec3 c) {
+  return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+void main() {
+  ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+  if (pix.x >= int(g.width) || pix.y >= int(g.height)) return;
+
+  vec4 centerColor = loadSpatial(pc.srcIndex, pix);
+  vec4 normalDepth = imageLoad(normalImage, pix);
+  vec3 centerNormal = normalDepth.xyz * 2.0 - 1.0;
+  float centerDepth = normalDepth.w;
+  vec4 centerMoments = imageLoad(historyMomentsImage, pix);
+  float centerVariance = max(centerMoments.y - centerMoments.x * centerMoments.x, 0.0);
+  float centerLuma = luma(centerColor.rgb);
+  vec4 centerAlbedoPacked = imageLoad(albedoImage, pix);
+  vec3 centerAlbedo = centerAlbedoPacked.rgb;
+
+  vec3 sum = vec3(0.0);
+  float weightSum = 0.0;
+
+  for (int ky = -2; ky <= 2; ++ky) {
+    for (int kx = -2; kx <= 2; ++kx) {
+      float kernelWeight = kernel[kx + 2] * kernel[ky + 2];
+      ivec2 offset = ivec2(kx, ky) * int(pc.stepWidth);
+      ivec2 samplePix = clamp(pix + offset, ivec2(0), ivec2(int(g.width) - 1, int(g.height) - 1));
+      vec4 sampleColor = loadSpatial(pc.srcIndex, samplePix);
+      vec4 sampleNormalDepth = imageLoad(normalImage, samplePix);
+      vec3 sampleNormal = sampleNormalDepth.xyz * 2.0 - 1.0;
+      float sampleDepth = sampleNormalDepth.w;
+      vec4 sampleMoments = imageLoad(historyMomentsImage, samplePix);
+      float sampleVariance = max(sampleMoments.y - sampleMoments.x * sampleMoments.x, 0.0);
+      vec4 sampleAlbedoPacked = imageLoad(albedoImage, samplePix);
+      vec3 sampleAlbedo = sampleAlbedoPacked.rgb;
+
+      float normalTerm = max(dot(centerNormal, sampleNormal), 0.0);
+      float wNormal = exp(-max(0.0, 1.0 - normalTerm) * pc.phiNormal);
+      float wDepth = exp(-abs(sampleDepth - centerDepth) * pc.phiDepth);
+      float wColor = exp(-abs(luma(sampleColor.rgb) - centerLuma) * pc.phiColor);
+      float wAlbedo = exp(-length(sampleAlbedo - centerAlbedo) * pc.phiLuminance);
+      float variance = max(centerVariance, sampleVariance);
+      float wVariance = 1.0 / (1.0 + variance);
+
+      float weight = kernelWeight * wNormal * wDepth * wColor * wAlbedo * wVariance;
+      sum += sampleColor.rgb * weight;
+      weightSum += weight;
+    }
+  }
+
+  vec3 filtered = (weightSum > 1e-4) ? (sum / weightSum) : centerColor.rgb;
+  storeSpatial(pc.dstIndex, pix, vec4(filtered, 1.0));
+}

@@ -112,6 +112,7 @@ private:
     VkPipeline            pipeTemporal_{};
     VkPipeline            pipeTraverse_{};
     VkPipeline            pipeComposite_{};
+    VkPipeline            pipeAtrous_{};
     VkPipeline            pipeOverlay_{};
     VkDescriptorPool      descPool_{};
     std::vector<VkDescriptorSet> sets_;

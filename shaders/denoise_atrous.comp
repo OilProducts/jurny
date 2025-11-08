@@ -42,7 +42,9 @@ void main() {
   vec2 velocity = motion.xy;
   float valid = motion.z;
 
-  vec3 albedo = imageLoad(albedoImage, pix).rgb;
+  vec4 albedoPacked = imageLoad(albedoImage, pix);
+  vec3 albedo = albedoPacked.rgb;
+  float materialId = albedoPacked.a;
   vec4 normalDepth = imageLoad(normalImage, pix);
   vec3 normal = normalDepth.xyz * 2.0 - 1.0;
   float depth = normalDepth.w;
@@ -61,26 +63,36 @@ void main() {
       float prevLength = prevMoments.z;
       float prevDepth = prevMoments.w;
       bool prevValid = (prevLength > 0.0);
-      float normalFactor = clamp(abs(normal.z), 0.2, 1.0);
-      float depthThreshold = max(0.01, depth * 0.01 / normalFactor);
-      if (prevValid && abs(prevDepth - depth) <= depthThreshold) {
-        float albedoLuma = dot(albedo, vec3(0.299, 0.587, 0.114));
-        float moment1Prev = prevMoments.x;
-        float moment2Prev = prevMoments.y;
-        float variancePrev = max(moment2Prev - moment1Prev * moment1Prev, 0.0);
-        float sigma = sqrt(variancePrev);
-        float historyLen = clamp(prevLength + 1.0, 1.0, 64.0);
-        float alpha = 1.0 / historyLen;
-        float clampK = mix(1.0, 1.5, albedoLuma);
-        vec3 minColor = curr.rgb - vec3(clampK * sigma);
-        vec3 maxColor = curr.rgb + vec3(clampK * sigma);
-        vec3 clampedHistory = clamp(historyColor.rgb, minColor, maxColor);
-        vec3 blendedColor = mix(clampedHistory, curr.rgb, alpha);
-        float blendedMoment1 = mix(moment1Prev, currMoment1, alpha);
-        float blendedMoment2 = mix(moment2Prev, currMoment2, alpha);
-        curr = vec4(blendedColor, 1.0);
-        historyMoments = vec4(blendedMoment1, blendedMoment2, historyLen, depth);
-        historyUsed = true;
+      if (prevValid) {
+        vec4 prevNormalDepth = imageLoad(normalImage, prevPix);
+        vec3 prevNormal = prevNormalDepth.xyz * 2.0 - 1.0;
+        float prevDepthCurrent = prevNormalDepth.w;
+        vec4 prevAlbedoPacked = imageLoad(albedoImage, prevPix);
+        float prevMaterialId = prevAlbedoPacked.a;
+        float normalSimilarity = max(dot(normal, prevNormal), 0.0);
+        float depthDelta = abs(prevDepthCurrent - depth) / max(max(depth, prevDepthCurrent), 1e-3);
+        bool materialOk = abs(prevMaterialId - materialId) <= 1e-3;
+        bool normalOk = normalSimilarity >= 0.8;
+        bool depthOk = depthDelta <= 0.02;
+        if (materialOk && normalOk && depthOk && abs(prevDepth - depth) <= 0.05) {
+          float moment1Prev = prevMoments.x;
+          float moment2Prev = prevMoments.y;
+          float variancePrev = max(moment2Prev - moment1Prev * moment1Prev, 0.0);
+          float varianceCurr = max(currMoment2 - currMoment1 * currMoment1, 0.0);
+          float sigma = sqrt(max(max(variancePrev, varianceCurr), 1e-6));
+          float historyLen = clamp(prevLength + 1.0, 1.0, 64.0);
+          float alpha = 1.0 / historyLen;
+          float clampK = mix(1.0, 1.5, dot(albedo, vec3(0.299, 0.587, 0.114)));
+          vec3 minColor = curr.rgb - vec3(clampK * sigma);
+          vec3 maxColor = curr.rgb + vec3(clampK * sigma);
+          vec3 clampedHistory = clamp(historyColor.rgb, minColor, maxColor);
+          vec3 blendedColor = mix(clampedHistory, curr.rgb, alpha);
+          float blendedMoment1 = mix(moment1Prev, currMoment1, alpha);
+          float blendedMoment2 = mix(moment2Prev, currMoment2, alpha);
+          curr = vec4(blendedColor, 1.0);
+          historyMoments = vec4(blendedMoment1, blendedMoment2, historyLen, depth);
+          historyUsed = true;
+        }
       }
     }
   }

@@ -37,6 +37,17 @@ struct RayDispatchConstants {
     uint32_t bounceCount;
 };
 
+struct AtrousPushConstants {
+    uint32_t srcIndex;
+    uint32_t dstIndex;
+    uint32_t stepWidth;
+    float phiColor;
+    float phiNormal;
+    float phiDepth;
+    float phiLuminance;
+    float padding;
+};
+
 static uint32_t findMemoryType(VkPhysicalDevice phys, uint32_t typeBits, VkMemoryPropertyFlags req) {
     VkPhysicalDeviceMemoryProperties mp{}; vkGetPhysicalDeviceMemoryProperties(phys, &mp);
     for (uint32_t i=0;i<mp.memoryTypeCount;++i) {
@@ -343,7 +354,9 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     VkDescriptorSetLayoutBinding bField{ }; bField.binding=26; bField.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bField.descriptorCount=1; bField.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bOverlayBuf{}; bOverlayBuf.binding=27; bOverlayBuf.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bOverlayBuf.descriptorCount=1; bOverlayBuf.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bOverlayImage{}; bOverlayImage.binding=28; bOverlayImage.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bOverlayImage.descriptorCount=1; bOverlayImage.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutBinding bindings[29] = { bUbo, bAcc, bOut, bBH, bOcc, bHK, bHV, bMK, bMV, bDBG, bRayQ, bHitQ, bMissQ, bSecQ, bStats, bMotion, bHistRead, bHistWrite, bAlbedo, bNormal, bMoments, bHistMomentsRead, bHistMomentsWrite, bMatIdx, bMatTable, bPalette, bField, bOverlayBuf, bOverlayImage };
+    VkDescriptorSetLayoutBinding bSpatialSrc{}; bSpatialSrc.binding=29; bSpatialSrc.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bSpatialSrc.descriptorCount=1; bSpatialSrc.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding bSpatialDst{}; bSpatialDst.binding=30; bSpatialDst.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bSpatialDst.descriptorCount=1; bSpatialDst.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding bindings[31] = { bUbo, bAcc, bOut, bBH, bOcc, bHK, bHV, bMK, bMV, bDBG, bRayQ, bHitQ, bMissQ, bSecQ, bStats, bMotion, bHistRead, bHistWrite, bAlbedo, bNormal, bMoments, bHistMomentsRead, bHistMomentsWrite, bMatIdx, bMatTable, bPalette, bField, bOverlayBuf, bOverlayImage, bSpatialSrc, bSpatialDst };
     VkDescriptorSetLayoutCreateInfo dslci{};
     dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     dslci.bindingCount = static_cast<uint32_t>(sizeof(bindings) / sizeof(bindings[0]));
@@ -356,7 +369,7 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     VkPushConstantRange pcr{};
     pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pcr.offset = 0;
-    pcr.size = sizeof(RayDispatchConstants);
+    pcr.size = sizeof(AtrousPushConstants);
     plci.pushConstantRangeCount = 1;
     plci.pPushConstantRanges = &pcr;
     if (vkCreatePipelineLayout(vk.device(), &plci, nullptr, &pipeLayout_) != VK_SUCCESS) return false;
@@ -431,10 +444,11 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     VkShaderModule smGen   = loadShader("generate_rays.comp.spv");
     VkShaderModule smShade = loadShader("shade.comp.spv");
     VkShaderModule smTemporal = loadShader("denoise_atrous.comp.spv");
+    VkShaderModule smAtrous = loadShader("denoise_spatial.comp.spv");
     VkShaderModule smTrav  = loadShader("traverse_bricks.comp.spv");
     VkShaderModule smComp  = loadShader("composite.comp.spv");
     VkShaderModule smOverlay = loadShader("overlay.comp.spv");
-    if (!smGen || !smShade || !smTemporal || !smTrav || !smComp || !smOverlay) return false;
+    if (!smGen || !smShade || !smTemporal || !smAtrous || !smTrav || !smComp || !smOverlay) return false;
     VkComputePipelineCreateInfo cpci{};
     cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     VkPipelineShaderStageCreateInfo ss{};
@@ -445,6 +459,7 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     ss.module = smGen;   cpci.stage = ss; if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeGenerate_) != VK_SUCCESS) return false;
     ss.module = smShade; cpci.stage = ss; if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeShade_) != VK_SUCCESS) return false;
     ss.module = smTemporal; cpci.stage = ss; if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeTemporal_) != VK_SUCCESS) return false;
+    ss.module = smAtrous; cpci.stage = ss; if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeAtrous_) != VK_SUCCESS) return false;
     ss.module = smTrav;  cpci.stage = ss; if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeTraverse_) != VK_SUCCESS) return false;
     ss.module = smComp;  cpci.stage = ss;
     if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeComposite_) != VK_SUCCESS) return false;
@@ -453,6 +468,7 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     vkDestroyShaderModule(vk.device(), smGen, nullptr);
     vkDestroyShaderModule(vk.device(), smShade, nullptr);
     vkDestroyShaderModule(vk.device(), smTemporal, nullptr);
+    vkDestroyShaderModule(vk.device(), smAtrous, nullptr);
     vkDestroyShaderModule(vk.device(), smTrav, nullptr);
     vkDestroyShaderModule(vk.device(), smComp, nullptr);
     vkDestroyShaderModule(vk.device(), smOverlay, nullptr);
@@ -462,6 +478,7 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
 void Raytracer::destroyPipelines(platform::VulkanContext& vk) {
     if (pipeComposite_) { vkDestroyPipeline(vk.device(), pipeComposite_, nullptr); pipeComposite_ = VK_NULL_HANDLE; }
     if (pipeTemporal_) { vkDestroyPipeline(vk.device(), pipeTemporal_, nullptr); pipeTemporal_ = VK_NULL_HANDLE; }
+    if (pipeAtrous_) { vkDestroyPipeline(vk.device(), pipeAtrous_, nullptr); pipeAtrous_ = VK_NULL_HANDLE; }
     if (pipeShade_) { vkDestroyPipeline(vk.device(), pipeShade_, nullptr); pipeShade_ = VK_NULL_HANDLE; }
     if (pipeTraverse_) { vkDestroyPipeline(vk.device(), pipeTraverse_, nullptr); pipeTraverse_ = VK_NULL_HANDLE; }
     if (pipeGenerate_) { vkDestroyPipeline(vk.device(), pipeGenerate_, nullptr); pipeGenerate_ = VK_NULL_HANDLE; }
@@ -567,8 +584,10 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
         VkDescriptorBufferInfo dbField{ fieldBuf_.buffer, 0, fieldBuf_.size > 0 ? fieldBuf_.size : VK_WHOLE_SIZE };
         VkDescriptorBufferInfo dbOverlay{ overlays_.buffer(), 0, overlays_.capacity() ? overlays_.capacity() : VK_WHOLE_SIZE };
         VkDescriptorImageInfo diOverlay{}; diOverlay.imageView = swap.imageViews()[i]; diOverlay.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo diSpatialSrc{}; diSpatialSrc.imageView = denoiser_.historyWriteView(); diSpatialSrc.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo diSpatialDst{}; diSpatialDst.imageView = gpuBuffers_.colorView(); diSpatialDst.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet writes[23]{};
+        VkWriteDescriptorSet writes[25]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[0].dstSet = sets_[i]; writes[0].dstBinding=0; writes[0].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; writes[0].descriptorCount=1; writes[0].pBufferInfo=&db;
         writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[1].dstSet = sets_[i]; writes[1].dstBinding=1; writes[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[1].descriptorCount=1; writes[1].pImageInfo=&diCurr;
         writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[2].dstSet = sets_[i]; writes[2].dstBinding=2; writes[2].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[2].descriptorCount=1; writes[2].pImageInfo=&diOut;
@@ -592,6 +611,8 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
         writes[20].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[20].dstSet=sets_[i]; writes[20].dstBinding=26; writes[20].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[20].descriptorCount=1; writes[20].pBufferInfo=&dbField;
         writes[21].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[21].dstSet=sets_[i]; writes[21].dstBinding=27; writes[21].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[21].descriptorCount=1; writes[21].pBufferInfo=&dbOverlay;
         writes[22].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[22].dstSet=sets_[i]; writes[22].dstBinding=28; writes[22].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[22].descriptorCount=1; writes[22].pImageInfo=&diOverlay;
+        writes[23].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[23].dstSet=sets_[i]; writes[23].dstBinding=29; writes[23].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[23].descriptorCount=1; writes[23].pImageInfo=&diSpatialSrc;
+        writes[24].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[24].dstSet=sets_[i]; writes[24].dstBinding=30; writes[24].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[24].descriptorCount=1; writes[24].pImageInfo=&diSpatialDst;
         uint32_t writeCount = static_cast<uint32_t>(sizeof(writes) / sizeof(writes[0]));
         vkUpdateDescriptorSets(vk.device(), writeCount, writes, 0, nullptr);
     }
@@ -1255,8 +1276,10 @@ void Raytracer::updateFrameDescriptors(platform::VulkanContext& vk, platform::Sw
     VkDescriptorImageInfo diHistMomentsWrite{ VK_NULL_HANDLE, historyMomentsWriteView, VK_IMAGE_LAYOUT_GENERAL };
 
     VkDescriptorImageInfo diOverlay{ VK_NULL_HANDLE, swap.imageViews()[swapIndex], VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo diSpatialSrc{ VK_NULL_HANDLE, historyWriteView, VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo diSpatialDst{ VK_NULL_HANDLE, gpuBuffers_.colorView(), VK_IMAGE_LAYOUT_GENERAL };
 
-    std::array<VkWriteDescriptorSet, 8> writes{};
+    std::array<VkWriteDescriptorSet, 10> writes{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = sets_[swapIndex];
     writes[0].dstBinding = 1;
@@ -1312,6 +1335,20 @@ void Raytracer::updateFrameDescriptors(platform::VulkanContext& vk, platform::Sw
     writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     writes[7].descriptorCount = 1;
     writes[7].pImageInfo = &diOverlay;
+
+    writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[8].dstSet = sets_[swapIndex];
+    writes[8].dstBinding = 29;
+    writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[8].descriptorCount = 1;
+    writes[8].pImageInfo = &diSpatialSrc;
+
+    writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[9].dstSet = sets_[swapIndex];
+    writes[9].dstBinding = 30;
+    writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[9].descriptorCount = 1;
+    writes[9].pImageInfo = &diSpatialDst;
 
     vkUpdateDescriptorSets(vk.device(), static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -1584,6 +1621,39 @@ void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, V
         dep.imageMemoryBarrierCount = static_cast<uint32_t>(histBarriers.size());
         dep.pImageMemoryBarriers = histBarriers.data();
         vkCmdPipelineBarrier2(cb, &dep);
+
+        if (pipeAtrous_) {
+            const uint32_t atrousIterations = 4u;
+            uint32_t srcIdx = 0u;
+            uint32_t dstIdx = 1u;
+            uint32_t txSpatial = (extent_.width + 7u) / 8u;
+            uint32_t tySpatial = (extent_.height + 7u) / 8u;
+            for (uint32_t iter = 0u; iter < atrousIterations; ++iter) {
+                AtrousPushConstants apc{};
+                apc.srcIndex = srcIdx;
+                apc.dstIndex = dstIdx;
+                apc.stepWidth = 1u << iter;
+                apc.phiColor = 4.0f;
+                apc.phiNormal = 32.0f;
+                apc.phiDepth = 4.0f;
+                apc.phiLuminance = 2.0f;
+                apc.padding = 0.0f;
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeAtrous_);
+                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_, 0, 1, &sets_[swapIndex], 0, nullptr);
+                vkCmdPushConstants(cb, pipeLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(AtrousPushConstants), &apc);
+                vkCmdDispatch(cb, txSpatial, tySpatial, 1);
+
+                VkImage dstImage = (dstIdx == 0u) ? denoiser_.historyWriteImage() : gpuBuffers_.colorImage();
+                auto spatialBarrier = makeBarrier(dstImage);
+                VkDependencyInfo depSpatial{};
+                depSpatial.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                depSpatial.imageMemoryBarrierCount = 1;
+                depSpatial.pImageMemoryBarriers = &spatialBarrier;
+                vkCmdPipelineBarrier2(cb, &depSpatial);
+
+                std::swap(srcIdx, dstIdx);
+            }
+        }
     }
 
     // Composite: read temporally accumulated history, write swap image already in GENERAL from App

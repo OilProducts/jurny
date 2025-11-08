@@ -55,6 +55,7 @@ struct GlobalsUBO_t {
 layout(set = 0, binding = 0) uniform GlobalsUBO { GlobalsUBO_t g; };
 #endif
 
+#ifndef VOXEL_NO_DISPATCH_PUSH
 struct DispatchParams {
   uint queueSrc;   // 0 = RayQueueIn, 1 = SecondaryQueue
   uint queueDst;   // destination queue for spawned rays
@@ -65,6 +66,7 @@ struct DispatchParams {
 layout(push_constant) uniform DispatchPush {
   DispatchParams dispatch;
 };
+#endif
 
 // layout(set=0, binding=0) uniform GlobalsUBO { GlobalsUBO_t g; };
 // Note: bind this only in passes that need it; first_pixels.comp does not include this file.
