@@ -230,25 +230,43 @@ uint32_t BrickStore::classifyMaterial(const glm::vec3& p) const {
     glm::vec3 normal = worldGen_.crustNormal(p, voxelSize_ * 0.75f);
     float slope = 1.0f - glm::clamp(std::abs(glm::dot(normal, up)), 0.0f, 1.0f);
 
-    if (height > 18.0f || temperature < 0.1f) {
-        return 3u; // snow / ice
+    // IDs (match defaults):
+    // 0: rock, 1: dirt, 2: grass, 3: snow/ice, 4: sand, 5: basalt cliff, 6: lava (emissive)
+
+    // Deep underground or below sea level: occasional lava pockets
+    if (height < -4.0f) {
+        float lavaNoise = std::sin(p.x * 0.15f + p.y * 0.07f + p.z * 0.21f);
+        if (lavaNoise > 0.85f) {
+            return 6u;
+        }
+        return 0u;
     }
 
-    if (slope > 0.6f) {
-        return height > 0.0f ? 5u : 0u; // cliffs vs subterranean rock
+    if (height > 22.0f || temperature < 0.08f) {
+        return 3u;
     }
 
-    if (height > 6.0f) {
-        return (moisture > 0.30f) ? 2u : 1u; // alpine grass vs dry soil
+    if (slope > 0.65f) {
+        return height > 0.0f ? 5u : 0u;
     }
 
-    if (height > 2.0f) {
-        if (moisture > 0.40f && temperature > 0.2f) return 2u;
+    if (height > 10.0f) {
+        return (moisture > 0.35f) ? 2u : 1u;
+    }
+
+    if (height > 3.5f) {
+        if (moisture > 0.45f && temperature > 0.25f) return 2u;
         return 1u;
     }
 
-    if (height > -0.5f) {
-        return (moisture > 0.30f) ? 4u : 1u; // sandier beaches near sea level
+    if (height > -1.0f) {
+        if (moisture > 0.45f && temperature > 0.3f) return 2u;
+        if (moisture > 0.25f) return 4u;
+        return 1u;
+    }
+
+    if (height > -3.0f) {
+        return 4u;
     }
 
     return 0u;
