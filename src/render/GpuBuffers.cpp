@@ -298,6 +298,19 @@ void GpuBuffers::writeQueueHeaders(VkCommandBuffer cb) const {
     }
 }
 
+void GpuBuffers::resetQueueHeader(VkCommandBuffer cb, Queue q) const {
+    if (queueCapacity_ == 0) return;
+    VkBuffer buf = queues_[static_cast<size_t>(q)];
+    if (!buf) return;
+    struct Header {
+        uint32_t head;
+        uint32_t tail;
+        uint32_t capacity;
+        uint32_t dropped;
+    } hdr{0u, 0u, queueCapacity_, 0u};
+    vkCmdUpdateBuffer(cb, buf, 0, sizeof(Header), &hdr);
+}
+
 void GpuBuffers::zeroStats(VkCommandBuffer cb) const {
     if (!statsBuf_) return;
     vkCmdFillBuffer(cb, statsBuf_, 0, sizeof(uint32_t) * 8, 0);

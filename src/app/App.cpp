@@ -224,7 +224,7 @@ int App::run() {
     bool blockPrevDown = false; // edge-trigger for 'B'
     const uint32_t blockNormalFlag = 32u;
     uint32_t debugFlags = 0u; // smooth normals, macro skip off by default
-    glm::dvec3 camWorld = glm::dvec3(double(planetRadius) + 5.0, 0.0, 5.0);
+    glm::dvec3 camWorld = glm::dvec3(double(planetRadius) + 40.0, 0.0, 0.0);
     glm::dvec3 prevRenderOrigin = camWorld;
     glm::mat4 prevViewMat(1.0f);
     glm::mat4 prevProjMat(1.0f);
@@ -712,7 +712,7 @@ int App::run() {
         data.planetRadius = planetRadiusForUBO;
         data.exposure = 1.0f;
         data.frameIdx = frameCounter;
-        data.maxBounces = 0;
+        data.maxBounces = 1;
         data.width = swap.extent().width;
         data.height = swap.extent().height;
         data.raysPerPixel = 1;

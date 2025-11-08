@@ -158,6 +158,7 @@ private:
     uint32_t lastDbgFrame_{}; int lastMcX_{}; int lastMcY_{}; int lastMcZ_{}; int lastPresent_{};
     uint32_t currFrameIdx_{};
     glm::vec3 renderOrigin_{0.0f};
+    GlobalsUBOData globalsCpu_{};
     GpuBuffers gpuBuffers_;
     Denoiser denoiser_;
     bool denoiseEnabled_ = false;

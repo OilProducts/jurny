@@ -46,6 +46,7 @@ public:
     VkDeviceMemory queueMemory(Queue q) const { return queueMemory_[static_cast<size_t>(q)]; }
     uint32_t queueCapacity() const { return queueCapacity_; }
     void writeQueueHeaders(VkCommandBuffer cb) const;
+    void resetQueueHeader(VkCommandBuffer cb, Queue q) const;
 
     VkBuffer statsBuffer() const { return statsBuf_; }
     VkDeviceMemory statsMemory() const { return statsMem_; }

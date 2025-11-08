@@ -30,6 +30,13 @@ constexpr VkDeviceSize kOverlayBufferBytes = (4u + kOverlayMaxCols * kOverlayMax
 constexpr bool kCacheFieldSamples = true;
 }
 
+struct RayDispatchConstants {
+    uint32_t queueSrc;
+    uint32_t queueDst;
+    uint32_t bounceIndex;
+    uint32_t bounceCount;
+};
+
 static uint32_t findMemoryType(VkPhysicalDevice phys, uint32_t typeBits, VkMemoryPropertyFlags req) {
     VkPhysicalDeviceMemoryProperties mp{}; vkGetPhysicalDeviceMemoryProperties(phys, &mp);
     for (uint32_t i=0;i<mp.memoryTypeCount;++i) {
@@ -346,6 +353,12 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     plci.setLayoutCount = 1;
     plci.pSetLayouts = &setLayout_;
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcr.offset = 0;
+    pcr.size = sizeof(RayDispatchConstants);
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &pcr;
     if (vkCreatePipelineLayout(vk.device(), &plci, nullptr, &pipeLayout_) != VK_SUCCESS) return false;
 
     auto readFile = [](const char* path) -> std::vector<uint32_t> {
@@ -1372,6 +1385,7 @@ void Raytracer::updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData&
     std::memcpy(mapped, &d, sizeof(GlobalsUBOData));
     vkUnmapMemory(vk.device(), uboMem_);
     currFrameIdx_ = d.frameIdx;
+    globalsCpu_ = d;
 }
 
 void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, VkCommandBuffer cb, uint32_t swapIndex) {
@@ -1386,6 +1400,14 @@ void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, V
     updateFrameDescriptors(vk, swap, swapIndex);
     gpuBuffers_.writeQueueHeaders(cb);
     gpuBuffers_.zeroStats(cb);
+    const uint32_t bounceCount = std::max(1u, globalsCpu_.maxBounces == 0u ? 1u : globalsCpu_.maxBounces);
+    auto pushDispatchConstants = [&](uint32_t queueSrc, uint32_t queueDst, uint32_t bounceIndex) {
+        RayDispatchConstants constants{queueSrc, queueDst, bounceIndex, bounceCount};
+        vkCmdPushConstants(cb, pipeLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RayDispatchConstants), &constants);
+    };
+    auto queueFromIndex = [](uint32_t idx) {
+        return (idx == 0u) ? GpuBuffers::Queue::Ray : GpuBuffers::Queue::Secondary;
+    };
     auto issueBarrier = [&](VkPipelineStageFlags2 srcStage2,
                             VkAccessFlags2 srcAccess2,
                             VkPipelineStageFlags2 dstStage2,
@@ -1441,6 +1463,7 @@ void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, V
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_, 0, 1, &sets_[swapIndex], 0, nullptr);
     uint32_t gx = (extent_.width + 7u) / 8u;
     uint32_t gy = (extent_.height + 7u) / 8u;
+    pushDispatchConstants(0u, 1u, 0u);
     if (kEnableGenerateStage) {
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeGenerate_);
         vkCmdDispatch(cb, gx, gy, 1);
@@ -1458,32 +1481,43 @@ void Raytracer::record(platform::VulkanContext& vk, platform::Swapchain& swap, V
         writeTimestamp(2);
     }
 
-    // Traverse rays into queues
-    if (kEnableTraverseStage) {
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeTraverse_);
-        vkCmdDispatch(cb, gx, gy, 1);
-    }
-    // Ensure queue writes are visible to shading pass
-    if (kEnableTraverseStage && kEnableShadeStage) {
-        issueBarrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                     VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                     VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                     VK_ACCESS_SHADER_WRITE_BIT,
-                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        writeTimestamp(3);
-    }
+    for (uint32_t bounce = 0; bounce < bounceCount; ++bounce) {
+        const uint32_t srcIdx = (bounce & 1u) == 0u ? 0u : 1u;
+        const uint32_t dstIdx = (bounce & 1u) == 0u ? 1u : 0u;
+        pushDispatchConstants(srcIdx, dstIdx, bounce);
+        gpuBuffers_.resetQueueHeader(cb, queueFromIndex(dstIdx));
+        gpuBuffers_.resetQueueHeader(cb, GpuBuffers::Queue::Hit);
+        gpuBuffers_.resetQueueHeader(cb, GpuBuffers::Queue::Miss);
 
-    // Shade hits/misses from queues into current color/motion targets
-    if (kEnableShadeStage) {
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeShade_);
-        uint32_t shadeGroups = gx * gy; // one workgroup per traverse workgroup (64 threads)
-        writeTimestamp(4);
-        vkCmdDispatch(cb, shadeGroups, 1, 1);
-        if (timestampPool_) {
-            vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 5);
+        if (kEnableTraverseStage) {
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeTraverse_);
+            vkCmdDispatch(cb, gx, gy, 1);
+        }
+
+        if (kEnableTraverseStage && kEnableShadeStage) {
+            issueBarrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            if (bounce == 0u) {
+                writeTimestamp(3);
+            }
+        }
+
+        if (kEnableShadeStage) {
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeShade_);
+            uint32_t shadeGroups = gx * gy;
+            if (bounce == 0u) {
+                writeTimestamp(4);
+            }
+            vkCmdDispatch(cb, shadeGroups, 1, 1);
+            if (bounce == 0u && timestampPool_) {
+                vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, timestampPool_, 5);
+            }
         }
     }
 

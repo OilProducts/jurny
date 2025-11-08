@@ -55,6 +55,17 @@ struct GlobalsUBO_t {
 layout(set = 0, binding = 0) uniform GlobalsUBO { GlobalsUBO_t g; };
 #endif
 
+struct DispatchParams {
+  uint queueSrc;   // 0 = RayQueueIn, 1 = SecondaryQueue
+  uint queueDst;   // destination queue for spawned rays
+  uint bounceIndex;
+  uint bounceCount;
+};
+
+layout(push_constant) uniform DispatchPush {
+  DispatchParams dispatch;
+};
+
 // layout(set=0, binding=0) uniform GlobalsUBO { GlobalsUBO_t g; };
 // Note: bind this only in passes that need it; first_pixels.comp does not include this file.
 

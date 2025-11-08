@@ -344,7 +344,7 @@ bool fetchMaterialId(uint linearIndex, BrickHeader h, out uint materialId) {
 // Queue helpers
 // -------------------------------------------------------------------------------------------------
 
-bool dequeueRay(out RayPayload ray) {
+bool dequeuePrimaryRay(out RayPayload ray) {
   for (;;) {
     uint idx = atomicAdd(RayQueueIn.header.head, 1u);
     uint tail = RayQueueIn.header.tail;
@@ -356,6 +356,25 @@ bool dequeueRay(out RayPayload ray) {
     atomicAdd(RayQueueIn.header.head, uint(0u - 1u));
     if (idx >= tail) return false;
   }
+}
+
+bool dequeueSecondaryRay(out RayPayload ray) {
+  for (;;) {
+    uint idx = atomicAdd(SecondaryQueue.header.head, 1u);
+    uint tail = SecondaryQueue.header.tail;
+    if (idx < tail) {
+      uint slot = idx & (SecondaryQueue.header.capacity - 1u);
+      ray = SecondaryQueue.rays[slot];
+      return true;
+    }
+    atomicAdd(SecondaryQueue.header.head, uint(0u - 1u));
+    if (idx >= tail) return false;
+  }
+}
+
+bool dequeueRay(out RayPayload ray) {
+  return (dispatch.queueSrc == 0u) ? dequeuePrimaryRay(ray)
+                                   : dequeueSecondaryRay(ray);
 }
 
 uint reserveMissSlot(uint overflowReason) {
