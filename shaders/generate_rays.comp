@@ -17,6 +17,8 @@ struct RayPayload {
   float tMin;
   vec3  direction;
   float tMax;
+  vec3  throughput;
+  float padThroughput;
   uint  rng;
   uint  pixelIndex;
   uint  pathDepth;
@@ -104,6 +106,8 @@ void main() {
   payload.tMin = tMin;
   payload.direction = dir;
   payload.tMax = tMax;
+  payload.throughput = vec3(1.0);
+  payload.padThroughput = 0.0;
   payload.rng = pcg_hash(pixelIndex ^ (g.frameIdx * 1664525u));
   payload.pixelIndex = pixelIndex;
   payload.pathDepth = 0u;

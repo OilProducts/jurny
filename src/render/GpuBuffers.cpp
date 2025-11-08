@@ -197,9 +197,9 @@ bool GpuBuffers::createQueueBuffers(platform::VulkanContext& vk, VkExtent2D exte
     queueCapacity_ = nextPow2(static_cast<uint32_t>(std::max<uint64_t>(1ull, pixelCount)));
 
     constexpr VkDeviceSize kHeaderBytes = sizeof(uint32_t) * 4;
-    constexpr VkDeviceSize kRayPayload = 80;
-    constexpr VkDeviceSize kHitPayload = 96;
-    constexpr VkDeviceSize kMissPayload = 80;
+    constexpr VkDeviceSize kRayPayload = 128;
+    constexpr VkDeviceSize kHitPayload = 160;
+    constexpr VkDeviceSize kMissPayload = 128;
     const std::array<VkDeviceSize, 4> payloadSizes = {
         kRayPayload,
         kHitPayload,

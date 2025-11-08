@@ -76,3 +76,16 @@ uint pcg_hash(uint x) {
   x ^= x >> 15; x *= 0x31848babu;
   x ^= x >> 14; return x;
 }
+
+uint pcg_next(inout uint state) {
+  state = pcg_hash(state);
+  return state;
+}
+
+float rand_float(inout uint state) {
+  return float(pcg_next(state)) * (1.0 / 4294967296.0);
+}
+
+vec2 rand2(inout uint state) {
+  return vec2(rand_float(state), rand_float(state));
+}
