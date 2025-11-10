@@ -1,6 +1,11 @@
 {
   "materials": [
-    { "id": 0, "name": "default", "baseColor": [0.8, 0.8, 0.8], "emission": 0.0, "roughness": 0.6, "metalness": 0.0, "absorption": [0.0, 0.0, 0.0] }
+    { "id": 0, "name": "rock",   "baseColor": [0.36, 0.34, 0.33], "emission": 0.0, "roughness": 0.85, "metalness": 0.0, "absorption": [0.0, 0.0, 0.0] },
+    { "id": 1, "name": "dirt",   "baseColor": [0.43, 0.28, 0.16], "emission": 0.0, "roughness": 0.75, "metalness": 0.0, "absorption": [0.0, 0.0, 0.0] },
+    { "id": 2, "name": "grass",  "baseColor": [0.18, 0.45, 0.17], "emission": 0.0, "roughness": 0.52, "metalness": 0.0, "absorption": [0.0, 0.0, 0.0] },
+    { "id": 3, "name": "snow",   "baseColor": [0.92, 0.92, 0.96], "emission": 0.0, "roughness": 0.20, "metalness": 0.0, "absorption": [0.0, 0.0, 0.0] },
+    { "id": 4, "name": "sand",   "baseColor": [0.76, 0.68, 0.45], "emission": 0.0, "roughness": 0.55, "metalness": 0.0, "absorption": [0.0, 0.0, 0.0] },
+    { "id": 5, "name": "basalt", "baseColor": [0.20, 0.22, 0.25], "emission": 0.0, "roughness": 0.35, "metalness": 0.0, "absorption": [0.0, 0.0, 0.0] },
+    { "id": 6, "name": "lava",   "baseColor": [1.00, 0.32, 0.05], "emission": 4.0, "roughness": 0.15, "metalness": 0.0, "absorption": [0.0, 0.0, 0.0] }
   ]
 }
-
