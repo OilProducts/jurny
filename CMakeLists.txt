@@ -19,7 +19,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(VOXEL_BUILD_TESTS        "Build tests"                              ON)
 option(VOXEL_ENABLE_VALIDATION  "Enable Vulkan validation (Debug default)" ON)
 option(VOXEL_ENABLE_TRACY       "Enable Tracy profiler integration"        OFF)
-option(VOXEL_ENABLE_SANITIZERS  "Enable Address/UB sanitizers (Debug)"     ON)
+option(VOXEL_ENABLE_SANITIZERS  "Enable Address/UB sanitizers (Debug)"     OFF)
 option(VOXEL_ENABLE_LTO         "Enable LTO in Release"                    ON)
 option(VOXEL_SHADER_DEBUG       "Emit debug info in SPIR-V (Debug)"        ON)
 option(VOXEL_USE_FETCHCONTENT   "Use FetchContent for extern deps"         ON)
@@ -29,7 +29,7 @@ option(BUILD_TOOLS              "Build auxiliary tools"                    ON)
 
 # Feature flags bridged to shaders
 set(VOXEL_BRICK_SIZE 8 CACHE STRING "Brick dimension (voxels)")
-option(VOXEL_USE_TSDF           "Enable TSDF tiles"                         OFF)
+option(VOXEL_USE_TSDF           "Enable TSDF tiles"                         ON)
 option(VOXEL_MATERIAL_4BIT      "Use 4-bit material indices by default"     ON)
 option(VOXEL_ENABLE_DENOISER    "Enable denoiser passes"                    ON)
 

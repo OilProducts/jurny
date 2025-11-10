@@ -6,59 +6,10 @@
 
 #include <spdlog/spdlog.h>
 
+#include "VulkanUtils.h"
+
 namespace render {
 namespace {
-uint32_t findMemoryType(VkPhysicalDevice phys,
-                        uint32_t typeBits,
-                        VkMemoryPropertyFlags flags) {
-    VkPhysicalDeviceMemoryProperties mp{};
-    vkGetPhysicalDeviceMemoryProperties(phys, &mp);
-    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
-        if ((typeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & flags) == flags) {
-            return i;
-        }
-    }
-    return UINT32_MAX;
-}
-
-bool allocateBuffer(VkDevice device,
-                    VkPhysicalDevice phys,
-                    VkDeviceSize size,
-                    VkBufferUsageFlags usage,
-                    VkMemoryPropertyFlags flags,
-                    VkBuffer& outBuf,
-                    VkDeviceMemory& outMem) {
-    VkBufferCreateInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bi.size = size;
-    bi.usage = usage;
-    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(device, &bi, nullptr, &outBuf) != VK_SUCCESS) {
-        spdlog::error("Failed to create buffer (size={})", size);
-        return false;
-    }
-    VkMemoryRequirements mr{};
-    vkGetBufferMemoryRequirements(device, outBuf, &mr);
-    uint32_t typeIndex = findMemoryType(phys, mr.memoryTypeBits, flags);
-    if (typeIndex == UINT32_MAX) {
-        spdlog::error("No compatible memory type for buffer allocation");
-        vkDestroyBuffer(device, outBuf, nullptr);
-        outBuf = VK_NULL_HANDLE;
-        return false;
-    }
-    VkMemoryAllocateInfo mai{};
-    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    mai.allocationSize = mr.size;
-    mai.memoryTypeIndex = typeIndex;
-    if (vkAllocateMemory(device, &mai, nullptr, &outMem) != VK_SUCCESS) {
-        spdlog::error("Failed to allocate buffer memory (size={})", mr.size);
-        vkDestroyBuffer(device, outBuf, nullptr);
-        outBuf = VK_NULL_HANDLE;
-        return false;
-    }
-    vkBindBufferMemory(device, outBuf, outMem, 0);
-    return true;
-}
 
 uint32_t nextPow2(uint32_t v) {
     if (v <= 1u) return 1u;
@@ -152,7 +103,9 @@ bool GpuBuffers::allocateImage(platform::VulkanContext& vk,
 
     VkMemoryRequirements mr{};
     vkGetImageMemoryRequirements(vk.device(), out.image, &mr);
-    uint32_t typeIndex = findMemoryType(vk.physicalDevice(), mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    uint32_t typeIndex = vkutil::findMemoryType(vk.physicalDevice(),
+                                                mr.memoryTypeBits,
+                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (typeIndex == UINT32_MAX) {
         spdlog::error("No compatible memory type for image allocation");
         vkDestroyImage(vk.device(), out.image, nullptr);
@@ -211,12 +164,15 @@ bool GpuBuffers::createQueueBuffers(platform::VulkanContext& vk, VkExtent2D exte
         VkBuffer& buf = queues_[i];
         VkDeviceMemory& mem = queueMemory_[i];
         VkDeviceSize size = kHeaderBytes + payloadSizes[i] * queueCapacity_;
-        if (!allocateBuffer(vk.device(), vk.physicalDevice(), size,
-                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                            buf, mem)) {
+        if (!vkutil::allocateBuffer(vk.device(),
+                                    vk.physicalDevice(),
+                                    size,
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                    buf,
+                                    mem)) {
             return false;
         }
     }
@@ -225,62 +181,26 @@ bool GpuBuffers::createQueueBuffers(platform::VulkanContext& vk, VkExtent2D exte
 
 void GpuBuffers::destroyQueueBuffers(platform::VulkanContext& vk) {
     for (size_t i = 0; i < queues_.size(); ++i) {
-        if (queues_[i]) {
-            vkDestroyBuffer(vk.device(), queues_[i], nullptr);
-            queues_[i] = VK_NULL_HANDLE;
-        }
-        if (queueMemory_[i]) {
-            vkFreeMemory(vk.device(), queueMemory_[i], nullptr);
-            queueMemory_[i] = VK_NULL_HANDLE;
-        }
+        vkutil::destroyBuffer(vk.device(), queues_[i], queueMemory_[i]);
     }
     queueCapacity_ = 0;
 }
 
 bool GpuBuffers::createStatsBuffer(platform::VulkanContext& vk) {
     destroyStatsBuffer(vk);
-    VkBufferCreateInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bi.size = sizeof(uint32_t) * 8;
-    bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(vk.device(), &bi, nullptr, &statsBuf_) != VK_SUCCESS) {
-        spdlog::error("Failed to create stats buffer");
-        return false;
-    }
-    VkMemoryRequirements mr{};
-    vkGetBufferMemoryRequirements(vk.device(), statsBuf_, &mr);
-    uint32_t typeIndex = findMemoryType(vk.physicalDevice(), mr.memoryTypeBits,
-                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (typeIndex == UINT32_MAX) {
-        spdlog::error("No compatible memory type for stats buffer");
-        vkDestroyBuffer(vk.device(), statsBuf_, nullptr);
-        statsBuf_ = VK_NULL_HANDLE;
-        return false;
-    }
-    VkMemoryAllocateInfo mai{};
-    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    mai.allocationSize = mr.size;
-    mai.memoryTypeIndex = typeIndex;
-    if (vkAllocateMemory(vk.device(), &mai, nullptr, &statsMem_) != VK_SUCCESS) {
-        spdlog::error("Failed to allocate stats buffer memory");
-        vkDestroyBuffer(vk.device(), statsBuf_, nullptr);
-        statsBuf_ = VK_NULL_HANDLE;
-        return false;
-    }
-    vkBindBufferMemory(vk.device(), statsBuf_, statsMem_, 0);
-    return true;
+    return vkutil::allocateBuffer(vk.device(),
+                                  vk.physicalDevice(),
+                                  sizeof(uint32_t) * 8,
+                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                  statsBuf_,
+                                  statsMem_);
 }
 
 void GpuBuffers::destroyStatsBuffer(platform::VulkanContext& vk) {
-    if (statsBuf_) {
-        vkDestroyBuffer(vk.device(), statsBuf_, nullptr);
-        statsBuf_ = VK_NULL_HANDLE;
-    }
-    if (statsMem_) {
-        vkFreeMemory(vk.device(), statsMem_, nullptr);
-        statsMem_ = VK_NULL_HANDLE;
-    }
+    vkutil::destroyBuffer(vk.device(), statsBuf_, statsMem_);
 }
 
 void GpuBuffers::writeQueueHeaders(VkCommandBuffer cb) const {

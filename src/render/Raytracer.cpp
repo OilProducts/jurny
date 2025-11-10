@@ -2,6 +2,7 @@
 #include "world/BrickStore.h"
 #include "math/Spherical.h"
 #include "core/Assets.h"
+#include "VulkanUtils.h"
 #include <spdlog/spdlog.h>
 #include <chrono>
 #include <cstdio>
@@ -48,39 +49,6 @@ struct AtrousPushConstants {
     float padding;
 };
 
-static uint32_t findMemoryType(VkPhysicalDevice phys, uint32_t typeBits, VkMemoryPropertyFlags req) {
-    VkPhysicalDeviceMemoryProperties mp{}; vkGetPhysicalDeviceMemoryProperties(phys, &mp);
-    for (uint32_t i=0;i<mp.memoryTypeCount;++i) {
-        if ((typeBits & (1u<<i)) && (mp.memoryTypes[i].propertyFlags & req) == req) return i;
-    }
-    return UINT32_MAX;
-}
-
-static bool allocateBuffer(VkDevice device,
-                           VkPhysicalDevice phys,
-                           VkDeviceSize size,
-                           VkBufferUsageFlags usage,
-                           VkMemoryPropertyFlags flags,
-                           VkBuffer& outBuf,
-                           VkDeviceMemory& outMem) {
-    VkBufferCreateInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bi.size = size;
-    bi.usage = usage;
-    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(device, &bi, nullptr, &outBuf) != VK_SUCCESS) return false;
-    VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(device, outBuf, &mr);
-    uint32_t typeIndex = findMemoryType(phys, mr.memoryTypeBits, flags);
-    if (typeIndex == UINT32_MAX) return false;
-    VkMemoryAllocateInfo mai{};
-    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    mai.allocationSize = mr.size;
-    mai.memoryTypeIndex = typeIndex;
-    if (vkAllocateMemory(device, &mai, nullptr, &outMem) != VK_SUCCESS) return false;
-    vkBindBufferMemory(device, outBuf, outMem, 0);
-    return true;
-}
-
 static constexpr uint32_t kTimestampCount = 8;
 static constexpr uint32_t kTimestampPairs = 4;
 
@@ -125,9 +93,13 @@ bool Raytracer::ensureBuffer(platform::VulkanContext& vk,
     destroyBuffer(vk, buf);
     VkBuffer newBuf = VK_NULL_HANDLE;
     VkDeviceMemory newMem = VK_NULL_HANDLE;
-    if (!allocateBuffer(vk.device(), vk.physicalDevice(), allocSize, requiredUsage,
-                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                        newBuf, newMem)) {
+    if (!vkutil::allocateBuffer(vk.device(),
+                                vk.physicalDevice(),
+                                allocSize,
+                                requiredUsage,
+                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                newBuf,
+                                newMem)) {
         return false;
     }
     buf.buffer = newBuf;
@@ -140,14 +112,7 @@ bool Raytracer::ensureBuffer(platform::VulkanContext& vk,
 }
 
 void Raytracer::destroyBuffer(platform::VulkanContext& vk, BufferResource& buf) {
-    if (buf.buffer) {
-        vkDestroyBuffer(vk.device(), buf.buffer, nullptr);
-        buf.buffer = VK_NULL_HANDLE;
-    }
-    if (buf.memory) {
-        vkFreeMemory(vk.device(), buf.memory, nullptr);
-        buf.memory = VK_NULL_HANDLE;
-    }
+    vkutil::destroyBuffer(vk.device(), buf.buffer, buf.memory);
     buf.capacity = 0;
     buf.size = 0;
     buf.usage = 0;
@@ -514,7 +479,10 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
     bi.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
     if (vkCreateBuffer(vk.device(), &bi, nullptr, &ubo_) != VK_SUCCESS) return false;
     VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(vk.device(), ubo_, &mr);
-    uint32_t typeIndex = findMemoryType(vk.physicalDevice(), mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    uint32_t typeIndex = vkutil::findMemoryType(
+        vk.physicalDevice(),
+        mr.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = mr.size;
@@ -529,7 +497,10 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
     bdbg.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     if (vkCreateBuffer(vk.device(), &bdbg, nullptr, &dbgBuf_) != VK_SUCCESS) return false;
     VkMemoryRequirements mrd{}; vkGetBufferMemoryRequirements(vk.device(), dbgBuf_, &mrd);
-    uint32_t typeIndexDbg = findMemoryType(vk.physicalDevice(), mrd.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    uint32_t typeIndexDbg = vkutil::findMemoryType(
+        vk.physicalDevice(),
+        mrd.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkMemoryAllocateInfo maid{};
     maid.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     maid.allocationSize = mrd.size;
