@@ -35,10 +35,10 @@ inline glm::vec3 fade3(const glm::vec3& v) {
     return glm::vec3(fade(v.x), fade(v.y), fade(v.z));
 }
 
-inline float hash(const glm::vec3& p, std::uint32_t seed) {
-    constexpr glm::vec3 kHashVec(12.9898f, 78.233f, 37.719f);
-    const float n = glm::dot(p, kHashVec) + static_cast<float>(seed) * 0.001953125f; // /512
-    return glm::fract(std::sin(n) * 43758.5453f);
+inline float randomFloat(std::uint32_t seed) {
+    constexpr float kInvUint32 = 1.0f / 4294967296.0f;
+    seed = pcgHash32(seed);
+    return static_cast<float>(seed) * kInvUint32;
 }
 
 float valueNoise(const glm::vec3& p, std::uint32_t seed) {
@@ -53,8 +53,7 @@ float valueNoise(const glm::vec3& p, std::uint32_t seed) {
                                static_cast<float>(oz));
         const glm::ivec3 cornerIdx = cell + glm::ivec3(ox, oy, oz);
         const std::uint32_t cornerSeed = latticeHash(cornerIdx, seed);
-        const glm::vec3 pos = i + offset;
-        return hash(pos, cornerSeed);
+        return randomFloat(cornerSeed);
     };
 
     const float n000 = corner(0, 0, 0);

@@ -4,17 +4,15 @@
 const float PERSISTENCE_CONTINENT = 0.55;
 const float PERSISTENCE_DETAIL    = 0.5;
 const float PERSISTENCE_CAVE      = 0.5;
-const float HASH_SCALE            = 1.0 / 512.0;
-
-float hash13(vec3 p, uint seed) {
-    float n = dot(p, vec3(12.9898, 78.233, 37.719)) + float(seed) * HASH_SCALE;
-    return fract(sin(n) * 43758.5453);
-}
-
 uint pcgHash32(uint v) {
     v = v * 747796405u + 2891336453u;
     uint word = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
     return (word >> 22u) ^ word;
+}
+
+float randomFloat(uint seed) {
+    seed = pcgHash32(seed);
+    return float(seed) * (1.0 / 4294967296.0);
 }
 
 uint latticeHash(ivec3 c, uint seed) {
@@ -39,14 +37,14 @@ float valueNoise(vec3 p, uint seed) {
     vec3 u = fade3(f);
     ivec3 cell = ivec3(i);
     uint baseSeed = seed;
-    float c000 = hash13(i + vec3(0.0, 0.0, 0.0), latticeHash(cell + ivec3(0, 0, 0), baseSeed));
-    float c100 = hash13(i + vec3(1.0, 0.0, 0.0), latticeHash(cell + ivec3(1, 0, 0), baseSeed));
-    float c010 = hash13(i + vec3(0.0, 1.0, 0.0), latticeHash(cell + ivec3(0, 1, 0), baseSeed));
-    float c110 = hash13(i + vec3(1.0, 1.0, 0.0), latticeHash(cell + ivec3(1, 1, 0), baseSeed));
-    float c001 = hash13(i + vec3(0.0, 0.0, 1.0), latticeHash(cell + ivec3(0, 0, 1), baseSeed));
-    float c101 = hash13(i + vec3(1.0, 0.0, 1.0), latticeHash(cell + ivec3(1, 0, 1), baseSeed));
-    float c011 = hash13(i + vec3(0.0, 1.0, 1.0), latticeHash(cell + ivec3(0, 1, 1), baseSeed));
-    float c111 = hash13(i + vec3(1.0, 1.0, 1.0), latticeHash(cell + ivec3(1, 1, 1), baseSeed));
+    float c000 = randomFloat(latticeHash(cell + ivec3(0, 0, 0), baseSeed));
+    float c100 = randomFloat(latticeHash(cell + ivec3(1, 0, 0), baseSeed));
+    float c010 = randomFloat(latticeHash(cell + ivec3(0, 1, 0), baseSeed));
+    float c110 = randomFloat(latticeHash(cell + ivec3(1, 1, 0), baseSeed));
+    float c001 = randomFloat(latticeHash(cell + ivec3(0, 0, 1), baseSeed));
+    float c101 = randomFloat(latticeHash(cell + ivec3(1, 0, 1), baseSeed));
+    float c011 = randomFloat(latticeHash(cell + ivec3(0, 1, 1), baseSeed));
+    float c111 = randomFloat(latticeHash(cell + ivec3(1, 1, 1), baseSeed));
 
     float nx00 = mix(c000, c100, u.x);
     float nx10 = mix(c010, c110, u.x);
