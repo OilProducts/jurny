@@ -219,6 +219,7 @@ void BrickStore::initMaterialTable(const core::AssetRegistry* assets) {
     addDefault(glm::vec3(0.92f, 0.92f, 0.96f), 0.20f, 0.0f); // snow
     addDefault(glm::vec3(0.76f, 0.68f, 0.45f), 0.55f, 0.0f); // sand
     addDefault(glm::vec3(0.20f, 0.22f, 0.25f), 0.35f, 0.0f); // basalt cliff
+    addDefault(glm::vec3(1.00f, 0.32f, 0.05f), 0.15f, 0.0f, 4.0f); // lava (emissive)
 }
 
 uint32_t BrickStore::classifyMaterial(const glm::vec3& p) const {
