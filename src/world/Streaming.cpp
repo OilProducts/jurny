@@ -10,16 +10,8 @@
 
 #include "core/Jobs.h"
 #include "world/BrickStore.h"
+#include "world/CoordUtils.h"
 #include "math/Spherical.h"
-
-namespace {
-inline int divFloor(int a, int b) {
-    int q = a / b;
-    int r = a - q * b;
-    if (((a ^ b) < 0) && r != 0) --q;
-    return q;
-}
-}
 
 namespace world {
 
@@ -452,19 +444,11 @@ std::pair<float, float> Streaming::shellBounds() const {
 }
 
 uint64_t Streaming::packRegionCoord(const glm::ivec3& coord) {
-    const int64_t B = (1ll << 20);
-    return (static_cast<uint64_t>(coord.x + B) << 42) |
-           (static_cast<uint64_t>(coord.y + B) << 21) |
-            (static_cast<uint64_t>(coord.z + B));
+    return coord::packSignedCoord(coord.x, coord.y, coord.z);
 }
 
 glm::ivec3 Streaming::unpackRegionCoord(uint64_t key) {
-    const int64_t B = (1ll << 20);
-    glm::ivec3 coord;
-    coord.x = static_cast<int>((key >> 42) & ((1ull << 21) - 1ull)) - static_cast<int>(B);
-    coord.y = static_cast<int>((key >> 21) & ((1ull << 21) - 1ull)) - static_cast<int>(B);
-    coord.z = static_cast<int>(key & ((1ull << 21) - 1ull)) - static_cast<int>(B);
-    return coord;
+    return coord::unpackSignedCoord(key);
 }
 
 void Streaming::queueOutwardNeighbor(const glm::ivec3& coord, float solidRatio) {

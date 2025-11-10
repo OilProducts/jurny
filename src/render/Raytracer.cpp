@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cctype>
+#include <cstddef>
 #include <utility>
 #include <unordered_map>
 #include <memory>
@@ -29,6 +30,32 @@ constexpr uint32_t kOverlayPadX = 1u;
 constexpr uint32_t kOverlayPadY = 1u;
 constexpr VkDeviceSize kOverlayBufferBytes = (4u + kOverlayMaxCols * kOverlayMaxRows) * sizeof(uint32_t);
 constexpr bool kCacheFieldSamples = true;
+
+void uploadBrickRange(core::UploadContext& ctx,
+                      VkBuffer buffer,
+                      const void* data,
+                      VkDeviceSize totalBytes,
+                      uint32_t firstBrick,
+                      uint32_t brickCount,
+                      VkDeviceSize strideBytes,
+                      bool uploadFull) {
+    if (totalBytes == 0 || buffer == VK_NULL_HANDLE) {
+        return;
+    }
+    if (uploadFull) {
+        ctx.uploadBufferRegion(data, totalBytes, buffer, 0);
+        return;
+    }
+    if (brickCount == 0 || strideBytes == 0) {
+        return;
+    }
+    const auto* byteBase = static_cast<const std::byte*>(data);
+    VkDeviceSize offset = static_cast<VkDeviceSize>(firstBrick) * strideBytes;
+    VkDeviceSize bytes = static_cast<VkDeviceSize>(brickCount) * strideBytes;
+    ctx.uploadBufferRegion(byteBase + offset, bytes, buffer, offset);
+}
+
+constexpr size_t kWorldBufferBindingCount = 10;
 }
 
 struct RayDispatchConstants {
@@ -122,22 +149,33 @@ void Raytracer::markWorldDescriptorsDirty() {
     worldDescriptorsDirty_ = true;
 }
 
-void Raytracer::refreshWorldDescriptors(platform::VulkanContext& vk) {
-    if (!descriptorsReady_ || !worldDescriptorsDirty_ || sets_.empty()) {
-        return;
-    }
-    worldDescriptorsDirty_ = false;
+void Raytracer::writeWorldBufferDescriptors(VkDescriptorSet set,
+                                            std::vector<VkDescriptorBufferInfo>& infos,
+                                            std::vector<VkWriteDescriptorSet>& writes) const {
+    struct BufferBindingDesc {
+        uint32_t binding;
+        BufferResource Raytracer::*member;
+    };
+    static constexpr BufferBindingDesc bindings[] = {
+        {3,  &Raytracer::bhBuf_},
+        {4,  &Raytracer::occBuf_},
+        {5,  &Raytracer::hkBuf_},
+        {6,  &Raytracer::hvBuf_},
+        {7,  &Raytracer::mkBuf_},
+        {8,  &Raytracer::mvBuf_},
+        {23, &Raytracer::matIdxBuf_},
+        {24, &Raytracer::materialTableBuf_},
+        {25, &Raytracer::paletteBuf_},
+        {26, &Raytracer::fieldBuf_}
+    };
     auto bufferRange = [](const BufferResource& buf) -> VkDeviceSize {
         return buf.size > 0 ? buf.size : VK_WHOLE_SIZE;
     };
-
-    const size_t bindingCountPerSet = 10; // bindings 3..8 plus material/palette/field buffers
-    std::vector<VkDescriptorBufferInfo> infos;
-    infos.reserve(sets_.size() * bindingCountPerSet);
-    std::vector<VkWriteDescriptorSet> writes;
-    writes.reserve(sets_.size() * bindingCountPerSet);
-
-    auto appendWrite = [&](VkDescriptorSet set, uint32_t binding, const BufferResource& buf) {
+    for (const auto& binding : bindings) {
+        const BufferResource& buf = this->*(binding.member);
+        if (buf.buffer == VK_NULL_HANDLE) {
+            continue;
+        }
         VkDescriptorBufferInfo info{};
         info.buffer = buf.buffer;
         info.offset = 0;
@@ -147,28 +185,31 @@ void Raytracer::refreshWorldDescriptors(platform::VulkanContext& vk) {
         VkWriteDescriptorSet write{};
         write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         write.dstSet = set;
-        write.dstBinding = binding;
+        write.dstBinding = binding.binding;
         write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         write.descriptorCount = 1;
         write.pBufferInfo = &infos.back();
         writes.push_back(write);
-    };
+    }
+}
+
+void Raytracer::refreshWorldDescriptors(platform::VulkanContext& vk) {
+    if (!descriptorsReady_ || !worldDescriptorsDirty_ || sets_.empty()) {
+        return;
+    }
+    worldDescriptorsDirty_ = false;
+    std::vector<VkDescriptorBufferInfo> infos;
+    std::vector<VkWriteDescriptorSet> writes;
+    infos.reserve(kWorldBufferBindingCount);
+    writes.reserve(kWorldBufferBindingCount);
 
     for (VkDescriptorSet set : sets_) {
-        appendWrite(set, 3, bhBuf_);
-        appendWrite(set, 4, occBuf_);
-        appendWrite(set, 5, hkBuf_);
-        appendWrite(set, 6, hvBuf_);
-        appendWrite(set, 7, mkBuf_);
-        appendWrite(set, 8, mvBuf_);
-        appendWrite(set, 23, matIdxBuf_);
-        appendWrite(set, 24, materialTableBuf_);
-        appendWrite(set, 25, paletteBuf_);
-        appendWrite(set, 26, fieldBuf_);
-    }
-
-    if (!writes.empty()) {
-        vkUpdateDescriptorSets(vk.device(), static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        infos.clear();
+        writes.clear();
+        writeWorldBufferDescriptors(set, infos, writes);
+        if (!writes.empty()) {
+            vkUpdateDescriptorSets(vk.device(), static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        }
     }
 }
 
@@ -518,17 +559,22 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
         }
     }
     if (matIdxBuf_.buffer == VK_NULL_HANDLE) {
-    if (!ensureBuffer(vk, matIdxBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
+        if (!ensureBuffer(vk, matIdxBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
     }
     if (paletteBuf_.buffer == VK_NULL_HANDLE) {
-    if (!ensureBuffer(vk, paletteBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
+        if (!ensureBuffer(vk, paletteBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
     }
     if (fieldBuf_.buffer == VK_NULL_HANDLE) {
-    if (!ensureBuffer(vk, fieldBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
+        if (!ensureBuffer(vk, fieldBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
     }
     if (materialTableBuf_.buffer == VK_NULL_HANDLE) {
-    if (!ensureBuffer(vk, materialTableBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
+        if (!ensureBuffer(vk, materialTableBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
     }
+
+    std::vector<VkDescriptorBufferInfo> worldInfos;
+    std::vector<VkWriteDescriptorSet> worldWrites;
+    worldInfos.reserve(kWorldBufferBindingCount);
+    worldWrites.reserve(kWorldBufferBindingCount);
 
     // Write descriptors per swapchain image
     for (uint32_t i=0;i<swap.imageCount();++i) {
@@ -549,16 +595,12 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
         VkDescriptorBufferInfo dbMiss{ gpuBuffers_.queueBuffer(GpuBuffers::Queue::Miss), 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo dbSec{ gpuBuffers_.queueBuffer(GpuBuffers::Queue::Secondary), 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo dbStats{ gpuBuffers_.statsBuffer(), 0, sizeof(TraversalStatsHost) };
-        VkDescriptorBufferInfo dbMatIdx{ matIdxBuf_.buffer, 0, matIdxBuf_.size > 0 ? matIdxBuf_.size : VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo dbMatTable{ materialTableBuf_.buffer, 0, materialTableBuf_.size > 0 ? materialTableBuf_.size : VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo dbPalette{ paletteBuf_.buffer, 0, paletteBuf_.size > 0 ? paletteBuf_.size : VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo dbField{ fieldBuf_.buffer, 0, fieldBuf_.size > 0 ? fieldBuf_.size : VK_WHOLE_SIZE };
         VkDescriptorBufferInfo dbOverlay{ overlays_.buffer(), 0, overlays_.capacity() ? overlays_.capacity() : VK_WHOLE_SIZE };
         VkDescriptorImageInfo diOverlay{}; diOverlay.imageView = swap.imageViews()[i]; diOverlay.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         VkDescriptorImageInfo diSpatialSrc{}; diSpatialSrc.imageView = denoiser_.historyWriteView(); diSpatialSrc.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         VkDescriptorImageInfo diSpatialDst{}; diSpatialDst.imageView = gpuBuffers_.colorView(); diSpatialDst.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet writes[25]{};
+        VkWriteDescriptorSet writes[21]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[0].dstSet = sets_[i]; writes[0].dstBinding=0; writes[0].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; writes[0].descriptorCount=1; writes[0].pBufferInfo=&db;
         writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[1].dstSet = sets_[i]; writes[1].dstBinding=1; writes[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[1].descriptorCount=1; writes[1].pImageInfo=&diCurr;
         writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[2].dstSet = sets_[i]; writes[2].dstBinding=2; writes[2].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[2].descriptorCount=1; writes[2].pImageInfo=&diOut;
@@ -576,19 +618,21 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
         writes[14].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[14].dstSet=sets_[i]; writes[14].dstBinding=20; writes[14].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[14].descriptorCount=1; writes[14].pImageInfo=&diMoments;
         writes[15].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[15].dstSet=sets_[i]; writes[15].dstBinding=21; writes[15].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[15].descriptorCount=1; writes[15].pImageInfo=&diHistMomentsRead;
         writes[16].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[16].dstSet=sets_[i]; writes[16].dstBinding=22; writes[16].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[16].descriptorCount=1; writes[16].pImageInfo=&diHistMomentsWrite;
-        writes[17].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[17].dstSet=sets_[i]; writes[17].dstBinding=23; writes[17].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[17].descriptorCount=1; writes[17].pBufferInfo=&dbMatIdx;
-        writes[18].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[18].dstSet=sets_[i]; writes[18].dstBinding=24; writes[18].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[18].descriptorCount=1; writes[18].pBufferInfo=&dbMatTable;
-        writes[19].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[19].dstSet=sets_[i]; writes[19].dstBinding=25; writes[19].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[19].descriptorCount=1; writes[19].pBufferInfo=&dbPalette;
-        writes[20].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[20].dstSet=sets_[i]; writes[20].dstBinding=26; writes[20].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[20].descriptorCount=1; writes[20].pBufferInfo=&dbField;
-        writes[21].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[21].dstSet=sets_[i]; writes[21].dstBinding=27; writes[21].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[21].descriptorCount=1; writes[21].pBufferInfo=&dbOverlay;
-        writes[22].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[22].dstSet=sets_[i]; writes[22].dstBinding=28; writes[22].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[22].descriptorCount=1; writes[22].pImageInfo=&diOverlay;
-        writes[23].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[23].dstSet=sets_[i]; writes[23].dstBinding=29; writes[23].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[23].descriptorCount=1; writes[23].pImageInfo=&diSpatialSrc;
-        writes[24].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[24].dstSet=sets_[i]; writes[24].dstBinding=30; writes[24].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[24].descriptorCount=1; writes[24].pImageInfo=&diSpatialDst;
+        writes[17].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[17].dstSet=sets_[i]; writes[17].dstBinding=27; writes[17].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[17].descriptorCount=1; writes[17].pBufferInfo=&dbOverlay;
+        writes[18].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[18].dstSet=sets_[i]; writes[18].dstBinding=28; writes[18].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[18].descriptorCount=1; writes[18].pImageInfo=&diOverlay;
+        writes[19].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[19].dstSet=sets_[i]; writes[19].dstBinding=29; writes[19].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[19].descriptorCount=1; writes[19].pImageInfo=&diSpatialSrc;
+        writes[20].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[20].dstSet=sets_[i]; writes[20].dstBinding=30; writes[20].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[20].descriptorCount=1; writes[20].pImageInfo=&diSpatialDst;
         uint32_t writeCount = static_cast<uint32_t>(sizeof(writes) / sizeof(writes[0]));
         vkUpdateDescriptorSets(vk.device(), writeCount, writes, 0, nullptr);
+
+        worldInfos.clear();
+        worldWrites.clear();
+        writeWorldBufferDescriptors(sets_[i], worldInfos, worldWrites);
+        if (!worldWrites.empty()) {
+            vkUpdateDescriptorSets(vk.device(), static_cast<uint32_t>(worldWrites.size()), worldWrites.data(), 0, nullptr);
+        }
     }
     descriptorsReady_ = true;
-    refreshWorldDescriptors(vk);
     return true;
 }
 
@@ -925,14 +969,15 @@ void Raytracer::uploadHeadersRange(platform::VulkanContext& vk, uint32_t first, 
     if (totalBytes == 0) {
         return;
     }
-    if (reallocated || count == headersHost_.size()) {
-        uploadCtx_.uploadBufferRegion(headersHost_.data(), totalBytes, bhBuf_.buffer, 0);
-    } else if (count > 0) {
-        const world::BrickHeader* src = headersHost_.data() + first;
-        VkDeviceSize offset = static_cast<VkDeviceSize>(first) * sizeof(world::BrickHeader);
-        VkDeviceSize bytes = static_cast<VkDeviceSize>(count) * sizeof(world::BrickHeader);
-        uploadCtx_.uploadBufferRegion(src, bytes, bhBuf_.buffer, offset);
-    }
+    bool uploadFull = reallocated || (count >= brickCount_);
+    uploadBrickRange(uploadCtx_,
+                     bhBuf_.buffer,
+                     headersHost_.data(),
+                     totalBytes,
+                     first,
+                     count,
+                     sizeof(world::BrickHeader),
+                     uploadFull);
 }
 
 void Raytracer::uploadOccupancyRange(platform::VulkanContext& vk, uint32_t first, uint32_t count) {
@@ -945,14 +990,15 @@ void Raytracer::uploadOccupancyRange(platform::VulkanContext& vk, uint32_t first
     if (totalBytes == 0) {
         return;
     }
-    if (reallocated || count == brickCount_) {
-        uploadCtx_.uploadBufferRegion(occWordsHost_.data(), totalBytes, occBuf_.buffer, 0);
-    } else if (count > 0) {
-        const uint64_t* src = occWordsHost_.data() + static_cast<size_t>(first) * kOccWordsPerBrick;
-        VkDeviceSize offset = static_cast<VkDeviceSize>(first) * kOccWordsPerBrick * sizeof(uint64_t);
-        VkDeviceSize bytes = static_cast<VkDeviceSize>(count) * kOccWordsPerBrick * sizeof(uint64_t);
-        uploadCtx_.uploadBufferRegion(src, bytes, occBuf_.buffer, offset);
-    }
+    bool uploadFull = reallocated || (count >= brickCount_);
+    uploadBrickRange(uploadCtx_,
+                     occBuf_.buffer,
+                     occWordsHost_.data(),
+                     totalBytes,
+                     first,
+                     count,
+                     kOccWordsPerBrick * sizeof(uint64_t),
+                     uploadFull);
 }
 
 void Raytracer::uploadMaterialRange(platform::VulkanContext& vk, uint32_t first, uint32_t count) {
@@ -965,14 +1011,15 @@ void Raytracer::uploadMaterialRange(platform::VulkanContext& vk, uint32_t first,
     if (totalBytes == 0) {
         return;
     }
-    if (reallocated || count == brickCount_) {
-        uploadCtx_.uploadBufferRegion(matWordsHost_.data(), totalBytes, matIdxBuf_.buffer, 0);
-    } else if (count > 0) {
-        const uint32_t* src = matWordsHost_.data() + static_cast<size_t>(first) * kMaterialWordsPerBrick;
-        VkDeviceSize offset = static_cast<VkDeviceSize>(first) * kMaterialWordsPerBrick * sizeof(uint32_t);
-        VkDeviceSize bytes = static_cast<VkDeviceSize>(count) * kMaterialWordsPerBrick * sizeof(uint32_t);
-        uploadCtx_.uploadBufferRegion(src, bytes, matIdxBuf_.buffer, offset);
-    }
+    bool uploadFull = reallocated || (count >= brickCount_);
+    uploadBrickRange(uploadCtx_,
+                     matIdxBuf_.buffer,
+                     matWordsHost_.data(),
+                     totalBytes,
+                     first,
+                     count,
+                     kMaterialWordsPerBrick * sizeof(uint32_t),
+                     uploadFull);
 }
 
 void Raytracer::uploadPaletteRange(platform::VulkanContext& vk, uint32_t first, uint32_t count) {
@@ -985,14 +1032,15 @@ void Raytracer::uploadPaletteRange(platform::VulkanContext& vk, uint32_t first, 
     if (totalBytes == 0) {
         return;
     }
-    if (reallocated || count == brickCount_) {
-        uploadCtx_.uploadBufferRegion(paletteHost_.data(), totalBytes, paletteBuf_.buffer, 0);
-    } else if (count > 0) {
-        const uint32_t* src = paletteHost_.data() + static_cast<size_t>(first) * kPaletteEntriesPerBrick;
-        VkDeviceSize offset = static_cast<VkDeviceSize>(first) * kPaletteEntriesPerBrick * sizeof(uint32_t);
-        VkDeviceSize bytes = static_cast<VkDeviceSize>(count) * kPaletteEntriesPerBrick * sizeof(uint32_t);
-        uploadCtx_.uploadBufferRegion(src, bytes, paletteBuf_.buffer, offset);
-    }
+    bool uploadFull = reallocated || (count >= brickCount_);
+    uploadBrickRange(uploadCtx_,
+                     paletteBuf_.buffer,
+                     paletteHost_.data(),
+                     totalBytes,
+                     first,
+                     count,
+                     kPaletteEntriesPerBrick * sizeof(uint32_t),
+                     uploadFull);
 }
 
 void Raytracer::uploadFieldRange(platform::VulkanContext& vk, uint32_t first, uint32_t count) {
@@ -1009,14 +1057,15 @@ void Raytracer::uploadFieldRange(platform::VulkanContext& vk, uint32_t first, ui
     if (totalBytes == 0) {
         return;
     }
-    if (reallocated || count == brickCount_) {
-        uploadCtx_.uploadBufferRegion(fieldHost_.data(), totalBytes, fieldBuf_.buffer, 0);
-    } else if (count > 0) {
-        const float* src = fieldHost_.data() + static_cast<size_t>(first) * kFieldValuesPerBrick;
-        VkDeviceSize offset = static_cast<VkDeviceSize>(first) * kFieldValuesPerBrick * sizeof(float);
-        VkDeviceSize bytes = static_cast<VkDeviceSize>(count) * kFieldValuesPerBrick * sizeof(float);
-        uploadCtx_.uploadBufferRegion(src, bytes, fieldBuf_.buffer, offset);
-    }
+    bool uploadFull = reallocated || (count >= brickCount_);
+    uploadBrickRange(uploadCtx_,
+                     fieldBuf_.buffer,
+                     fieldHost_.data(),
+                     totalBytes,
+                     first,
+                     count,
+                     kFieldValuesPerBrick * sizeof(float),
+                     uploadFull);
 }
 
 void Raytracer::uploadAllWorldBuffers(platform::VulkanContext& vk) {

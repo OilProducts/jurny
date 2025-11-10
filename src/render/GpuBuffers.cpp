@@ -68,9 +68,7 @@ bool GpuBuffers::createFrameImages(platform::VulkanContext& vk, VkExtent2D exten
 
 void GpuBuffers::destroyFrameImages(platform::VulkanContext& vk) {
     auto destroy = [&](ImageResource& img) {
-        if (img.view) { vkDestroyImageView(vk.device(), img.view, nullptr); img.view = VK_NULL_HANDLE; }
-        if (img.image) { vkDestroyImage(vk.device(), img.image, nullptr); img.image = VK_NULL_HANDLE; }
-        if (img.memory) { vkFreeMemory(vk.device(), img.memory, nullptr); img.memory = VK_NULL_HANDLE; }
+        vkutil::destroyImage(vk.device(), img.image, img.memory, img.view);
         img.format = VK_FORMAT_UNDEFINED;
     };
     destroy(color_);
@@ -85,59 +83,15 @@ bool GpuBuffers::allocateImage(platform::VulkanContext& vk,
                                VkFormat format,
                                VkImageUsageFlags usage,
                                ImageResource& out) {
-    VkImageCreateInfo ici{};
-    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    ici.imageType = VK_IMAGE_TYPE_2D;
-    ici.format = format;
-    ici.extent = { extent.width, extent.height, 1 };
-    ici.mipLevels = 1;
-    ici.arrayLayers = 1;
-    ici.samples = VK_SAMPLE_COUNT_1_BIT;
-    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = usage;
-    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateImage(vk.device(), &ici, nullptr, &out.image) != VK_SUCCESS) {
-        spdlog::error("Failed to create GPU image ({}x{}, fmt={})", extent.width, extent.height, static_cast<int>(format));
-        return false;
-    }
-
-    VkMemoryRequirements mr{};
-    vkGetImageMemoryRequirements(vk.device(), out.image, &mr);
-    uint32_t typeIndex = vkutil::findMemoryType(vk.physicalDevice(),
-                                                mr.memoryTypeBits,
-                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (typeIndex == UINT32_MAX) {
-        spdlog::error("No compatible memory type for image allocation");
-        vkDestroyImage(vk.device(), out.image, nullptr);
-        out.image = VK_NULL_HANDLE;
-        return false;
-    }
-    VkMemoryAllocateInfo mai{};
-    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    mai.allocationSize = mr.size;
-    mai.memoryTypeIndex = typeIndex;
-    if (vkAllocateMemory(vk.device(), &mai, nullptr, &out.memory) != VK_SUCCESS) {
-        spdlog::error("Failed to allocate image memory (size={})", mr.size);
-        vkDestroyImage(vk.device(), out.image, nullptr);
-        out.image = VK_NULL_HANDLE;
-        return false;
-    }
-    vkBindImageMemory(vk.device(), out.image, out.memory, 0);
-
-    VkImageViewCreateInfo ivci{};
-    ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    ivci.image = out.image;
-    ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    ivci.format = format;
-    ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    ivci.subresourceRange.levelCount = 1;
-    ivci.subresourceRange.layerCount = 1;
-    if (vkCreateImageView(vk.device(), &ivci, nullptr, &out.view) != VK_SUCCESS) {
-        spdlog::error("Failed to create image view");
-        vkFreeMemory(vk.device(), out.memory, nullptr);
-        vkDestroyImage(vk.device(), out.image, nullptr);
-        out.memory = VK_NULL_HANDLE;
-        out.image = VK_NULL_HANDLE;
+    if (!vkutil::createImage2D(vk.device(),
+                               vk.physicalDevice(),
+                               extent,
+                               format,
+                               usage,
+                               VK_IMAGE_ASPECT_COLOR_BIT,
+                               out.image,
+                               out.memory,
+                               out.view)) {
         return false;
     }
     out.format = format;

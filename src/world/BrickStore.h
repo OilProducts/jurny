@@ -38,7 +38,7 @@ struct CpuWorld {
 
 class BrickStore {
 public:
-    void configure(const math::PlanetParams& P, float voxelSize, int brickDim,
+    void configure(const ::math::PlanetParams& P, float voxelSize, int brickDim,
                    const WorldGen::NoiseParams& noise, std::uint32_t seed,
                    const core::AssetRegistry* assets = nullptr);
 
@@ -48,7 +48,7 @@ public:
     float brickSize() const { return brickSize_; }
     float voxelSize() const { return voxelSize_; }
     int brickDim() const { return brickDim_; }
-    const math::PlanetParams& params() const { return params_; }
+    const ::math::PlanetParams& params() const { return params_; }
     const WorldGen& worldGen() const { return worldGen_; }
 
 private:
@@ -62,7 +62,7 @@ private:
     static void buildHash(CpuWorld& world);
     static void buildMacroHash(CpuWorld& world, uint32_t macroDimBricks);
     bool computeBrickData(const glm::ivec3& bc,
-                          const math::PlanetParams& P,
+                          const ::math::PlanetParams& P,
                           float voxelSize,
                           int brickDim,
                           float brickSize,
@@ -77,7 +77,7 @@ private:
     int brickDim_ = 8;
     float brickSize_ = 4.0f;
     float voxelSize_ = 0.5f;
-    math::PlanetParams params_{};
+    ::math::PlanetParams params_{};
     std::vector<MaterialGpu> materialTable_;
     void initMaterialTable(const core::AssetRegistry* assets);
     uint32_t classifyMaterial(const glm::vec3& p) const;

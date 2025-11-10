@@ -12,14 +12,12 @@
 #include <cctype>
 
 #include "core/Assets.h"
+#include "world/CoordUtils.h"
 
 namespace world {
 
 uint64_t BrickStore::packKey(int bx, int by, int bz) {
-    const uint64_t B = 1ull << 20; // bias for signed coords
-    return ((uint64_t)(bx + (int)B) << 42) |
-           ((uint64_t)(by + (int)B) << 21) |
-            (uint64_t)(bz + (int)B);
+    return coord::packSignedCoord(bx, by, bz);
 }
 
 void BrickStore::buildHash(CpuWorld& world) {
@@ -50,22 +48,15 @@ void BrickStore::buildHash(CpuWorld& world) {
     world.hashCapacity = cap;
 }
 
-static int divFloor(int a, int b) {
-    int q = a / b;
-    int r = a - q * b;
-    if (((a ^ b) < 0) && r != 0) --q;
-    return q;
-}
-
 void BrickStore::buildMacroHash(CpuWorld& world, uint32_t macroDimBricks) {
     world.macroDimBricks = macroDimBricks;
     std::vector<uint64_t> unique;
     unique.reserve(world.headers.size());
     for (const auto& h : world.headers) {
-        int mx = divFloor(h.bx, static_cast<int>(macroDimBricks));
-        int my = divFloor(h.by, static_cast<int>(macroDimBricks));
-        int mz = divFloor(h.bz, static_cast<int>(macroDimBricks));
-        unique.push_back(packKey(mx, my, mz));
+        int mx = math::divFloor(h.bx, static_cast<int>(macroDimBricks));
+        int my = math::divFloor(h.by, static_cast<int>(macroDimBricks));
+        int mz = math::divFloor(h.bz, static_cast<int>(macroDimBricks));
+        unique.push_back(coord::packSignedCoord(mx, my, mz));
     }
     std::sort(unique.begin(), unique.end());
     unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
@@ -92,7 +83,7 @@ void BrickStore::buildMacroHash(CpuWorld& world, uint32_t macroDimBricks) {
     world.macroCapacity = cap;
 }
 
-void BrickStore::configure(const math::PlanetParams& P, float voxelSize, int brickDim,
+void BrickStore::configure(const ::math::PlanetParams& P, float voxelSize, int brickDim,
                            const WorldGen::NoiseParams& noise, std::uint32_t seed,
                            const core::AssetRegistry* assets) {
     params_ = P;
@@ -274,7 +265,7 @@ uint32_t BrickStore::classifyMaterial(const glm::vec3& p) const {
 }
 
 bool BrickStore::computeBrickData(const glm::ivec3& bc,
-                                  const math::PlanetParams& P,
+                                  const ::math::PlanetParams& P,
                                   float voxelSize,
                                   int brickDim,
                                   float brickSize,

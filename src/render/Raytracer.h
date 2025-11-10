@@ -89,6 +89,9 @@ private:
     void destroyBuffer(platform::VulkanContext& vk, BufferResource& buf);
     void markWorldDescriptorsDirty();
     void refreshWorldDescriptors(platform::VulkanContext& vk);
+    void writeWorldBufferDescriptors(VkDescriptorSet set,
+                                     std::vector<VkDescriptorBufferInfo>& infos,
+                                     std::vector<VkWriteDescriptorSet>& writes) const;
     bool appendRegion(platform::VulkanContext& vk, world::CpuWorld&& cpu, const glm::ivec3& regionCoord);
     bool removeRegionInternal(platform::VulkanContext& vk, const glm::ivec3& regionCoord);
     void rebuildHashesAndMacro(platform::VulkanContext& vk);
