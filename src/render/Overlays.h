@@ -7,6 +7,8 @@
 
 #include "platform/VulkanContext.h"
 
+namespace core { class UploadContext; }
+
 namespace render {
 
 // Overlays uploads HUD text to a storage buffer consumed by the overlay shader.
@@ -16,6 +18,7 @@ public:
     void shutdown(platform::VulkanContext& vk);
 
     bool update(platform::VulkanContext& vk,
+                core::UploadContext& uploadCtx,
                 const std::vector<std::string>& lines,
                 uint32_t maxCols,
                 uint32_t maxRows,
@@ -25,7 +28,6 @@ public:
                 uint32_t padY);
 
     VkBuffer buffer() const { return buffer_; }
-    VkDeviceMemory memory() const { return memory_; }
     VkDeviceSize capacity() const { return capacity_; }
 
     uint32_t cols() const { return cols_; }
@@ -43,6 +45,7 @@ private:
     uint32_t pixelWidth_ = 0;
     uint32_t pixelHeight_ = 0;
     bool active_ = false;
+    std::vector<uint32_t> staging_;
 };
 
 } // namespace render

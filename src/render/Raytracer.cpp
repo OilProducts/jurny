@@ -575,13 +575,13 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
 
     if (!createProfilingResources(vk)) return false;
     if (!overlays_.init(vk, kOverlayBufferBytes)) return false;
-    if (VkDeviceMemory overlayMem = overlays_.memory()) {
-        void* data = nullptr;
-        if (vkMapMemory(vk.device(), overlayMem, 0, overlays_.capacity(), 0, &data) == VK_SUCCESS && data) {
-            std::memset(data, 0, static_cast<size_t>(overlays_.capacity()));
-            vkUnmapMemory(vk.device(), overlayMem);
-        }
-    }
+    overlays_.update(vk, uploadCtx_, std::vector<std::string>{},
+                     kOverlayMaxCols,
+                     kOverlayMaxRows,
+                     kOverlayFontWidth,
+                     kOverlayFontHeight,
+                     kOverlayPadX,
+                     kOverlayPadY);
     if (matIdxBuf_.buffer == VK_NULL_HANDLE) {
         if (!ensureBuffer(vk, matIdxBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
     }
@@ -1806,6 +1806,7 @@ void Raytracer::updateOverlayHUD(platform::VulkanContext& vk, const std::vector<
     }
 
     overlays_.update(vk,
+                     uploadCtx_,
                      sanitized,
                      kOverlayMaxCols,
                      kOverlayMaxRows,
