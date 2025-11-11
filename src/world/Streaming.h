@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <limits>
@@ -75,6 +76,14 @@ private:
         float priority = 0.0f;
         uint64_t frameEnqueued = 0;
     };
+    struct PendingCompare {
+        bool operator()(const PendingEntry& a, const PendingEntry& b) const {
+            if (a.priority == b.priority) {
+                return a.frameEnqueued > b.frameEnqueued;
+            }
+            return a.priority < b.priority;
+        }
+    };
     struct RegionContext {
         float brickSize = 0.0f;
         int regionDim = 1;
@@ -108,6 +117,7 @@ private:
         Evicting,
         Empty
     };
+    static constexpr int kRegionStateCount = static_cast<int>(RegionState::Empty) + 1;
 
     struct RegionRecord {
         RegionState state = RegionState::None;
@@ -118,6 +128,7 @@ private:
         float maxRadius = 0.0f;
         float distanceToCamera = 0.0f;
         bool frontierQueued = false;
+        bool frontierVisited = false;
     };
 
 private:
@@ -134,8 +145,9 @@ private:
     float regionPriority(const glm::vec3& regionCenter, float distance, const RegionContext& ctx) const;
     std::pair<float, float> shellBounds() const;
     void updateRecordMetrics(RegionRecord& record, const glm::ivec3& coord);
-    void enqueuePendingRegion(const glm::ivec3& coord, float priority, uint64_t frameIndex);
+    void enqueuePendingRegion(RegionRecord& record, const glm::ivec3& coord, float priority, uint64_t frameIndex);
     void pushFrontierCell(const glm::ivec3& cell);
+    void transitionState(RegionRecord& record, RegionState newState, const glm::ivec3& coord);
 
     static uint64_t packRegionCoord(const glm::ivec3& coord);
     static glm::ivec3 unpackRegionCoord(uint64_t key);
@@ -153,11 +165,8 @@ private:
     uint64_t currentFrame_ = 0;
     RegionContext regionCtx_{};
 
-    std::vector<PendingEntry> pendingRegions_;
-    std::vector<glm::ivec3> buildingRegions_;
+    std::priority_queue<PendingEntry, std::vector<PendingEntry>, PendingCompare> pendingRegions_;
     std::vector<ReadyRegion> readyRegions_;
-    std::vector<glm::ivec3> residentRegions_;
-    std::vector<glm::ivec3> evictingRegions_;
     std::deque<glm::ivec3> frontier_;
     glm::ivec3 lastFrontierOrigin_{std::numeric_limits<int>::max(), std::numeric_limits<int>::max(), std::numeric_limits<int>::max()};
     glm::ivec3 currentCameraCell_{0};
@@ -168,6 +177,7 @@ private:
     std::vector<CompletedRegion> completedRegions_;
 
     std::unordered_map<uint64_t, RegionRecord> regionRecords_;
+    uint32_t buildingCount_ = 0;
 };
 
 }

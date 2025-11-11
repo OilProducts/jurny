@@ -26,6 +26,20 @@ constexpr glm::ivec3 kNeighborOffsets[6] = {
 };
 }
 
+void Streaming::transitionState(RegionRecord& record, RegionState newState, const glm::ivec3& coord) {
+    (void)coord;
+    if (record.state == newState) {
+        return;
+    }
+    if (record.state == RegionState::Building && buildingCount_ > 0) {
+        --buildingCount_;
+    }
+    record.state = newState;
+    if (newState == RegionState::Building) {
+        ++buildingCount_;
+    }
+}
+
 void Streaming::initialize(const BrickStore& store, const Config& config, core::Jobs* jobs) {
     store_ = &store;
     config_ = config;
@@ -42,11 +56,8 @@ void Streaming::shutdown() {
 }
 
 void Streaming::clearQueues() {
-    pendingRegions_.clear();
-    buildingRegions_.clear();
+    pendingRegions_ = decltype(pendingRegions_)();
     readyRegions_.clear();
-    residentRegions_.clear();
-    evictingRegions_.clear();
     frontier_.clear();
     hasCameraCell_ = false;
     lastFrontierOrigin_ = glm::ivec3(std::numeric_limits<int>::max(),
@@ -57,6 +68,7 @@ void Streaming::clearQueues() {
         completedRegions_.clear();
     }
     regionRecords_.clear();
+    buildingCount_ = 0;
     evictedRegions_.clear();
     buildMsAvgValid_ = false;
     buildMsAvg_ = 0.0;
@@ -93,6 +105,7 @@ void Streaming::updateRegionContext(const glm::vec3& cameraPos) {
 
 void Streaming::seedFrontier(const glm::ivec3& cameraCell) {
     if (!hasCameraCell_ || cameraCell != lastFrontierOrigin_) {
+        frontier_.clear();
         pushFrontierCell(cameraCell);
         lastFrontierOrigin_ = cameraCell;
     }
@@ -102,24 +115,20 @@ void Streaming::pushFrontierCell(const glm::ivec3& cell) {
     const uint64_t key = packRegionCoord(cell);
     auto [it, inserted] = regionRecords_.emplace(key, RegionRecord{});
     RegionRecord& record = it->second;
-    if (record.frontierQueued) {
+    if (record.frontierVisited) {
         return;
     }
     record.frontierQueued = true;
+    record.frontierVisited = true;
     frontier_.push_back(cell);
 }
 
-void Streaming::enqueuePendingRegion(const glm::ivec3& coord, float priority, uint64_t frameIndex) {
+void Streaming::enqueuePendingRegion(RegionRecord& record, const glm::ivec3& coord, float priority, uint64_t frameIndex) {
     PendingEntry entry{coord, priority, frameIndex};
-    auto insertPos = std::lower_bound(
-        pendingRegions_.begin(), pendingRegions_.end(), entry,
-        [](const PendingEntry& a, const PendingEntry& b) {
-            if (a.priority == b.priority) {
-                return a.frameEnqueued < b.frameEnqueued;
-            }
-            return a.priority > b.priority;
-        });
-    pendingRegions_.insert(insertPos, entry);
+    pendingRegions_.push(entry);
+    record.priority = priority;
+    record.lastTouchedFrame = frameIndex;
+    transitionState(record, RegionState::Pending, coord);
 }
 
 void Streaming::expandFrontier(uint64_t frameIndex) {
@@ -143,21 +152,12 @@ void Streaming::expandFrontier(uint64_t frameIndex) {
         updateRecordMetrics(record, cell);
         record.lastTouchedFrame = frameIndex;
 
-        if (record.maxRadius < ctx.shellInner || record.minRadius > ctx.shellOuter) {
-            continue;
-        }
-        if (record.distanceToCamera > ctx.loadRadiusExpanded) {
-            continue;
-        }
-        if (record.state == RegionState::None || record.state == RegionState::Empty) {
+        bool withinShell = !(record.maxRadius < ctx.shellInner || record.minRadius > ctx.shellOuter);
+        bool withinLoad = record.distanceToCamera <= ctx.loadRadiusExpanded;
+        if (withinShell && withinLoad && record.state == RegionState::None) {
             float priority = regionPriority(record.center, record.distanceToCamera, ctx);
-            enqueuePendingRegion(cell, priority, frameIndex);
-            record.state = RegionState::Pending;
-            record.priority = priority;
+            enqueuePendingRegion(record, cell, priority, frameIndex);
             ++expansions;
-            if (expansions >= static_cast<size_t>(config_.maxRegionSelectionsPerFrame)) {
-                // still push neighbors before breaking to maintain coverage
-            }
         }
 
         if (hasCameraCell_) {
@@ -203,13 +203,15 @@ void Streaming::update(const glm::vec3& cameraPos, uint64_t frameIndex) {
     stats_.buildMsAvg = buildMsAvgValid_ ? buildMsAvg_ : 0.0;
     evictedRegions_.clear();
 
-    expandFrontier(frameIndex);
+    if (pendingRegions_.size() < static_cast<size_t>(config_.maxQueuedRegions)) {
+        expandFrontier(frameIndex);
+    }
     launchRegionBuilds();
     drainCompleted();
     evaluateEvictions(frameIndex);
 
     stats_.queuedRegions = static_cast<uint32_t>(pendingRegions_.size());
-    stats_.buildingRegions = static_cast<uint32_t>(buildingRegions_.size());
+    stats_.buildingRegions = buildingCount_;
     stats_.readyRegions = static_cast<uint32_t>(readyRegions_.size());
 }
 
@@ -219,11 +221,6 @@ bool Streaming::popReadyRegion(ReadyRegion& out) {
     }
     out = std::move(readyRegions_.back());
     readyRegions_.pop_back();
-    const uint64_t key = packRegionCoord(out.regionCoord);
-    auto it = regionRecords_.find(key);
-    if (it != regionRecords_.end()) {
-        it->second.state = RegionState::Ready;
-    }
     return true;
 }
 
@@ -231,8 +228,7 @@ void Streaming::markRegionUploaded(const glm::ivec3& regionCoord) {
     const uint64_t key = packRegionCoord(regionCoord);
     auto it = regionRecords_.find(key);
     if (it != regionRecords_.end()) {
-        it->second.state = RegionState::Resident;
-        residentRegions_.push_back(regionCoord);
+        transitionState(it->second, RegionState::Resident, regionCoord);
     }
 }
 
@@ -240,10 +236,9 @@ void Streaming::markRegionEvicted(const glm::ivec3& regionCoord) {
     const uint64_t key = packRegionCoord(regionCoord);
     auto it = regionRecords_.find(key);
     if (it != regionRecords_.end()) {
+        transitionState(it->second, RegionState::None, regionCoord);
         regionRecords_.erase(it);
     }
-    evictingRegions_.erase(std::remove(evictingRegions_.begin(), evictingRegions_.end(), regionCoord), evictingRegions_.end());
-    residentRegions_.erase(std::remove(residentRegions_.begin(), residentRegions_.end(), regionCoord), residentRegions_.end());
 }
 
 bool Streaming::popEvictedRegion(glm::ivec3& out) {
@@ -261,9 +256,10 @@ void Streaming::launchRegionBuilds() {
     spdlog::debug("Streaming: launch builds shell=[{}, {}] loadRadius={} keepRadius={}",
                   regionCtx_.shellInner, regionCtx_.shellOuter, config_.loadRadius, config_.keepRadius);
 
-    while (!pendingRegions_.empty() && static_cast<int>(buildingRegions_.size()) < config_.maxConcurrentGenerations) {
-        PendingEntry entry = pendingRegions_.front();
-        pendingRegions_.erase(pendingRegions_.begin());
+    while (!pendingRegions_.empty() &&
+           static_cast<int>(buildingCount_) < config_.maxConcurrentGenerations) {
+        PendingEntry entry = pendingRegions_.top();
+        pendingRegions_.pop();
         glm::ivec3 coord = entry.coord;
         const uint64_t key = packRegionCoord(coord);
 
@@ -271,14 +267,14 @@ void Streaming::launchRegionBuilds() {
         if (it == regionRecords_.end() || it->second.state != RegionState::Pending) {
             continue;
         }
+        RegionRecord& record = it->second;
 
         auto cancelFlag = std::make_shared<std::atomic<bool>>(false);
-        buildingRegions_.push_back(coord);
-        it->second.state = RegionState::Building;
+        transitionState(record, RegionState::Building, coord);
 
         std::vector<glm::ivec3> bricks = enumerateRegionBricks(coord, regionCtx_);
         if (bricks.empty()) {
-            it->second.state = RegionState::None;
+            transitionState(record, RegionState::None, coord);
             continue;
         }
         stats_.queuedRegions = static_cast<uint32_t>(pendingRegions_.size());
@@ -334,12 +330,7 @@ void Streaming::drainCompleted() {
         promoteToReady(std::move(completed));
     }
 
-    // Remove finished jobs from inFlight_
-    buildingRegions_.erase(std::remove_if(buildingRegions_.begin(), buildingRegions_.end(), [&](const glm::ivec3& coord) {
-        const uint64_t key = packRegionCoord(coord);
-        auto it = regionRecords_.find(key);
-        return it == regionRecords_.end() || it->second.state != RegionState::Building;
-    }), buildingRegions_.end());
+    // Building state bucket already reflects active jobs; no additional cleanup needed here.
 }
 
 void Streaming::promoteToReady(CompletedRegion&& completed) {
@@ -350,12 +341,12 @@ void Streaming::promoteToReady(CompletedRegion&& completed) {
     }
 
     if (completed.cancelled) {
-        it->second.state = RegionState::None;
+        transitionState(it->second, RegionState::None, completed.coord);
         return;
     }
 
     if (completed.bricks.headers.empty()) {
-        it->second.state = RegionState::Empty;
+        transitionState(it->second, RegionState::Empty, completed.coord);
         return;
     }
 
@@ -393,7 +384,7 @@ void Streaming::promoteToReady(CompletedRegion&& completed) {
     ready.priority = completed.priority;
     ready.bricks = std::move(completed.bricks);
     readyRegions_.push_back(std::move(ready));
-    it->second.state = RegionState::Ready;
+    transitionState(it->second, RegionState::Ready, completed.coord);
 }
 
 void Streaming::evaluateEvictions(uint64_t frameIndex) {
@@ -417,8 +408,8 @@ void Streaming::evaluateEvictions(uint64_t frameIndex) {
         bool outsideKeep = record.distanceToCamera > ctx.keepRadiusExpanded;
 
         if (outsideShell || outsideKeep) {
-            record.state = RegionState::Evicting;
-            evictingRegions_.push_back(coord);
+            transitionState(record, RegionState::Evicting, coord);
+            evictedRegions_.push_back(coord);
         }
     }
 }
@@ -547,11 +538,7 @@ void Streaming::queueOutwardNeighbor(const glm::ivec3& coord, float solidRatio) 
     float distanceToCamera = glm::length(outwardCenterExact - lastCameraWorld_);
     float priority = regionPriority(outwardCenterExact, distanceToCamera, ctx);
 
-    record.state = RegionState::Pending;
-    record.priority = priority;
-    record.lastTouchedFrame = currentFrame_;
-
-    enqueuePendingRegion(outwardCoord, priority, currentFrame_);
+    enqueuePendingRegion(record, outwardCoord, priority, currentFrame_);
 
     spdlog::debug("Streaming: queued outward region ({}, {}, {}) after solid ratio {:.2f}",
                   outwardCoord.x, outwardCoord.y, outwardCoord.z, solidRatio);
