@@ -977,19 +977,17 @@ bool Raytracer::removeRegionInternal(platform::VulkanContext& vk, const glm::ive
     return true;
 }
 
-namespace {
 template <typename T>
-void uploadBufferSpan(core::UploadContext& ctx,
-                      const std::vector<T>& host,
-                      uint32_t strideCount,
-                      uint32_t first,
-                      uint32_t count,
-                      render::Raytracer::BufferResource& dst,
-                      VkDeviceSize totalBytes,
-                      bool uploadFull) {
+void Raytracer::uploadBufferSpan(const std::vector<T>& host,
+                                 uint32_t strideCount,
+                                 uint32_t first,
+                                 uint32_t count,
+                                 BufferResource& dst,
+                                 VkDeviceSize totalBytes,
+                                 bool uploadFull) {
     const T* dataPtr = host.data();
     VkDeviceSize stride = static_cast<VkDeviceSize>(strideCount) * sizeof(T);
-    uploadBrickRange(ctx,
+    uploadBrickRange(uploadCtx_,
                      dst.buffer,
                      dataPtr,
                      totalBytes,
@@ -997,7 +995,6 @@ void uploadBufferSpan(core::UploadContext& ctx,
                      count,
                      stride,
                      uploadFull);
-}
 }
 
 void Raytracer::uploadHeadersRange(platform::VulkanContext& vk, uint32_t first, uint32_t count) {

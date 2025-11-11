@@ -100,6 +100,14 @@ private:
     bool removeRegionInternal(platform::VulkanContext& vk, const glm::ivec3& regionCoord);
     void rebuildHashesAndMacro(platform::VulkanContext& vk);
     void uploadAllWorldBuffers(platform::VulkanContext& vk);
+    template<typename T>
+    void uploadBufferSpan(const std::vector<T>& host,
+                          uint32_t strideCount,
+                          uint32_t first,
+                          uint32_t count,
+                          BufferResource& dst,
+                          VkDeviceSize totalBytes,
+                          bool uploadFull);
     void uploadHeadersRange(platform::VulkanContext& vk, uint32_t first, uint32_t count);
     void uploadOccupancyRange(platform::VulkanContext& vk, uint32_t first, uint32_t count);
     void uploadMaterialRange(platform::VulkanContext& vk, uint32_t first, uint32_t count);
