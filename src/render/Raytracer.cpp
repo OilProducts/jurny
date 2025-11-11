@@ -1012,7 +1012,7 @@ void Raytracer::uploadHeadersRange(platform::VulkanContext& vk, uint32_t first, 
         return;
     }
     bool uploadFull = reallocated || (count >= brickCount_);
-    uploadBufferSpan(uploadCtx_, headersHost_, 1, first, count, bhBuf_, totalBytes, uploadFull);
+    uploadBufferSpan(headersHost_, 1, first, count, bhBuf_, totalBytes, uploadFull);
 }
 
 void Raytracer::uploadOccupancyRange(platform::VulkanContext& vk, uint32_t first, uint32_t count) {
@@ -1030,7 +1030,7 @@ void Raytracer::uploadOccupancyRange(platform::VulkanContext& vk, uint32_t first
         return;
     }
     bool uploadFull = reallocated || (count >= brickCount_);
-    uploadBufferSpan(uploadCtx_, occWordsHost_, kOccWordsPerBrick, first, count, occBuf_, totalBytes, uploadFull);
+    uploadBufferSpan(occWordsHost_, kOccWordsPerBrick, first, count, occBuf_, totalBytes, uploadFull);
 }
 
 void Raytracer::uploadMaterialRange(platform::VulkanContext& vk, uint32_t first, uint32_t count) {
@@ -1048,7 +1048,7 @@ void Raytracer::uploadMaterialRange(platform::VulkanContext& vk, uint32_t first,
         return;
     }
     bool uploadFull = reallocated || (count >= brickCount_);
-    uploadBufferSpan(uploadCtx_, matWordsHost_, kMaterialWordsPerBrick, first, count, matIdxBuf_, totalBytes, uploadFull);
+    uploadBufferSpan(matWordsHost_, kMaterialWordsPerBrick, first, count, matIdxBuf_, totalBytes, uploadFull);
 }
 
 void Raytracer::uploadPaletteRange(platform::VulkanContext& vk, uint32_t first, uint32_t count) {
@@ -1066,7 +1066,7 @@ void Raytracer::uploadPaletteRange(platform::VulkanContext& vk, uint32_t first, 
         return;
     }
     bool uploadFull = reallocated || (count >= brickCount_);
-    uploadBufferSpan(uploadCtx_, paletteHost_, kPaletteEntriesPerBrick, first, count, paletteBuf_, totalBytes, uploadFull);
+    uploadBufferSpan(paletteHost_, kPaletteEntriesPerBrick, first, count, paletteBuf_, totalBytes, uploadFull);
 }
 
 void Raytracer::uploadFieldRange(platform::VulkanContext& vk, uint32_t first, uint32_t count) {
@@ -1088,7 +1088,7 @@ void Raytracer::uploadFieldRange(platform::VulkanContext& vk, uint32_t first, ui
         return;
     }
     bool uploadFull = reallocated || (count >= brickCount_);
-    uploadBufferSpan(uploadCtx_, fieldHost_, kFieldValuesPerBrick, first, count, fieldBuf_, totalBytes, uploadFull);
+    uploadBufferSpan(fieldHost_, kFieldValuesPerBrick, first, count, fieldBuf_, totalBytes, uploadFull);
 }
 
 void Raytracer::uploadAllWorldBuffers(platform::VulkanContext& vk) {
