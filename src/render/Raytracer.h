@@ -89,9 +89,7 @@ private:
     void destroyBuffer(platform::VulkanContext& vk, BufferResource& buf);
     void markWorldDescriptorsDirty();
     void refreshWorldDescriptors(platform::VulkanContext& vk);
-    void writeWorldBufferDescriptors(VkDescriptorSet set,
-                                     std::vector<VkDescriptorBufferInfo>& infos,
-                                     std::vector<VkWriteDescriptorSet>& writes) const;
+    void markWorldBufferDirty(const BufferResource& buf);
     bool appendRegion(platform::VulkanContext& vk, world::CpuWorld&& cpu, const glm::ivec3& regionCoord);
     bool removeRegionInternal(platform::VulkanContext& vk, const glm::ivec3& regionCoord);
     void rebuildHashesAndMacro(platform::VulkanContext& vk);
@@ -201,6 +199,15 @@ private:
     std::vector<float>    fieldHost_;
     std::vector<uint64_t> hashKeysHost_;
     std::vector<uint32_t> hashValsHost_;
+
+    struct WorldBindingEntry {
+        uint32_t binding = 0;
+        BufferResource Raytracer::*member = nullptr;
+    };
+    static constexpr size_t kWorldBindingCount = 10;
+    static const std::array<WorldBindingEntry, kWorldBindingCount> kWorldBindings_;
+    std::array<VkDescriptorBufferInfo, kWorldBindingCount> worldBufferInfos_{};
+    std::array<bool, kWorldBindingCount> worldBufferDirty_{};
     uint32_t macroDimBricks_ = 8;
     static constexpr uint32_t kOccWordsPerBrick = 8;
     static constexpr uint32_t kMaterialWordsPerBrick = 128;
