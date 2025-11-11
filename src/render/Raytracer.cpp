@@ -57,19 +57,6 @@ void uploadBrickRange(core::UploadContext& ctx,
 
 }
 
-constexpr std::array<Raytracer::WorldBindingEntry, Raytracer::kWorldBindingCount> Raytracer::kWorldBindings_{{
-    {3,  &Raytracer::bhBuf_},
-    {4,  &Raytracer::occBuf_},
-    {5,  &Raytracer::hkBuf_},
-    {6,  &Raytracer::hvBuf_},
-    {7,  &Raytracer::mkBuf_},
-    {8,  &Raytracer::mvBuf_},
-    {23, &Raytracer::matIdxBuf_},
-    {24, &Raytracer::materialTableBuf_},
-    {25, &Raytracer::paletteBuf_},
-    {26, &Raytracer::fieldBuf_},
-}};
-
 struct RayDispatchConstants {
     uint32_t queueSrc;
     uint32_t queueDst;
@@ -117,6 +104,20 @@ static bool macroTilePresentCpu(const std::vector<uint64_t>& keys,
     return false;
 }
 
+Raytracer::Raytracer() {
+    worldBuffers_.reserve(10);
+    registerWorldBuffer(bhBuf_, 3);
+    registerWorldBuffer(occBuf_, 4);
+    registerWorldBuffer(hkBuf_, 5);
+    registerWorldBuffer(hvBuf_, 6);
+    registerWorldBuffer(mkBuf_, 7);
+    registerWorldBuffer(mvBuf_, 8);
+    registerWorldBuffer(matIdxBuf_, 23);
+    registerWorldBuffer(materialTableBuf_, 24);
+    registerWorldBuffer(paletteBuf_, 25);
+    registerWorldBuffer(fieldBuf_, 26);
+}
+
 bool Raytracer::ensureBuffer(platform::VulkanContext& vk,
                              BufferResource& buf,
                              VkDeviceSize requiredBytes,
@@ -152,65 +153,88 @@ bool Raytracer::ensureBuffer(platform::VulkanContext& vk,
 
 void Raytracer::destroyBuffer(platform::VulkanContext& vk, BufferResource& buf) {
     vkutil::destroyBuffer(vk.device(), buf.buffer, buf.memory);
+    buf.buffer = VK_NULL_HANDLE;
+    buf.memory = VK_NULL_HANDLE;
     buf.capacity = 0;
     buf.size = 0;
     buf.usage = 0;
+    if (buf.tracked) {
+        buf.descriptor = {};
+        buf.dirty = true;
+        worldDescriptorsDirty_ = true;
+    }
+}
+
+void Raytracer::registerWorldBuffer(BufferResource& buf, uint32_t binding) {
+    buf.binding = binding;
+    buf.descriptor = {};
+    buf.descriptor.offset = 0;
+    buf.descriptor.range = VK_WHOLE_SIZE;
+    buf.tracked = true;
+    buf.dirty = true;
+    worldBuffers_.push_back(&buf);
 }
 
 void Raytracer::markWorldDescriptorsDirty() {
-    for (const auto& entry : kWorldBindings_) {
-        markWorldBufferDirty(this->*entry.member);
+    for (auto* buf : worldBuffers_) {
+        if (buf) {
+            buf->dirty = true;
+        }
     }
+    worldDescriptorsDirty_ = true;
 }
 
-void Raytracer::markWorldBufferDirty(const BufferResource& buf) {
-    for (size_t i = 0; i < kWorldBindingCount; ++i) {
-        const auto& entry = kWorldBindings_[i];
-        if (&(this->*entry.member) != &buf) {
-            continue;
-        }
-        auto& info = worldBufferInfos_[i];
-        info.buffer = buf.buffer;
-        info.offset = 0;
-        info.range = buf.size > 0 ? buf.size : VK_WHOLE_SIZE;
-        worldBufferDirty_[i] = true;
-        worldDescriptorsDirty_ = true;
-        break;
+void Raytracer::markWorldBufferDirty(BufferResource& buf) {
+    if (!buf.tracked) {
+        return;
     }
+    buf.dirty = true;
+    worldDescriptorsDirty_ = true;
 }
 
 void Raytracer::refreshWorldDescriptors(platform::VulkanContext& vk) {
     if (!descriptorsReady_ || !worldDescriptorsDirty_ || sets_.empty()) {
         return;
     }
-    worldDescriptorsDirty_ = false;
-    std::vector<VkWriteDescriptorSet> writes;
-    writes.reserve(kWorldBindingCount);
 
+    std::vector<BufferResource*> dirtyBuffers;
+    dirtyBuffers.reserve(worldBuffers_.size());
+    for (auto* buf : worldBuffers_) {
+        if (buf && buf->dirty && buf->binding != UINT32_MAX && buf->buffer != VK_NULL_HANDLE) {
+            buf->descriptor.buffer = buf->buffer;
+            buf->descriptor.offset = 0;
+            buf->descriptor.range = buf->size > 0 ? buf->size : VK_WHOLE_SIZE;
+            dirtyBuffers.push_back(buf);
+        }
+    }
+    if (dirtyBuffers.empty()) {
+        worldDescriptorsDirty_ = false;
+        return;
+    }
+
+    std::vector<VkWriteDescriptorSet> writes;
+    writes.reserve(dirtyBuffers.size());
     for (VkDescriptorSet set : sets_) {
         writes.clear();
-        for (size_t i = 0; i < kWorldBindingCount; ++i) {
-            if (!worldBufferDirty_[i]) {
-                continue;
-            }
-            const auto& info = worldBufferInfos_[i];
-            if (info.buffer == VK_NULL_HANDLE) {
-                continue;
-            }
+        for (auto* buf : dirtyBuffers) {
             VkWriteDescriptorSet write{};
             write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             write.dstSet = set;
-            write.dstBinding = kWorldBindings_[i].binding;
+            write.dstBinding = buf->binding;
             write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             write.descriptorCount = 1;
-            write.pBufferInfo = &worldBufferInfos_[i];
+            write.pBufferInfo = &buf->descriptor;
             writes.push_back(write);
         }
         if (!writes.empty()) {
             vkUpdateDescriptorSets(vk.device(), static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         }
     }
-    std::fill(worldBufferDirty_.begin(), worldBufferDirty_.end(), false);
+
+    for (auto* buf : dirtyBuffers) {
+        buf->dirty = false;
+    }
+    worldDescriptorsDirty_ = false;
 }
 
 bool Raytracer::createImages(platform::VulkanContext& vk, platform::Swapchain& swap) {
