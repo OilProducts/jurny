@@ -93,6 +93,11 @@ private:
     bool ensureBuffer(platform::VulkanContext& vk, BufferResource& buf, VkDeviceSize requiredBytes, VkBufferUsageFlags usage, bool* reallocated = nullptr);
     void destroyBuffer(platform::VulkanContext& vk, BufferResource& buf);
     void registerWorldBuffer(BufferResource& buf, uint32_t binding);
+    bool createHostVisibleBuffer(platform::VulkanContext& vk,
+                                 VkDeviceSize size,
+                                 VkBufferUsageFlags usage,
+                                 VkBuffer& outBuffer,
+                                 VkDeviceMemory& outMemory);
     void markWorldDescriptorsDirty();
     void refreshWorldDescriptors(platform::VulkanContext& vk);
     void markWorldBufferDirty(BufferResource& buf);

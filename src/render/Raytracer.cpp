@@ -151,6 +151,27 @@ bool Raytracer::ensureBuffer(platform::VulkanContext& vk,
     return true;
 }
 
+bool Raytracer::createHostVisibleBuffer(platform::VulkanContext& vk,
+                                        VkDeviceSize size,
+                                        VkBufferUsageFlags usage,
+                                        VkBuffer& outBuffer,
+                                        VkDeviceMemory& outMemory) {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    if (!vkutil::allocateBuffer(vk.device(),
+                                vk.physicalDevice(),
+                                size,
+                                usage,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                buffer,
+                                memory)) {
+        return false;
+    }
+    outBuffer = buffer;
+    outMemory = memory;
+    return true;
+}
+
 void Raytracer::destroyBuffer(platform::VulkanContext& vk, BufferResource& buf) {
     vkutil::destroyBuffer(vk.device(), buf.buffer, buf.memory);
     buf.buffer = VK_NULL_HANDLE;
@@ -537,41 +558,22 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
     dsai.pSetLayouts = layouts.data();
     if (vkAllocateDescriptorSets(vk.device(), &dsai, sets_.data()) != VK_SUCCESS) return false;
 
-    // Create UBO
-    VkBufferCreateInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bi.size = sizeof(GlobalsUBOData);
-    bi.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-    if (vkCreateBuffer(vk.device(), &bi, nullptr, &ubo_) != VK_SUCCESS) return false;
-    VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(vk.device(), ubo_, &mr);
-    uint32_t typeIndex = vkutil::findMemoryType(
-        vk.physicalDevice(),
-        mr.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VkMemoryAllocateInfo mai{};
-    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    mai.allocationSize = mr.size;
-    mai.memoryTypeIndex = typeIndex;
-    if (vkAllocateMemory(vk.device(), &mai, nullptr, &uboMem_) != VK_SUCCESS) return false;
-    vkBindBufferMemory(vk.device(), ubo_, uboMem_, 0);
+    if (!createHostVisibleBuffer(vk,
+                                 sizeof(GlobalsUBOData),
+                                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                 ubo_,
+                                 uboMem_)) {
+        return false;
+    }
 
-    // Create Debug buffer (host visible)
-    VkBufferCreateInfo bdbg{};
-    bdbg.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bdbg.size = 128 * sizeof(uint32_t); // expanded for richer diagnostics
-    bdbg.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    if (vkCreateBuffer(vk.device(), &bdbg, nullptr, &dbgBuf_) != VK_SUCCESS) return false;
-    VkMemoryRequirements mrd{}; vkGetBufferMemoryRequirements(vk.device(), dbgBuf_, &mrd);
-    uint32_t typeIndexDbg = vkutil::findMemoryType(
-        vk.physicalDevice(),
-        mrd.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VkMemoryAllocateInfo maid{};
-    maid.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    maid.allocationSize = mrd.size;
-    maid.memoryTypeIndex = typeIndexDbg;
-    if (vkAllocateMemory(vk.device(), &maid, nullptr, &dbgMem_) != VK_SUCCESS) return false;
-    vkBindBufferMemory(vk.device(), dbgBuf_, dbgMem_, 0);
+    constexpr VkDeviceSize kDbgBytes = 128 * sizeof(uint32_t);
+    if (!createHostVisibleBuffer(vk,
+                                 kDbgBytes,
+                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                 dbgBuf_,
+                                 dbgMem_)) {
+        return false;
+    }
 
     if (!createProfilingResources(vk)) return false;
     if (!overlays_.init(vk, kOverlayBufferBytes)) return false;
