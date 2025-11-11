@@ -192,14 +192,7 @@ void Streaming::update(const glm::vec3& cameraPos, uint64_t frameIndex) {
         hasCameraCell_ = true;
         seedFrontier(cameraCell);
     }
-    Stats prevStats = stats_;
-    stats_ = {};
-    stats_.buildMsLast = prevStats.buildMsLast;
-    stats_.bricksGeneratedLast = prevStats.bricksGeneratedLast;
-    stats_.bricksRequestedLast = prevStats.bricksRequestedLast;
-    stats_.solidRatioLast = prevStats.solidRatioLast;
-    stats_.buildMsMax = prevStats.buildMsMax;
-    stats_.buildSamples = prevStats.buildSamples;
+    stats_.selectedRegions = 0;
     stats_.buildMsAvg = buildMsAvgValid_ ? buildMsAvg_ : 0.0;
     evictedRegions_.clear();
 
