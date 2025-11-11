@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
+#include <limits>
 #include <memory>
 #include <queue>
 #include <unordered_map>
@@ -68,19 +70,24 @@ public:
 
 private:
     void queueOutwardNeighbor(const glm::ivec3& coord, float solidRatio);
-
-    struct RegionTask {
-        glm::ivec3 coord;
+    struct PendingEntry {
+        glm::ivec3 coord{};
         float priority = 0.0f;
-        uint64_t key = 0;
         uint64_t frameEnqueued = 0;
     };
-
-    struct BuildingJob {
-        glm::ivec3 coord;
-        float priority = 0.0f;
-        std::shared_ptr<std::atomic<bool>> cancel;
+    struct RegionContext {
+        float brickSize = 0.0f;
+        int regionDim = 1;
+        float regionSize = 0.0f;
+        float regionHalfDiag = 0.0f;
+        float shellInner = 0.0f;
+        float shellOuter = 0.0f;
+        float loadRadius = 0.0f;
+        float loadRadiusExpanded = 0.0f;
+        float keepRadiusExpanded = 0.0f;
+        int regionRadius = 0;
     };
+    void updateRegionContext(const glm::vec3& cameraPos);
 
     struct CompletedRegion {
         glm::ivec3 coord;
@@ -106,36 +113,29 @@ private:
         RegionState state = RegionState::None;
         float priority = 0.0f;
         uint64_t lastTouchedFrame = 0;
-    };
-
-    struct RegionTaskCompare {
-        bool operator()(const RegionTask& a, const RegionTask& b) const {
-            if (a.priority == b.priority) {
-                return a.frameEnqueued > b.frameEnqueued; // FIFO for equal priority
-            }
-            return a.priority < b.priority; // max-heap (higher priority first)
-        }
-    };
-
-    struct ReadyRegionCompare {
-        bool operator()(const ReadyRegion& a, const ReadyRegion& b) const {
-            return a.priority < b.priority;
-        }
+        glm::vec3 center{0.0f};
+        float minRadius = 0.0f;
+        float maxRadius = 0.0f;
+        float distanceToCamera = 0.0f;
+        bool frontierQueued = false;
     };
 
 private:
     void clearQueues();
-    void enqueueCandidateRegions(const glm::vec3& cameraPos, uint64_t frameIndex);
+    void seedFrontier(const glm::ivec3& cameraCell);
+    void expandFrontier(uint64_t frameIndex);
     void launchRegionBuilds();
     void drainCompleted();
     void promoteToReady(CompletedRegion&& completed);
     void evaluateEvictions(uint64_t frameIndex);
 
     std::vector<glm::ivec3> enumerateRegionBricks(const glm::ivec3& regionCoord,
-                                                  float shellInner,
-                                                  float shellOuter) const;
-    float regionPriority(const glm::vec3& regionCenter, float distance, float shellInner, float shellOuter) const;
+                                                  const RegionContext& ctx) const;
+    float regionPriority(const glm::vec3& regionCenter, float distance, const RegionContext& ctx) const;
     std::pair<float, float> shellBounds() const;
+    void updateRecordMetrics(RegionRecord& record, const glm::ivec3& coord);
+    void enqueuePendingRegion(const glm::ivec3& coord, float priority, uint64_t frameIndex);
+    void pushFrontierCell(const glm::ivec3& cell);
 
     static uint64_t packRegionCoord(const glm::ivec3& coord);
     static glm::ivec3 unpackRegionCoord(uint64_t key);
@@ -151,17 +151,23 @@ private:
     double solidRatioLast_ = 0.0;
     glm::vec3 lastCameraWorld_{0.0f};
     uint64_t currentFrame_ = 0;
+    RegionContext regionCtx_{};
 
-    std::priority_queue<RegionTask, std::vector<RegionTask>, RegionTaskCompare> pendingRegions_;
-    std::vector<BuildingJob> inFlight_;
+    std::vector<PendingEntry> pendingRegions_;
+    std::vector<glm::ivec3> buildingRegions_;
+    std::vector<ReadyRegion> readyRegions_;
+    std::vector<glm::ivec3> residentRegions_;
+    std::vector<glm::ivec3> evictingRegions_;
+    std::deque<glm::ivec3> frontier_;
+    glm::ivec3 lastFrontierOrigin_{std::numeric_limits<int>::max(), std::numeric_limits<int>::max(), std::numeric_limits<int>::max()};
+    glm::ivec3 currentCameraCell_{0};
+    bool hasCameraCell_ = false;
+    std::vector<glm::ivec3> evictedRegions_;
 
     std::mutex completedMutex_;
     std::vector<CompletedRegion> completedRegions_;
 
-    std::priority_queue<ReadyRegion, std::vector<ReadyRegion>, ReadyRegionCompare> readyQueue_;
-
     std::unordered_map<uint64_t, RegionRecord> regionRecords_;
-    std::vector<glm::ivec3> evictedRegions_;
 };
 
 }
