@@ -65,6 +65,38 @@ struct CameraState {
     glm::vec3 up = glm::vec3(0.0f, 0.0f, 1.0f);
 };
 
+struct CameraPose {
+    glm::dvec3 position = glm::dvec3(0.0);
+    glm::vec3 forward = glm::vec3(0.0f, 0.0f, 1.0f);
+    glm::vec3 up = glm::vec3(0.0f, 0.0f, 1.0f);
+};
+
+const glm::vec3 kWorldUpF(0.0f, 0.0f, 1.0f);
+const glm::dvec3 kWorldUpD(0.0, 0.0, 1.0);
+
+template <typename VecT>
+VecT safeNormalizeVec(const VecT& v, const VecT& fallback) {
+    using Scalar = typename VecT::value_type;
+    const Scalar len = glm::length(v);
+    if (!std::isfinite(static_cast<double>(len)) || len < static_cast<Scalar>(1e-6)) {
+        return fallback;
+    }
+    return v / len;
+}
+
+template <typename VecT>
+VecT safeCrossNormalizeVec(const VecT& a, const VecT& b, const VecT& fallback) {
+    return safeNormalizeVec(glm::cross(a, b), fallback);
+}
+
+template <typename VecT>
+VecT headingFromYaw(const VecT& east, const VecT& north, double yawRad) {
+    using Scalar = typename VecT::value_type;
+    const Scalar cosYaw = static_cast<Scalar>(std::cos(yawRad));
+    const Scalar sinYaw = static_cast<Scalar>(std::sin(yawRad));
+    return safeNormalizeVec(east * cosYaw + north * sinYaw, north);
+}
+
 struct FrameSync {
     VkSemaphore imageAvailable = VK_NULL_HANDLE;
     VkSemaphore renderFinished = VK_NULL_HANDLE;
@@ -92,6 +124,18 @@ private:
     bool acquireSwapImage(FrameSync& frame, uint32_t& imageIndex);
     void updateDebugFlags(const InputState& input);
     void updateCamera(const InputState& input, float dt);
+    void handleCameraModeToggles(const InputState& input);
+    CameraPose updateFreeFlyCamera(const InputState& input, float dt, float yawRad, float pitchRad);
+    CameraPose updateSurfaceWalkCamera(const InputState& input, float dt, float yawRad, float pitchRad);
+    CameraPose updateThirdPersonCamera(const InputState& input, float dt, float yawRad);
+    void updateMeshInstances();
+    void updateStreamingState(const glm::vec3& camPosF);
+    void updateViewProjection(const glm::vec3& camPosF, glm::mat4& V, glm::mat4& P, glm::mat4& invV, glm::mat4& invP);
+    uint32_t fillGlobalsData(const glm::mat4& V, const glm::mat4& P, const glm::mat4& invV, const glm::mat4& invP,
+                             const glm::vec3& camPosF, render::GlobalsUBOData& data);
+    std::vector<std::string> buildOverlayLines(float dt);
+    void recordFrameGraphPasses(uint32_t imageIndex);
+    bool submitFrame(FrameSync& frame, uint32_t imageIndex, VkCommandBuffer cb, bool logFrame, uint32_t currentFrameIdx);
     bool buildFrame(FrameSync& frame, uint32_t imageIndex, float dt);
     std::pair<glm::dvec3, glm::dvec3> sampleSurface(const glm::dvec3& guess) const;
 
@@ -478,6 +522,33 @@ void Runtime::updateCamera(const InputState& input, float dt) {
     camera_.pitchDeg += input.lookDelta.y;
     camera_.pitchDeg = std::clamp(camera_.pitchDeg, -89.0f, 89.0f);
 
+    handleCameraModeToggles(input);
+
+    const float yawRad = glm::radians(camera_.yawDeg);
+    const float pitchRad = glm::radians(camera_.pitchDeg);
+
+    CameraPose pose{camera_.position, camera_.forward, camera_.up};
+    switch (camera_.mode) {
+    case CameraMode::FreeFly:
+        pose = updateFreeFlyCamera(input, dt, yawRad, pitchRad);
+        break;
+    case CameraMode::SurfaceWalk:
+        pose = updateSurfaceWalkCamera(input, dt, yawRad, pitchRad);
+        break;
+    case CameraMode::ThirdPerson:
+        pose = updateThirdPersonCamera(input, dt, yawRad);
+        break;
+    default:
+        pose = updateFreeFlyCamera(input, dt, yawRad, pitchRad);
+        break;
+    }
+
+    camera_.position = pose.position;
+    camera_.forward = pose.forward;
+    camera_.up = pose.up;
+}
+
+void Runtime::handleCameraModeToggles(const InputState& input) {
     if (input.toggleSurfaceWalk) {
         if (camera_.mode == CameraMode::FreeFly) {
             camera_.mode = CameraMode::SurfaceWalk;
@@ -502,200 +573,182 @@ void Runtime::updateCamera(const InputState& input, float dt) {
             camera_.avatarValid = true;
         }
     }
-
-    const float yawRad = glm::radians(camera_.yawDeg);
-    const float pitchRad = glm::radians(camera_.pitchDeg);
-    glm::vec3 worldUp(0.0f, 0.0f, 1.0f);
-    glm::vec3 forward;
-    glm::vec3 up(0.0f, 0.0f, 1.0f);
-
-    if (camera_.mode == CameraMode::FreeFly) {
-        forward.x = std::cos(pitchRad) * std::cos(yawRad);
-        forward.y = std::cos(pitchRad) * std::sin(yawRad);
-        forward.z = std::sin(pitchRad);
-        forward = glm::normalize(forward);
-        glm::vec3 right = glm::normalize(glm::cross(forward, worldUp));
-        if (glm::dot(right, right) < 1e-4f) {
-            right = glm::vec3(1.0f, 0.0f, 0.0f);
-        }
-        up = glm::normalize(glm::cross(right, forward));
-
-        float moveSpeed = input.boost ? 10.0f : 5.0f;
-        if (input.moveForward) camera_.position += glm::dvec3(forward) * double(moveSpeed * dt);
-        if (input.moveBackward) camera_.position -= glm::dvec3(forward) * double(moveSpeed * dt);
-        if (input.moveLeft) camera_.position -= glm::dvec3(right) * double(moveSpeed * dt);
-        if (input.moveRight) camera_.position += glm::dvec3(right) * double(moveSpeed * dt);
-        if (input.ascend) camera_.position += glm::dvec3(up) * double(moveSpeed * dt);
-        if (input.descend) camera_.position -= glm::dvec3(up) * double(moveSpeed * dt);
-    } else if (camera_.mode == CameraMode::SurfaceWalk) {
-        if (!camera_.walkPosValid) {
-            auto surfaceSample = sampleSurface(camera_.position);
-            camera_.walkPos = surfaceSample.first;
-            camera_.walkPosValid = true;
-        }
-        auto surfaceSample = sampleSurface(camera_.walkPos);
-        camera_.walkPos = surfaceSample.first;
-        glm::dvec3 upD = glm::normalize(surfaceSample.second);
-        if (glm::length(upD) < 1e-6) {
-            upD = glm::dvec3(0.0, 0.0, 1.0);
-        }
-        glm::dvec3 east = glm::cross(glm::dvec3(0.0, 0.0, 1.0), upD);
-        if (glm::length(east) < 1e-6) {
-            east = glm::dvec3(1.0, 0.0, 0.0);
-        }
-        east = glm::normalize(east);
-        glm::dvec3 north = glm::normalize(glm::cross(upD, east));
-        double cosYaw = std::cos(static_cast<double>(yawRad));
-        double sinYaw = std::sin(static_cast<double>(yawRad));
-        glm::dvec3 heading = glm::normalize(east * cosYaw + north * sinYaw);
-        glm::dvec3 moveRight = glm::normalize(glm::cross(heading, upD));
-
-        float moveSpeed = input.boost ? 10.0f : 5.0f;
-        if (input.moveForward) camera_.walkPos += heading * double(moveSpeed * dt);
-        if (input.moveBackward) camera_.walkPos -= heading * double(moveSpeed * dt);
-        if (input.moveLeft) camera_.walkPos -= moveRight * double(moveSpeed * dt);
-        if (input.moveRight) camera_.walkPos += moveRight * double(moveSpeed * dt);
-
-        surfaceSample = sampleSurface(camera_.walkPos);
-        camera_.walkPos = surfaceSample.first;
-        upD = glm::normalize(surfaceSample.second);
-        if (glm::length(upD) < 1e-6) {
-            upD = glm::dvec3(0.0, 0.0, 1.0);
-        }
-        glm::dvec3 cameraPosD = camera_.walkPos + upD * double(kEyeHeight);
-        camera_.position = cameraPosD;
-
-        double cosPitch = std::cos(static_cast<double>(pitchRad));
-        double sinPitch = std::sin(static_cast<double>(pitchRad));
-        glm::dvec3 viewForwardD = glm::normalize(heading * cosPitch + upD * sinPitch);
-        forward = glm::vec3(viewForwardD);
-        up = glm::vec3(upD);
-    } else if (camera_.mode == CameraMode::ThirdPerson) {
-        if (!camera_.avatarValid) {
-            auto surfaceSample = sampleSurface(camera_.position);
-            camera_.avatarPos = surfaceSample.first;
-            camera_.avatarValid = true;
-        }
-
-        auto surfaceSample = sampleSurface(camera_.avatarPos);
-        camera_.avatarPos = surfaceSample.first;
-        glm::vec3 upVec = glm::normalize(glm::vec3(camera_.avatarPos));
-        if (!std::isfinite(upVec.x) || glm::length(upVec) < 1e-6f) {
-            upVec = worldUp;
-        }
-
-        glm::vec3 east, north, upCheck;
-        math::ENU(glm::vec3(camera_.avatarPos), east, north, upCheck);
-        if (glm::length(upVec) < 1e-6f) upVec = upCheck;
-        double cosYaw = std::cos(static_cast<double>(yawRad));
-        double sinYaw = std::sin(static_cast<double>(yawRad));
-        glm::vec3 heading = glm::normalize(east * static_cast<float>(cosYaw) + north * static_cast<float>(sinYaw));
-        glm::vec3 rightVec = glm::normalize(glm::cross(heading, upVec));
-        if (!std::isfinite(rightVec.x) || glm::length(rightVec) < 1e-6f) {
-            rightVec = glm::vec3(1.0f, 0.0f, 0.0f);
-        }
-        heading = glm::normalize(glm::cross(upVec, rightVec));
-
-        glm::dvec3 moveDir(0.0);
-        float moveSpeed = input.boost ? 10.0f : 5.0f;
-        if (input.moveForward) moveDir += glm::dvec3(heading);
-        if (input.moveBackward) moveDir -= glm::dvec3(heading);
-        if (input.moveLeft) moveDir -= glm::dvec3(rightVec);
-        if (input.moveRight) moveDir += glm::dvec3(rightVec);
-        if (glm::length(moveDir) > 1e-6) {
-            moveDir = glm::normalize(moveDir);
-            camera_.avatarPos += moveDir * double(moveSpeed * dt);
-            auto adjustSample = sampleSurface(camera_.avatarPos);
-            camera_.avatarPos = adjustSample.first;
-            upVec = glm::normalize(glm::vec3(camera_.avatarPos));
-            if (!std::isfinite(upVec.x) || glm::length(upVec) < 1e-6f) {
-                upVec = worldUp;
-            }
-            math::ENU(glm::vec3(camera_.avatarPos), east, north, upCheck);
-            if (glm::length(upVec) < 1e-6f) upVec = upCheck;
-            heading = glm::normalize(east * static_cast<float>(cosYaw) + north * static_cast<float>(sinYaw));
-            rightVec = glm::normalize(glm::cross(heading, upVec));
-            if (!std::isfinite(rightVec.x) || glm::length(rightVec) < 1e-6f) {
-                rightVec = glm::vec3(1.0f, 0.0f, 0.0f);
-            }
-            heading = glm::normalize(glm::cross(upVec, rightVec));
-        }
-
-        float thirdPitch = std::clamp(camera_.pitchDeg, -60.0f, 60.0f);
-        camera_.pitchDeg = thirdPitch;
-        float thirdPitchRad = glm::radians(thirdPitch);
-        glm::vec3 orbitDir = glm::normalize(heading * std::cos(thirdPitchRad) + upVec * std::sin(thirdPitchRad));
-        glm::vec3 target = glm::vec3(camera_.avatarPos) + upVec * kEyeHeight;
-        glm::vec3 cameraPos = target - orbitDir * kThirdPersonDistance + upVec * 0.5f;
-        camera_.position = glm::dvec3(cameraPos);
-        forward = glm::normalize(target - glm::vec3(camera_.position));
-        up = upVec;
-    }
-
-    camera_.forward = forward;
-    camera_.up = up;
 }
 
-bool Runtime::buildFrame(FrameSync& frame, uint32_t imageIndex, float dt) {
-    bool logFrame = (debugFrameSerial_ <= 10) || ((debugFrameSerial_ % 60) == 0);
-    if (logFrame) {
-        spdlog::info("Frame {} acquired image {}", debugFrameSerial_, imageIndex);
+CameraPose Runtime::updateFreeFlyCamera(const InputState& input, float dt, float yawRad, float pitchRad) {
+    CameraPose pose{};
+
+    glm::vec3 forward{
+        std::cos(pitchRad) * std::cos(yawRad),
+        std::cos(pitchRad) * std::sin(yawRad),
+        std::sin(pitchRad)
+    };
+    forward = safeNormalizeVec(forward, glm::vec3(0.0f, 0.0f, 1.0f));
+    glm::vec3 right = safeCrossNormalizeVec(forward, kWorldUpF, glm::vec3(1.0f, 0.0f, 0.0f));
+    glm::vec3 up = safeCrossNormalizeVec(right, forward, kWorldUpF);
+
+    const float moveSpeed = input.boost ? 10.0f : 5.0f;
+    glm::dvec3 move(0.0);
+    if (input.moveForward) move += glm::dvec3(forward);
+    if (input.moveBackward) move -= glm::dvec3(forward);
+    if (input.moveLeft) move -= glm::dvec3(right);
+    if (input.moveRight) move += glm::dvec3(right);
+    if (input.ascend) move += glm::dvec3(up);
+    if (input.descend) move -= glm::dvec3(up);
+    if (glm::length(move) > 1e-6) {
+        move = glm::normalize(move);
+        camera_.position += move * double(moveSpeed * dt);
     }
 
-    frameGraph_.beginFrame();
-    if (logFrame) {
-        spdlog::info("Frame {} beginFrame done", debugFrameSerial_);
+    pose.position = camera_.position;
+    pose.forward = forward;
+    pose.up = up;
+    return pose;
+}
+
+CameraPose Runtime::updateSurfaceWalkCamera(const InputState& input, float dt, float yawRad, float pitchRad) {
+    if (!camera_.walkPosValid) {
+        auto surfaceSample = sampleSurface(camera_.position);
+        camera_.walkPos = surfaceSample.first;
+        camera_.walkPosValid = true;
     }
 
-    glm::vec3 forward = camera_.forward;
-    glm::vec3 up = camera_.up;
+    auto surfaceSample = sampleSurface(camera_.walkPos);
+    camera_.walkPos = surfaceSample.first;
+    glm::dvec3 upD = safeNormalizeVec(surfaceSample.second, kWorldUpD);
+    glm::dvec3 east = safeCrossNormalizeVec(kWorldUpD, upD, glm::dvec3(1.0, 0.0, 0.0));
+    glm::dvec3 north = safeCrossNormalizeVec(upD, east, glm::dvec3(0.0, 1.0, 0.0));
+    glm::dvec3 heading = headingFromYaw(east, north, yawRad);
+    glm::dvec3 moveRight = safeCrossNormalizeVec(heading, upD, glm::dvec3(1.0, 0.0, 0.0));
 
-    if (meshRenderer_.ready()) {
-        if (camera_.mode == CameraMode::ThirdPerson && camera_.avatarValid) {
-            glm::vec3 east, north, upCheck;
-            math::ENU(glm::vec3(camera_.avatarPos), east, north, upCheck);
+    const float moveSpeed = input.boost ? 10.0f : 5.0f;
+    glm::dvec3 moveDelta(0.0);
+    if (input.moveForward) moveDelta += heading;
+    if (input.moveBackward) moveDelta -= heading;
+    if (input.moveLeft) moveDelta -= moveRight;
+    if (input.moveRight) moveDelta += moveRight;
+    if (glm::length(moveDelta) > 1e-6) {
+        moveDelta = glm::normalize(moveDelta);
+        camera_.walkPos += moveDelta * double(moveSpeed * dt);
+        surfaceSample = sampleSurface(camera_.walkPos);
+        camera_.walkPos = surfaceSample.first;
+        upD = safeNormalizeVec(surfaceSample.second, kWorldUpD);
+    }
 
-            glm::vec3 upAxis = glm::normalize(glm::vec3(camera_.avatarPos));
-            if (!std::isfinite(upAxis.x) || glm::length(upAxis) < 1e-6f) {
-                upAxis = upCheck;
-            }
-            if (!std::isfinite(upAxis.x) || glm::length(upAxis) < 1e-6f) {
-                upAxis = glm::vec3(0.0f, 0.0f, 1.0f);
-            }
-            if (glm::length(east) < 1e-6f) {
-                east = glm::normalize(glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), upAxis));
-            }
-            if (glm::length(east) < 1e-6f) {
-                east = glm::vec3(1.0f, 0.0f, 0.0f);
-            }
-            if (glm::length(north) < 1e-6f) {
-                north = glm::normalize(glm::cross(upAxis, east));
-            }
-            double cosYaw = std::cos(glm::radians(camera_.yawDeg));
-            double sinYaw = std::sin(glm::radians(camera_.yawDeg));
-            glm::vec3 heading = glm::normalize(east * static_cast<float>(cosYaw) + north * static_cast<float>(sinYaw));
-            if (glm::length(heading) < 1e-6f) heading = north;
-            glm::vec3 rightAxis = glm::normalize(glm::cross(heading, upAxis));
-            if (!std::isfinite(rightAxis.x) || glm::length(rightAxis) < 1e-6f) {
-                rightAxis = east;
-            }
-            glm::vec3 forwardAxis = glm::normalize(glm::cross(upAxis, rightAxis));
+    glm::dvec3 cameraPosD = camera_.walkPos + upD * double(kEyeHeight);
+    const double cosPitch = std::cos(static_cast<double>(pitchRad));
+    const double sinPitch = std::sin(static_cast<double>(pitchRad));
+    glm::dvec3 viewForwardD = safeNormalizeVec(heading * cosPitch + upD * sinPitch, heading);
 
-            glm::mat4 model(1.0f);
-            model[0] = glm::vec4(rightAxis, 0.0f);
-            model[1] = glm::vec4(upAxis, 0.0f);
-            model[2] = glm::vec4(forwardAxis, 0.0f);
-            model[3] = glm::vec4(glm::vec3(camera_.avatarPos), 1.0f);
-            render::MeshInstance inst{};
-            inst.model = model;
-            inst.color = glm::vec4(0.85f, 0.2f, 0.95f, 1.0f);
-            meshRenderer_.updateInstances(std::vector<render::MeshInstance>{inst});
-        } else {
-            meshRenderer_.updateInstances(std::vector<render::MeshInstance>{});
+    CameraPose pose{};
+    pose.position = cameraPosD;
+    pose.forward = glm::vec3(viewForwardD);
+    pose.up = glm::vec3(upD);
+    return pose;
+}
+
+CameraPose Runtime::updateThirdPersonCamera(const InputState& input, float dt, float yawRad) {
+    if (!camera_.avatarValid) {
+        auto surfaceSample = sampleSurface(camera_.position);
+        camera_.avatarPos = surfaceSample.first;
+        camera_.avatarValid = true;
+    }
+
+    auto surfaceSample = sampleSurface(camera_.avatarPos);
+    camera_.avatarPos = surfaceSample.first;
+
+    glm::vec3 east, north, upCheck;
+    math::ENU(glm::vec3(camera_.avatarPos), east, north, upCheck);
+    east = safeNormalizeVec(east, glm::vec3(1.0f, 0.0f, 0.0f));
+    north = safeNormalizeVec(north, glm::vec3(0.0f, 1.0f, 0.0f));
+    glm::vec3 upVec = safeNormalizeVec(glm::vec3(camera_.avatarPos), kWorldUpF);
+    if (glm::length(upVec) < 1e-6f) {
+        upVec = safeNormalizeVec(upCheck, kWorldUpF);
+    }
+
+    glm::vec3 heading = headingFromYaw(east, north, yawRad);
+    glm::vec3 rightVec = safeCrossNormalizeVec(heading, upVec, glm::vec3(1.0f, 0.0f, 0.0f));
+    heading = safeCrossNormalizeVec(upVec, rightVec, heading);
+
+    const float moveSpeed = input.boost ? 10.0f : 5.0f;
+    glm::dvec3 moveDir(0.0);
+    if (input.moveForward) moveDir += glm::dvec3(heading);
+    if (input.moveBackward) moveDir -= glm::dvec3(heading);
+    if (input.moveLeft) moveDir -= glm::dvec3(rightVec);
+    if (input.moveRight) moveDir += glm::dvec3(rightVec);
+    if (glm::length(moveDir) > 1e-6) {
+        moveDir = glm::normalize(moveDir);
+        camera_.avatarPos += moveDir * double(moveSpeed * dt);
+        auto adjustSample = sampleSurface(camera_.avatarPos);
+        camera_.avatarPos = adjustSample.first;
+
+        math::ENU(glm::vec3(camera_.avatarPos), east, north, upCheck);
+        east = safeNormalizeVec(east, glm::vec3(1.0f, 0.0f, 0.0f));
+        north = safeNormalizeVec(north, glm::vec3(0.0f, 1.0f, 0.0f));
+        upVec = safeNormalizeVec(glm::vec3(camera_.avatarPos), kWorldUpF);
+        if (glm::length(upVec) < 1e-6f) {
+            upVec = safeNormalizeVec(upCheck, kWorldUpF);
         }
+        heading = headingFromYaw(east, north, yawRad);
+        rightVec = safeCrossNormalizeVec(heading, upVec, glm::vec3(1.0f, 0.0f, 0.0f));
+        heading = safeCrossNormalizeVec(upVec, rightVec, heading);
     }
 
-    glm::vec3 camPosF = glm::vec3(camera_.position);
+    float thirdPitch = std::clamp(camera_.pitchDeg, -60.0f, 60.0f);
+    camera_.pitchDeg = thirdPitch;
+    const float thirdPitchRad = glm::radians(thirdPitch);
+    glm::vec3 orbitDir = safeNormalizeVec(heading * std::cos(thirdPitchRad) + upVec * std::sin(thirdPitchRad), heading);
+    glm::vec3 target = glm::vec3(camera_.avatarPos) + upVec * kEyeHeight;
+    glm::vec3 cameraPos = target - orbitDir * kThirdPersonDistance + upVec * 0.5f;
+
+    CameraPose pose{};
+    pose.position = glm::dvec3(cameraPos);
+    pose.forward = safeNormalizeVec(target - glm::vec3(pose.position), orbitDir);
+    pose.up = upVec;
+    return pose;
+}
+
+void Runtime::updateMeshInstances() {
+    if (!meshRenderer_.ready()) {
+        return;
+    }
+
+    if (camera_.mode == CameraMode::ThirdPerson && camera_.avatarValid) {
+        glm::vec3 east, north, upCheck;
+        math::ENU(glm::vec3(camera_.avatarPos), east, north, upCheck);
+
+        glm::vec3 upAxis = safeNormalizeVec(glm::vec3(camera_.avatarPos), kWorldUpF);
+        if (glm::length(upAxis) < 1e-6f) {
+            upAxis = safeNormalizeVec(upCheck, kWorldUpF);
+        }
+        if (glm::length(east) < 1e-6f) {
+            east = safeCrossNormalizeVec(glm::vec3(0.0f, 1.0f, 0.0f), upAxis, glm::vec3(1.0f, 0.0f, 0.0f));
+        }
+        if (glm::length(north) < 1e-6f) {
+            north = safeCrossNormalizeVec(upAxis, east, glm::vec3(0.0f, 1.0f, 0.0f));
+        }
+
+        const float yawRad = glm::radians(camera_.yawDeg);
+        glm::vec3 heading = headingFromYaw(east, north, yawRad);
+        glm::vec3 rightAxis = safeCrossNormalizeVec(heading, upAxis, east);
+        glm::vec3 forwardAxis = safeCrossNormalizeVec(upAxis, rightAxis, heading);
+
+        glm::mat4 model(1.0f);
+        model[0] = glm::vec4(rightAxis, 0.0f);
+        model[1] = glm::vec4(upAxis, 0.0f);
+        model[2] = glm::vec4(forwardAxis, 0.0f);
+        model[3] = glm::vec4(glm::vec3(camera_.avatarPos), 1.0f);
+
+        render::MeshInstance inst{};
+        inst.model = model;
+        inst.color = glm::vec4(0.85f, 0.2f, 0.95f, 1.0f);
+        meshRenderer_.updateInstances(std::vector<render::MeshInstance>{inst});
+    } else {
+        meshRenderer_.updateInstances(std::vector<render::MeshInstance>{});
+    }
+}
+
+void Runtime::updateStreamingState(const glm::vec3& camPosF) {
     streaming_.update(camPosF, frameCounter_);
     const auto statsBefore = streaming_.stats();
     if ((frameCounter_ % 120u) == 0u) {
@@ -703,20 +756,20 @@ bool Runtime::buildFrame(FrameSync& frame, uint32_t imageIndex, float dt) {
                      statsBefore.selectedRegions, statsBefore.queuedRegions, statsBefore.buildingRegions, statsBefore.readyRegions);
     }
 
-    std::vector<world::Streaming::ReadyRegion> readyRegionsFrame;
+    std::vector<world::Streaming::ReadyRegion> readyRegions;
     world::Streaming::ReadyRegion readyRegion{};
     while (streaming_.popReadyRegion(readyRegion)) {
-        readyRegionsFrame.push_back(std::move(readyRegion));
+        readyRegions.push_back(std::move(readyRegion));
     }
 
-    if (!readyRegionsFrame.empty()) {
+    if (!readyRegions.empty()) {
         size_t uploadedRegions = 0;
         size_t uploadedBricks = 0;
-        for (auto& region : readyRegionsFrame) {
+        for (auto& region : readyRegions) {
             const size_t bricksInRegion = region.bricks.headers.size();
             if (ray_.addRegion(vk_, region.regionCoord, std::move(region.bricks))) {
                 streaming_.markRegionUploaded(region.regionCoord);
-                uploadedRegions++;
+                ++uploadedRegions;
                 uploadedBricks += bricksInRegion;
             }
         }
@@ -734,18 +787,29 @@ bool Runtime::buildFrame(FrameSync& frame, uint32_t imageIndex, float dt) {
             streaming_.markRegionEvicted(evictCoord);
         }
     }
+}
 
-    glm::mat4 V = glm::lookAt(camPosF, camPosF + forward, up);
-    float aspect = float(swap_.extent().width) / float(swap_.extent().height);
-    glm::mat4 P = glm::perspective(glm::radians(45.0f), aspect, 0.05f, 2000.0f);
-    glm::mat4 invV = glm::inverse(V);
-    glm::mat4 invP = glm::inverse(P);
+void Runtime::updateViewProjection(const glm::vec3& camPosF, glm::mat4& V, glm::mat4& P, glm::mat4& invV, glm::mat4& invP) {
+    glm::vec3 forward = camera_.forward;
+    glm::vec3 up = camera_.up;
+    V = glm::lookAt(camPosF, camPosF + forward, up);
+    float aspect = float(swap_.extent().width) / std::max(1.0f, float(swap_.extent().height));
+    P = glm::perspective(glm::radians(45.0f), aspect, 0.05f, 2000.0f);
+    invV = glm::inverse(V);
+    invP = glm::inverse(P);
+
     if (meshRenderer_.ready()) {
         glm::mat4 VP = P * V;
         meshRenderer_.setCamera(VP, glm::vec3(0.4f, 1.0f, 0.3f));
     }
+}
 
-    render::GlobalsUBOData data{};
+uint32_t Runtime::fillGlobalsData(const glm::mat4& V,
+                                  const glm::mat4& P,
+                                  const glm::mat4& invV,
+                                  const glm::mat4& invP,
+                                  const glm::vec3& camPosF,
+                                  render::GlobalsUBOData& data) {
     std::memcpy(data.currView, &V[0][0], sizeof(float) * 16);
     std::memcpy(data.currProj, &P[0][0], sizeof(float) * 16);
     std::memcpy(data.currViewInv, &invV[0][0], sizeof(float) * 16);
@@ -756,6 +820,7 @@ bool Runtime::buildFrame(FrameSync& frame, uint32_t imageIndex, float dt) {
     data.renderOrigin[1] = camPosF.y;
     data.renderOrigin[2] = camPosF.z;
     data.renderOrigin[3] = 0.0f;
+
     glm::vec3 originDelta = glm::vec3(camera_.prevRenderOrigin - camera_.position);
     data.originDeltaPrevToCurr[0] = originDelta.x;
     data.originDeltaPrevToCurr[1] = originDelta.y;
@@ -807,14 +872,17 @@ bool Runtime::buildFrame(FrameSync& frame, uint32_t imageIndex, float dt) {
     data.height = swap_.extent().height;
     data.raysPerPixel = 1;
     data.flags = debugFlags_;
+
     uint32_t currentFrameIdx = data.frameIdx;
     ++frameCounter_;
     camera_.prevView = V;
     camera_.prevProj = P;
     camera_.prevRenderOrigin = camera_.position;
+    return currentFrameIdx;
+}
 
+std::vector<std::string> Runtime::buildOverlayLines(float dt) {
     constexpr size_t kOverlayMaxCols = 96;
-    const auto statsOverlay = streaming_.stats();
     std::vector<std::string> overlayLines;
     overlayLines.reserve(6);
     float fps = (dt > 1e-4f) ? (1.0f / dt) : 0.0f;
@@ -825,6 +893,7 @@ bool Runtime::buildFrame(FrameSync& frame, uint32_t imageIndex, float dt) {
         }
         overlayLines.push_back(std::move(line));
     };
+
     {
         std::ostringstream ss;
         ss << std::fixed << std::setprecision(1)
@@ -832,6 +901,7 @@ bool Runtime::buildFrame(FrameSync& frame, uint32_t imageIndex, float dt) {
            << "  DT " << std::setw(6) << dtMs << "MS";
         clampLine(ss.str());
     }
+
     auto timings = ray_.gpuTimingsMs();
     {
         std::ostringstream ss;
@@ -842,6 +912,8 @@ bool Runtime::buildFrame(FrameSync& frame, uint32_t imageIndex, float dt) {
            << " C:" << std::setw(5) << timings[3];
         clampLine(ss.str());
     }
+
+    const auto statsOverlay = streaming_.stats();
     {
         std::ostringstream ss;
         ss << "BRICKS " << ray_.brickCount()
@@ -851,6 +923,7 @@ bool Runtime::buildFrame(FrameSync& frame, uint32_t imageIndex, float dt) {
            << " BUILD " << statsOverlay.buildingRegions;
         clampLine(ss.str());
     }
+
     if (statsOverlay.bricksRequestedLast > 0) {
         std::ostringstream ss;
         ss << std::fixed << std::setprecision(2)
@@ -865,53 +938,22 @@ bool Runtime::buildFrame(FrameSync& frame, uint32_t imageIndex, float dt) {
            << " (" << std::setprecision(1) << statsOverlay.solidRatioLast * 100.0 << "%)";
         clampLine(ss.str());
     }
+
     {
-        double altitude = glm::length(camPosF) - double(planetRadius_);
+        double altitude = glm::length(glm::vec3(camera_.position)) - double(planetRadius_);
         std::ostringstream ss;
         ss << std::fixed << std::setprecision(1)
-           << "CAM X " << camPosF.x
-           << " Y " << camPosF.y
-           << " Z " << camPosF.z
+           << "CAM X " << camera_.position.x
+           << " Y " << camera_.position.y
+           << " Z " << camera_.position.z
            << " ALT " << altitude;
         clampLine(ss.str());
     }
-    ray_.updateOverlayHUD(vk_, overlayLines);
-    if (logFrame) {
-        spdlog::info("Frame {} globals prepared (GPU ms: G={:.2f} T={:.2f} S={:.2f} C={:.2f})",
-                     debugFrameSerial_, timings[0], timings[1], timings[2], timings[3]);
-    }
 
-    if (data.frameIdx < 3) {
-        auto makeRayCPU = [&](int px, int py) {
-            float w = float(swap_.extent().width), h = float(swap_.extent().height);
-            glm::vec2 uv = (glm::vec2(px + 0.5f, py + 0.5f)) / glm::vec2(w, h);
-            glm::vec2 ndc = glm::vec2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
-            glm::vec4 pView = invP * glm::vec4(ndc, 1.0f, 1.0f);
-            pView /= std::max(pView.w, 1e-6f);
-            glm::vec3 ro = glm::vec3(invV * glm::vec4(0, 0, 0, 1));
-            glm::vec3 dirWorld = glm::vec3(invV * glm::vec4(glm::normalize(glm::vec3(pView)), 0));
-            glm::vec3 rd = glm::normalize(dirWorld);
-            return std::pair<glm::vec3, glm::vec3>(ro, rd);
-        };
-        auto [ro0, rd0] = makeRayCPU(swap_.extent().width / 2, swap_.extent().height / 2);
-        auto [ro1, rd1] = makeRayCPU(0, 0);
-        float tEnter = 0, tExit = 0;
-        bool hit = math::IntersectSphereShell(ro0, rd0, data.Rin, data.Rout, tEnter, tExit);
-        spdlog::info("Extent={}x{} Rin={} Rout={} eye=({:.1f},{:.1f},{:.1f})",
-                     swap_.extent().width, swap_.extent().height, data.Rin, data.Rout, camPosF.x, camPosF.y, camPosF.z);
-        spdlog::info("Center ray ro=({:.1f},{:.1f},{:.1f}) rd=({:.3f},{:.3f},{:.3f}) hit={} t=[{:.1f},{:.1f}]",
-                     ro0.x, ro0.y, ro0.z, rd0.x, rd0.y, rd0.z, hit ? 1 : 0, tEnter, tExit);
-        spdlog::info("Corner ray  ro=({:.1f},{:.1f},{:.1f}) rd=({:.3f},{:.3f},{:.3f})",
-                     ro1.x, ro1.y, ro1.z, rd1.x, rd1.y, rd1.z);
-        float dotDirs = glm::dot(rd0, rd1);
-        spdlog::info("dot(center,corner)={:.3f} (expect < 1)", dotDirs);
-    }
+    return overlayLines;
+}
 
-    ray_.updateGlobals(vk_, data);
-    if (logFrame) {
-        spdlog::info("Frame {} globals uploaded", debugFrameSerial_);
-    }
-
+void Runtime::recordFrameGraphPasses(uint32_t imageIndex) {
     frameGraph_.addPass("PrepareSwapImage", [&, imageIndex](VkCommandBuffer cmd) {
         VkImageMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -972,6 +1014,122 @@ bool Runtime::buildFrame(FrameSync& frame, uint32_t imageIndex, float dt) {
                              0, nullptr,
                              1, &barrier);
     });
+}
+
+bool Runtime::submitFrame(FrameSync& frame,
+                          uint32_t imageIndex,
+                          VkCommandBuffer cb,
+                          bool logFrame,
+                          uint32_t currentFrameIdx) {
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.waitSemaphoreCount = 1;
+    si.pWaitSemaphores = &frame.imageAvailable;
+    si.pWaitDstStageMask = &waitStage;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &frame.renderFinished;
+
+    auto submitStart = std::chrono::steady_clock::now();
+    VkResult submitRes = vkQueueSubmit(vk_.graphicsQueue(), 1, &si, frame.inFlight);
+    auto submitEnd = std::chrono::steady_clock::now();
+    if (logFrame) {
+        double submitMs = std::chrono::duration<double, std::milli>(submitEnd - submitStart).count();
+        spdlog::info("Frame {} submitted ({:.3f} ms)", debugFrameSerial_, submitMs);
+    }
+    if (submitRes != VK_SUCCESS) {
+        spdlog::error("vkQueueSubmit failed ({})", int(submitRes));
+        return false;
+    }
+
+    VkSwapchainKHR sc = swap_.handle();
+    VkPresentInfoKHR pi{};
+    pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &frame.renderFinished;
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &sc;
+    pi.pImageIndices = &imageIndex;
+
+    auto presentStart = std::chrono::steady_clock::now();
+    vkQueuePresentKHR(vk_.graphicsQueue(), &pi);
+    auto presentEnd = std::chrono::steady_clock::now();
+    if (logFrame) {
+        double presentMs = std::chrono::duration<double, std::milli>(presentEnd - presentStart).count();
+        spdlog::info("Frame {} presented ({:.3f} ms)", debugFrameSerial_, presentMs);
+    }
+
+    ray_.collectGpuTimings(vk_, currentFrameIdx);
+    return true;
+}
+
+bool Runtime::buildFrame(FrameSync& frame, uint32_t imageIndex, float dt) {
+    bool logFrame = (debugFrameSerial_ <= 10) || ((debugFrameSerial_ % 60) == 0);
+    if (logFrame) {
+        spdlog::info("Frame {} acquired image {}", debugFrameSerial_, imageIndex);
+    }
+
+    frameGraph_.beginFrame();
+    if (logFrame) {
+        spdlog::info("Frame {} beginFrame done", debugFrameSerial_);
+    }
+
+    updateMeshInstances();
+
+    glm::vec3 camPosF = glm::vec3(camera_.position);
+    updateStreamingState(camPosF);
+
+    glm::mat4 V{};
+    glm::mat4 P{};
+    glm::mat4 invV{};
+    glm::mat4 invP{};
+    updateViewProjection(camPosF, V, P, invV, invP);
+
+    render::GlobalsUBOData data{};
+    uint32_t currentFrameIdx = fillGlobalsData(V, P, invV, invP, camPosF, data);
+
+    auto overlayLines = buildOverlayLines(dt);
+    ray_.updateOverlayHUD(vk_, overlayLines);
+    if (logFrame) {
+        auto timings = ray_.gpuTimingsMs();
+        spdlog::info("Frame {} globals prepared (GPU ms: G={:.2f} T={:.2f} S={:.2f} C={:.2f})",
+                     debugFrameSerial_, timings[0], timings[1], timings[2], timings[3]);
+    }
+
+    if (data.frameIdx < 3) {
+        auto makeRayCPU = [&](int px, int py) {
+            float w = float(swap_.extent().width), h = float(swap_.extent().height);
+            glm::vec2 uv = (glm::vec2(px + 0.5f, py + 0.5f)) / glm::vec2(w, h);
+            glm::vec2 ndc = glm::vec2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+            glm::vec4 pView = invP * glm::vec4(ndc, 1.0f, 1.0f);
+            pView /= std::max(pView.w, 1e-6f);
+            glm::vec3 ro = glm::vec3(invV * glm::vec4(0, 0, 0, 1));
+            glm::vec3 dirWorld = glm::vec3(invV * glm::vec4(glm::normalize(glm::vec3(pView)), 0));
+            glm::vec3 rd = glm::normalize(dirWorld);
+            return std::pair<glm::vec3, glm::vec3>(ro, rd);
+        };
+        auto [ro0, rd0] = makeRayCPU(swap_.extent().width / 2, swap_.extent().height / 2);
+        auto [ro1, rd1] = makeRayCPU(0, 0);
+        float tEnter = 0, tExit = 0;
+        bool hit = math::IntersectSphereShell(ro0, rd0, data.Rin, data.Rout, tEnter, tExit);
+        spdlog::info("Extent={}x{} Rin={} Rout={} eye=({:.1f},{:.1f},{:.1f})",
+                     swap_.extent().width, swap_.extent().height, data.Rin, data.Rout, camPosF.x, camPosF.y, camPosF.z);
+        spdlog::info("Center ray ro=({:.1f},{:.1f},{:.1f}) rd=({:.3f},{:.3f},{:.3f}) hit={} t=[{:.1f},{:.1f}]",
+                     ro0.x, ro0.y, ro0.z, rd0.x, rd0.y, rd0.z, hit ? 1 : 0, tEnter, tExit);
+        spdlog::info("Corner ray  ro=({:.1f},{:.1f},{:.1f}) rd=({:.3f},{:.3f},{:.3f})",
+                     ro1.x, ro1.y, ro1.z, rd1.x, rd1.y, rd1.z);
+        float dotDirs = glm::dot(rd0, rd1);
+        spdlog::info("dot(center,corner)={:.3f} (expect < 1)", dotDirs);
+    }
+
+    ray_.updateGlobals(vk_, data);
+    if (logFrame) {
+        spdlog::info("Frame {} globals uploaded", debugFrameSerial_);
+    }
+
+    recordFrameGraphPasses(imageIndex);
 
     VkCommandBuffer cb = commandBuffers_[currentFrame_];
     vkResetCommandBuffer(cb, 0);
@@ -984,46 +1142,10 @@ bool Runtime::buildFrame(FrameSync& frame, uint32_t imageIndex, float dt) {
         spdlog::info("Frame {} command buffer recorded", debugFrameSerial_);
     }
 
-    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    VkSubmitInfo si{};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.waitSemaphoreCount = 1;
-    si.pWaitSemaphores = &frame.imageAvailable;
-    si.pWaitDstStageMask = &waitStage;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cb;
-    si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores = &frame.renderFinished;
-    auto submitStart = std::chrono::steady_clock::now();
-    VkResult submitRes = vkQueueSubmit(vk_.graphicsQueue(), 1, &si, frame.inFlight);
-    auto submitEnd = std::chrono::steady_clock::now();
-    if (logFrame) {
-        double submitMs = std::chrono::duration<double, std::milli>(submitEnd - submitStart).count();
-        spdlog::info("Frame {} submitted ({:.3f} ms)", debugFrameSerial_, submitMs);
-    }
-    if (submitRes != VK_SUCCESS) {
-        spdlog::error("vkQueueSubmit failed ({})", int(submitRes));
+    if (!submitFrame(frame, imageIndex, cb, logFrame, currentFrameIdx)) {
         frameGraph_.endFrame();
         return false;
     }
-
-    VkPresentInfoKHR pi{};
-    pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    VkSwapchainKHR sc = swap_.handle();
-    pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores = &frame.renderFinished;
-    pi.swapchainCount = 1;
-    pi.pSwapchains = &sc;
-    pi.pImageIndices = &imageIndex;
-    auto presentStart = std::chrono::steady_clock::now();
-    vkQueuePresentKHR(vk_.graphicsQueue(), &pi);
-    auto presentEnd = std::chrono::steady_clock::now();
-    if (logFrame) {
-        double presentMs = std::chrono::duration<double, std::milli>(presentEnd - presentStart).count();
-        spdlog::info("Frame {} presented ({:.3f} ms)", debugFrameSerial_, presentMs);
-    }
-
-    ray_.collectGpuTimings(vk_, currentFrameIdx);
 
     frameGraph_.endFrame();
     if (logFrame) {
@@ -1031,6 +1153,7 @@ bool Runtime::buildFrame(FrameSync& frame, uint32_t imageIndex, float dt) {
     }
     return true;
 }
+
 
 std::pair<glm::dvec3, glm::dvec3> Runtime::sampleSurface(const glm::dvec3& guess) const {
     if (!brickStore_) {
