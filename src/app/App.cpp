@@ -1035,8 +1035,9 @@ LookTargetInfo Runtime::evaluateLookTarget(const glm::mat4& invV,
         return info;
     }
 
-    float tHit = (tEnter > 0.0f) ? tEnter : tExit;
-    if (tHit <= 0.0f) {
+    const float kMinTravel = 1e-3f;
+    float tHit = (tEnter > kMinTravel) ? tEnter : tExit;
+    if (tHit <= kMinTravel) {
         return info;
     }
 
