@@ -131,6 +131,7 @@ const uint  FLAG_FORCE_BLOCK_NORMALS = 32u;
 const uint  MISS_REASON_ENV    = 0u;
 const uint  MISS_REASON_SHELL  = 1u;
 const uint  MISS_REASON_BAND   = 2u;
+const uint  MISS_SLOT_INVALID  = 0xFFFFFFFFu;
 
 // Shared state for chunked queue fetch.
 // -------------------------------------------------------------------------------------------------
@@ -351,7 +352,7 @@ uint reserveMissSlot(uint overflowReason) {
   uint capacity = MissQueue.header.capacity;
   if (capacity == 0u) {
     atomicAdd(MissQueue.header.dropped, 1u);
-    return 0u;
+    return MISS_SLOT_INVALID;
   }
   uint headSnapshot = MissQueue.header.head;
   if ((slot - headSnapshot) >= capacity) {
@@ -363,6 +364,7 @@ uint reserveMissSlot(uint overflowReason) {
 
 void enqueueMiss(const RayPayload ray, uint reason) {
   uint slot = reserveMissSlot(reason + 1u);
+  if (slot == MISS_SLOT_INVALID) return;
   MissPayload payload;
   payload.origin     = ray.origin;
   payload.tMin       = ray.tMin;
@@ -484,10 +486,16 @@ bool sphereTraceBrick(const RayPayload ray,
 
     prevT = tCurrent;
     prevDist = dist;
-    tCurrent = min(tCurrent + stepLen, t1 + epsilon);
-    if (tCurrent > t1) break;
-
+    float nextT = tCurrent + stepLen;
+    bool clamped = nextT >= t1;
+    tCurrent = clamped ? t1 : nextT;
     dist = evaluateFieldAnalytic(originWorld + dir * tCurrent);
+    if (clamped) {
+      if (dist <= epsilon) {
+        continue;
+      }
+      break;
+    }
   }
 
   float tFallback;
