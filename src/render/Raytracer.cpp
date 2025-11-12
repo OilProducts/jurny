@@ -29,7 +29,6 @@ constexpr uint32_t kOverlayFontHeight = 8u;
 constexpr uint32_t kOverlayPadX = 1u;
 constexpr uint32_t kOverlayPadY = 1u;
 constexpr VkDeviceSize kOverlayBufferBytes = (4u + kOverlayMaxCols * kOverlayMaxRows) * sizeof(uint32_t);
-constexpr bool kCacheFieldSamples = true;
 
 void uploadBrickRange(core::UploadContext& ctx,
                       VkBuffer buffer,
@@ -126,7 +125,6 @@ Raytracer::Raytracer() {
     registerWorldBuffer(matIdxBuf_, 23);
     registerWorldBuffer(materialTableBuf_, 24);
     registerWorldBuffer(paletteBuf_, 25);
-    registerWorldBuffer(fieldBuf_, 26);
 }
 
 bool Raytracer::ensureBuffer(platform::VulkanContext& vk,
@@ -413,12 +411,11 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     VkDescriptorSetLayoutBinding bMatIdx{ }; bMatIdx.binding=23; bMatIdx.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bMatIdx.descriptorCount=1; bMatIdx.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bMatTable{ }; bMatTable.binding=24; bMatTable.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bMatTable.descriptorCount=1; bMatTable.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bPalette{ }; bPalette.binding=25; bPalette.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bPalette.descriptorCount=1; bPalette.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutBinding bField{ }; bField.binding=26; bField.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bField.descriptorCount=1; bField.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bOverlayBuf{}; bOverlayBuf.binding=27; bOverlayBuf.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bOverlayBuf.descriptorCount=1; bOverlayBuf.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bOverlayImage{}; bOverlayImage.binding=28; bOverlayImage.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bOverlayImage.descriptorCount=1; bOverlayImage.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bSpatialSrc{}; bSpatialSrc.binding=29; bSpatialSrc.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bSpatialSrc.descriptorCount=1; bSpatialSrc.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding bSpatialDst{}; bSpatialDst.binding=30; bSpatialDst.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bSpatialDst.descriptorCount=1; bSpatialDst.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutBinding bindings[31] = { bUbo, bAcc, bOut, bBH, bOcc, bHK, bHV, bMK, bMV, bDBG, bRayQ, bHitQ, bMissQ, bSecQ, bStats, bMotion, bHistRead, bHistWrite, bAlbedo, bNormal, bMoments, bHistMomentsRead, bHistMomentsWrite, bMatIdx, bMatTable, bPalette, bField, bOverlayBuf, bOverlayImage, bSpatialSrc, bSpatialDst };
+    VkDescriptorSetLayoutBinding bindings[30] = { bUbo, bAcc, bOut, bBH, bOcc, bHK, bHV, bMK, bMV, bDBG, bRayQ, bHitQ, bMissQ, bSecQ, bStats, bMotion, bHistRead, bHistWrite, bAlbedo, bNormal, bMoments, bHistMomentsRead, bHistMomentsWrite, bMatIdx, bMatTable, bPalette, bOverlayBuf, bOverlayImage, bSpatialSrc, bSpatialDst };
     VkDescriptorSetLayoutCreateInfo dslci{};
     dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     dslci.bindingCount = static_cast<uint32_t>(sizeof(bindings) / sizeof(bindings[0]));
@@ -606,9 +603,6 @@ bool Raytracer::createDescriptors(platform::VulkanContext& vk, platform::Swapcha
     if (paletteBuf_.buffer == VK_NULL_HANDLE) {
         if (!ensureBuffer(vk, paletteBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
     }
-    if (fieldBuf_.buffer == VK_NULL_HANDLE) {
-        if (!ensureBuffer(vk, fieldBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
-    }
     if (materialTableBuf_.buffer == VK_NULL_HANDLE) {
         if (!ensureBuffer(vk, materialTableBuf_, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr)) return false;
     }
@@ -688,22 +682,25 @@ bool Raytracer::createWorld(platform::VulkanContext& vk) {
     auto& store = *brickStore_;
     math::PlanetParams P{ 100.0, 120.0, 100.0, 160.0 }; // base radius, trench depth, sea level, max height
     math::NoiseTuning tuning{};
-    tuning.continentsPerCircumference = 3.2f;
-    tuning.continentAmplitude         = 110.0f;
-    tuning.continentOctaves           = 5;
-    tuning.detailWavelength           = 140.0f;
-    tuning.detailAmplitude            = 6.0f;
-    tuning.detailOctaves              = 2;
-    tuning.detailWarpMultiplier       = 1.3f;
-    tuning.baseHeightOffset           = 14.0f;
-    tuning.warpWavelength             = 240.0f;
-    tuning.warpAmplitude              = 24.0f;
-    tuning.slopeSampleDistance        = 100.0f;
-    tuning.caveWavelength             = 36.0f;
-    tuning.caveAmplitude              = 5.0f;
-    tuning.caveThreshold              = 0.35f;
-    tuning.moistureWavelength         = 80.0f;
-    tuning.moistureOctaves            = 4;
+    tuning.macroWavelength   = 2600.0f;
+    tuning.macroAmplitude    = 110.0f;
+    tuning.macroRidgeWeight  = 0.4f;
+    tuning.macroSharpness    = 1.4f;
+    tuning.detailWavelength  = 180.0f;
+    tuning.detailAmplitude   = 8.0f;
+    tuning.detailRidgeWeight = 0.3f;
+    tuning.detailSharpness   = 1.1f;
+    tuning.bandCount         = 3.0f;
+    tuning.bandAmplitude     = 18.0f;
+    tuning.bandSharpness     = 1.0f;
+    tuning.baseHeightOffset  = 14.0f;
+    tuning.caveWavelength    = 42.0f;
+    tuning.caveAmplitude     = 5.0f;
+    tuning.caveThreshold     = 0.32f;
+    tuning.caveContrast      = 2.5f;
+    tuning.moistureWavelength = 80.0f;
+    tuning.moistureOctaves    = 4;
+    tuning.moisturePersistence = 0.55f;
     noiseParams_ = math::BuildNoiseParams(tuning, P);
     worldSeed_ = 1337u;
     store.configure(P, /*voxelSize*/0.5f, /*brickDim*/VOXEL_BRICK_SIZE, noiseParams_, worldSeed_, assets_);
@@ -713,7 +710,6 @@ bool Raytracer::createWorld(platform::VulkanContext& vk) {
     occWordsHost_.clear();
     matWordsHost_.clear();
     paletteHost_.clear();
-    fieldHost_.clear();
     brickLookup_.clear();
     regionResidents_.clear();
     macroKeysHost_.clear();
@@ -797,11 +793,6 @@ bool Raytracer::appendRegion(platform::VulkanContext& vk, world::CpuWorld&& cpu,
     occWordsHost_.resize(static_cast<size_t>(oldCount + requested) * kOccWordsPerBrick);
     matWordsHost_.resize(static_cast<size_t>(oldCount + requested) * kMaterialWordsPerBrick);
     paletteHost_.resize(static_cast<size_t>(oldCount + requested) * kPaletteEntriesPerBrick);
-    if (kCacheFieldSamples) {
-        fieldHost_.resize(static_cast<size_t>(oldCount + requested) * kFieldValuesPerBrick);
-    } else {
-        fieldHost_.clear();
-    }
 
     RegionResident resident;
     resident.coord = regionCoord;
@@ -821,7 +812,6 @@ bool Raytracer::appendRegion(platform::VulkanContext& vk, world::CpuWorld&& cpu,
         record.coord = glm::ivec3(srcHeader.bx, srcHeader.by, srcHeader.bz);
         record.paletteCount = srcHeader.paletteCount;
         record.flags = srcHeader.flags;
-        record.hasField = kCacheFieldSamples && (srcHeader.tsdfOffset != world::kInvalidOffset);
         brickLookup_[key] = dstIndex;
         resident.brickKeys.push_back(key);
 
@@ -855,24 +845,6 @@ bool Raytracer::appendRegion(platform::VulkanContext& vk, world::CpuWorld&& cpu,
             std::copy_n(paletteSrc, srcHeader.paletteCount, paletteDst);
         }
 
-        if (kCacheFieldSamples) {
-            float* fieldDst = fieldHost_.data() + static_cast<size_t>(dstIndex) * kFieldValuesPerBrick;
-            std::fill(fieldDst, fieldDst + kFieldValuesPerBrick, 0.0f);
-            if (record.hasField && srcHeader.tsdfOffset != world::kInvalidOffset) {
-                size_t srcOffset = static_cast<size_t>(srcHeader.tsdfOffset / sizeof(float));
-                if (srcOffset + kFieldValuesPerBrick <= cpu.fieldSamples.size()) {
-                    const float* fieldSrc = cpu.fieldSamples.data() + srcOffset;
-                    std::copy_n(fieldSrc, kFieldValuesPerBrick, fieldDst);
-                } else {
-                    spdlog::warn("TSDF field truncated for brick ({}, {}, {}) — expected {} floats, have {}", srcHeader.bx, srcHeader.by, srcHeader.bz, kFieldValuesPerBrick, cpu.fieldSamples.size() - srcOffset);
-                    record.hasField = false;
-                    std::fill(fieldDst, fieldDst + kFieldValuesPerBrick, 0.0f);
-                }
-            }
-        } else {
-            record.hasField = false;
-        }
-
         brickRecords_[dstIndex] = record;
 
         fixupBrickHeader(dstIndex);
@@ -885,11 +857,6 @@ bool Raytracer::appendRegion(platform::VulkanContext& vk, world::CpuWorld&& cpu,
     occWordsHost_.resize(static_cast<size_t>(newCount) * kOccWordsPerBrick);
     matWordsHost_.resize(static_cast<size_t>(newCount) * kMaterialWordsPerBrick);
     paletteHost_.resize(static_cast<size_t>(newCount) * kPaletteEntriesPerBrick);
-    if (kCacheFieldSamples) {
-        fieldHost_.resize(static_cast<size_t>(newCount) * kFieldValuesPerBrick);
-    } else {
-        fieldHost_.clear();
-    }
 
     if (materialTableHost_.empty() && !cpu.materialTable.empty()) {
         materialTableHost_ = cpu.materialTable;
@@ -918,9 +885,8 @@ bool Raytracer::appendRegion(platform::VulkanContext& vk, world::CpuWorld&& cpu,
     if (appended > 0) {
         uploadHeadersRange(vk, oldCount, appended);
         uploadOccupancyRange(vk, oldCount, appended);
-        uploadMaterialRange(vk, oldCount, appended);
-        uploadPaletteRange(vk, oldCount, appended);
-        uploadFieldRange(vk, oldCount, appended);
+    uploadMaterialRange(vk, oldCount, appended);
+    uploadPaletteRange(vk, oldCount, appended);
     }
     const auto uploadEnd = std::chrono::steady_clock::now();
     const double uploadMs = std::chrono::duration<double, std::milli>(uploadEnd - uploadBegin).count();
@@ -966,11 +932,6 @@ bool Raytracer::removeRegionInternal(platform::VulkanContext& vk, const glm::ive
             std::copy_n(paletteHost_.data() + static_cast<size_t>(last) * kPaletteEntriesPerBrick,
                         kPaletteEntriesPerBrick,
                         paletteHost_.data() + static_cast<size_t>(idx) * kPaletteEntriesPerBrick);
-            if (kCacheFieldSamples) {
-                std::copy_n(fieldHost_.data() + static_cast<size_t>(last) * kFieldValuesPerBrick,
-                            kFieldValuesPerBrick,
-                            fieldHost_.data() + static_cast<size_t>(idx) * kFieldValuesPerBrick);
-            }
             fixupBrickHeader(idx);
         }
 
@@ -980,11 +941,6 @@ bool Raytracer::removeRegionInternal(platform::VulkanContext& vk, const glm::ive
         occWordsHost_.resize(static_cast<size_t>(brickRecords_.size()) * kOccWordsPerBrick);
         matWordsHost_.resize(static_cast<size_t>(brickRecords_.size()) * kMaterialWordsPerBrick);
         paletteHost_.resize(static_cast<size_t>(brickRecords_.size()) * kPaletteEntriesPerBrick);
-        if (kCacheFieldSamples) {
-            fieldHost_.resize(static_cast<size_t>(brickRecords_.size()) * kFieldValuesPerBrick);
-        } else {
-            fieldHost_.clear();
-        }
     }
 
     regionResidents_.erase(it);
@@ -1087,35 +1043,12 @@ void Raytracer::uploadPaletteRange(platform::VulkanContext& vk, uint32_t first, 
     uploadBufferSpan(paletteHost_, kPaletteEntriesPerBrick, first, count, paletteBuf_, totalBytes, uploadFull);
 }
 
-void Raytracer::uploadFieldRange(platform::VulkanContext& vk, uint32_t first, uint32_t count) {
-    if (!kCacheFieldSamples) {
-        fieldBuf_.size = 0;
-        return;
-    }
-    VkDeviceSize totalBytes = static_cast<VkDeviceSize>(fieldHost_.size()) * sizeof(float);
-    VkDeviceSize prevSize = fieldBuf_.size;
-    bool reallocated = false;
-    if (!ensureBuffer(vk, fieldBuf_, totalBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &reallocated)) {
-        return;
-    }
-    fieldBuf_.size = totalBytes;
-    if (reallocated || prevSize != totalBytes) {
-        markWorldBufferDirty(fieldBuf_);
-    }
-    if (totalBytes == 0) {
-        return;
-    }
-    bool uploadFull = reallocated || (count >= brickCount_);
-    uploadBufferSpan(fieldHost_, kFieldValuesPerBrick, first, count, fieldBuf_, totalBytes, uploadFull);
-}
-
 void Raytracer::uploadAllWorldBuffers(platform::VulkanContext& vk) {
     if (brickCount_ == 0u) {
         bhBuf_.size = 0;
         occBuf_.size = 0;
         matIdxBuf_.size = 0;
         paletteBuf_.size = 0;
-        fieldBuf_.size = 0;
         markWorldDescriptorsDirty();
         return;
     }
@@ -1123,7 +1056,6 @@ void Raytracer::uploadAllWorldBuffers(platform::VulkanContext& vk) {
     uploadOccupancyRange(vk, 0, brickCount_);
     uploadMaterialRange(vk, 0, brickCount_);
     uploadPaletteRange(vk, 0, brickCount_);
-    uploadFieldRange(vk, 0, brickCount_);
 }
 
 void Raytracer::rebuildHashesAndMacro(platform::VulkanContext& vk) {
@@ -1275,7 +1207,7 @@ void Raytracer::fixupBrickHeader(uint32_t index) {
     header.paletteCount = record.paletteCount;
     header.flags = record.flags;
     header.paletteOffset = (record.paletteCount > 0) ? index * kPaletteEntriesPerBrick * sizeof(uint32_t) : world::kInvalidOffset;
-    header.tsdfOffset = record.hasField ? index * kFieldValuesPerBrick * sizeof(float) : world::kInvalidOffset;
+    header.tsdfOffset = world::kInvalidOffset;
 }
 
 void Raytracer::destroyWorld(platform::VulkanContext& vk) {
@@ -1286,7 +1218,6 @@ void Raytracer::destroyWorld(platform::VulkanContext& vk) {
     destroyBuffer(vk, mkBuf_);
     destroyBuffer(vk, mvBuf_);
     destroyBuffer(vk, paletteBuf_);
-    destroyBuffer(vk, fieldBuf_);
     destroyBuffer(vk, matIdxBuf_);
     destroyBuffer(vk, materialTableBuf_);
     macroKeysHost_.clear();
@@ -1294,7 +1225,6 @@ void Raytracer::destroyWorld(platform::VulkanContext& vk) {
     hashKeysHost_.clear();
     hashValsHost_.clear();
     paletteHost_.clear();
-    fieldHost_.clear();
     materialTableHost_.clear();
     brickRecords_.clear();
     headersHost_.clear();
@@ -1461,39 +1391,40 @@ void Raytracer::updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData&
     if (brickStore_) {
         const auto& wg = brickStore_->worldGen();
         const auto& np = wg.params();
-        d.noiseContinentFreq = np.continentFrequency;
-        d.noiseContinentAmp  = np.continentAmplitude;
-        d.noiseDetailFreq    = np.detailFrequency;
-        d.noiseDetailAmp     = np.detailAmplitude;
-        d.noiseWarpFreq      = np.warpFrequency;
-        d.noiseWarpAmp       = np.warpAmplitude;
-        d.noiseCaveFreq      = np.caveFrequency;
-        d.noiseCaveAmp       = np.caveAmplitude;
-        d.noiseCaveThreshold = np.caveThreshold;
-        d.noiseMinHeight     = -static_cast<float>(wg.planet().T);
-        d.noiseMaxHeight     =  static_cast<float>(wg.planet().Hmax);
-        d.noiseDetailWarp    = np.detailWarpMultiplier;
-        d.noiseSlopeSampleDist = np.slopeSampleDistance;
-        d.noiseBaseHeightOffset = np.baseHeightOffset;
-        d.noisePad2          = 0.0f;
-        d.noisePad3          = 0.0f;
-        d.noiseSeed          = wg.seed();
-        d.noiseContinentOctaves = static_cast<uint32_t>(np.continentOctaves);
-        d.noiseDetailOctaves    = static_cast<uint32_t>(np.detailOctaves);
-        d.noiseCaveOctaves      = static_cast<uint32_t>(math::kNoiseCaveOctaves);
+        d.noiseMacroFreq         = np.macroFrequency;
+        d.noiseMacroAmp          = np.macroAmplitude;
+        d.noiseMacroRidgeWeight  = np.macroRidgeWeight;
+        d.noiseMacroSharpness    = np.macroSharpness;
+        d.noiseDetailFreq        = np.detailFrequency;
+        d.noiseDetailAmp         = np.detailAmplitude;
+        d.noiseDetailRidgeWeight = np.detailRidgeWeight;
+        d.noiseDetailSharpness   = np.detailSharpness;
+        d.noiseBandFreq          = np.bandFrequency;
+        d.noiseBandAmp           = np.bandAmplitude;
+        d.noiseBandSharpness     = np.bandSharpness;
+        d.noiseBaseHeightOffset  = np.baseHeightOffset;
+        d.noiseCavityFreq        = np.cavityFrequency;
+        d.noiseCavityAmp         = np.cavityAmplitude;
+        d.noiseCavityThreshold   = np.cavityThreshold;
+        d.noiseCavityContrast    = np.cavityContrast;
+        d.noiseMinHeight         = -static_cast<float>(wg.planet().T);
+        d.noiseMaxHeight         =  static_cast<float>(wg.planet().Hmax);
+        d.noisePad2 = d.noisePad3 = 0.0f;
+        d.noiseSeed = wg.seed();
+        d.noisePadU0 = d.noisePadU1 = d.noisePadU2 = 0u;
     } else {
-        d.noiseContinentFreq = d.noiseContinentAmp = 0.0f;
+        d.noiseMacroFreq = d.noiseMacroAmp = 0.0f;
+        d.noiseMacroRidgeWeight = d.noiseMacroSharpness = 0.0f;
         d.noiseDetailFreq = d.noiseDetailAmp = 0.0f;
-        d.noiseWarpFreq = d.noiseWarpAmp = 0.0f;
-        d.noiseCaveFreq = d.noiseCaveAmp = 0.0f;
-        d.noiseCaveThreshold = 0.0f;
-        d.noiseMinHeight = d.noiseMaxHeight = 0.0f;
-        d.noiseDetailWarp = 0.0f;
-        d.noiseSlopeSampleDist = 0.0f;
+        d.noiseDetailRidgeWeight = d.noiseDetailSharpness = 0.0f;
+        d.noiseBandFreq = d.noiseBandAmp = d.noiseBandSharpness = 0.0f;
         d.noiseBaseHeightOffset = 0.0f;
+        d.noiseCavityFreq = d.noiseCavityAmp = 0.0f;
+        d.noiseCavityThreshold = d.noiseCavityContrast = 0.0f;
+        d.noiseMinHeight = d.noiseMaxHeight = 0.0f;
         d.noisePad2 = d.noisePad3 = 0.0f;
         d.noiseSeed = 0u;
-        d.noiseContinentOctaves = d.noiseDetailOctaves = d.noiseCaveOctaves = 0u;
+        d.noisePadU0 = d.noisePadU1 = d.noisePadU2 = 0u;
     }
     renderOrigin_ = glm::vec3(d.renderOrigin[0], d.renderOrigin[1], d.renderOrigin[2]);
     tonemap_.setExposure(d.exposure);
@@ -2004,8 +1935,13 @@ void Raytracer::readDebug(platform::VulkanContext& vk, uint32_t frameIdx) {
             std::memcpy(&stats, mapped, sizeof(TraversalStatsHost));
             vkUnmapMemory(vk.device(), statsMem);
             statsHost_ = stats;
-            spdlog::debug("Traverse stats: macroVisited={} macroSkipped={} brickSteps={} microSteps={} hits={}",
-                          stats.macroVisited, stats.macroSkipped, stats.brickSteps, stats.microSteps, stats.hitsTotal);
+            spdlog::debug("Traverse stats: macroVisited={} macroSkipped={} brickSteps={} sphereSteps={} hits={} sphereMisses={}",
+                          stats.macroVisited,
+                          stats.macroSkipped,
+                          stats.brickSteps,
+                          stats.sphereSteps,
+                          stats.hitsTotal,
+                          stats.sphereMisses);
         } else {
             spdlog::warn("Failed to map traversal stats buffer (res={})", int(mapRes));
         }

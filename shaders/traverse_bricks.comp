@@ -98,9 +98,9 @@ layout(set = 0, binding = 14, std430) buffer TraverseStatsBuf {
   uint macroVisited;
   uint macroSkipped;
   uint brickSteps;
-  uint microSteps;
+  uint sphereSteps;
   uint hitsTotal;
-  uint pad0;
+  uint sphereMisses;
   uint pad1;
   uint pad2;
 } TraverseStats;
@@ -113,32 +113,6 @@ layout(set = 0, binding = 25, std430) readonly buffer PaletteBuf {
   uint paletteEntries[];
 };
 
-layout(set = 0, binding = 26, std430) readonly buffer FieldSamplesBuf {
-  float fieldSamples[];
-};
-
-const uint FIELD_RES   = 1u;
-const uint FIELD_APRON_VOXELS = 1u;
-const uint FIELD_APRON = FIELD_APRON_VOXELS * FIELD_RES;
-const uint FIELD_DIM   = uint(VOXEL_BRICK_SIZE) * FIELD_RES + 1u + 2u * FIELD_APRON;
-const uint FIELD_PLANE = FIELD_DIM * FIELD_DIM;
-const uint FIELD_COUNT_PER_BRICK = FIELD_DIM * FIELD_PLANE;
-
-bool brickFieldBase(const BrickHeader h, out uint baseIndex) {
-  if (h.tsdfOffset == BRICK_INVALID_OFFSET) return false;
-  uint base = h.tsdfOffset >> 2u;
-  uint count = fieldSamples.length();
-  if (count == 0u) return false;
-  if (base + FIELD_COUNT_PER_BRICK > count) return false;
-  baseIndex = base;
-  return true;
-}
-
-float fetchFieldSample(uint baseIndex, int x, int y, int z) {
-  uint idx = baseIndex + uint(x) + uint(y) * FIELD_DIM + uint(z) * FIELD_PLANE;
-  return fieldSamples[idx];
-}
-
 // Constants ----------------------------------------------------------------------------
 const float INF_T              = 1e30;
 const float BRICK_NUDGE        = 1e-5;
@@ -146,8 +120,12 @@ const float MACRO_STEP_EPS     = 1e-5;
 const float REFINE_EPS         = 0.5;      // gradient epsilon (in voxel units)
 const int   BRICK_MAX_STEPS    = 4096;
 const int   MACRO_MAX_STEPS    = 2048;
-const int   MICRO_MAX_STEPS    = 128;
+const int   SPHERE_TRACE_MAX_STEPS = 128;   // max iterations per brick segment
 const int   REFINE_MAX_ITERS   = 6;
+const float SPHERE_TRACE_SAFETY          = 0.9; // scales signed distance before advancing to reduce overshoot
+const float SPHERE_TRACE_EPS_VOX         = 0.5; // convergence threshold proportional to voxel size
+const float SPHERE_TRACE_MIN_STEP_VOX    = 0.1; // lower clamp in voxels so we keep moving near flat surfaces
+const float SPHERE_TRACE_MAX_STEP_BRICK  = 2.0; // upper clamp in bricks to avoid leaping past thin features
 const uint  FLAG_ENABLE_MACRO        = 8u;       // matches CPU/debug flag bit
 const uint  FLAG_FORCE_BLOCK_NORMALS = 32u;
 const uint  MISS_REASON_ENV    = 0u;
@@ -228,61 +206,33 @@ bool brickHasOccupancy(const BrickHeader h) {
   return false;
 }
 
-float sampleBrickField(uint baseIndex, vec3 worldPos, const BrickHeader h) {
-  vec3 brickOriginWorld = vec3(h.bx, h.by, h.bz) * g.brickSize;
-  vec3 local = (worldPos - brickOriginWorld) / g.voxelSize * float(FIELD_RES) +
-               vec3(float(FIELD_APRON));
-
-  float fx = clamp(local.x, 0.0, float(FIELD_DIM - 1u));
-  float fy = clamp(local.y, 0.0, float(FIELD_DIM - 1u));
-  float fz = clamp(local.z, 0.0, float(FIELD_DIM - 1u));
-
-  int ix0 = clamp(int(floor(fx)), 0, int(FIELD_DIM) - 1);
-  int iy0 = clamp(int(floor(fy)), 0, int(FIELD_DIM) - 1);
-  int iz0 = clamp(int(floor(fz)), 0, int(FIELD_DIM) - 1);
-  int ix1 = min(ix0 + 1, int(FIELD_DIM) - 1);
-  int iy1 = min(iy0 + 1, int(FIELD_DIM) - 1);
-  int iz1 = min(iz0 + 1, int(FIELD_DIM) - 1);
-
-  float tx = clamp(fx - float(ix0), 0.0, 1.0);
-  float ty = clamp(fy - float(iy0), 0.0, 1.0);
-  float tz = clamp(fz - float(iz0), 0.0, 1.0);
-
-  float c00 = mix(fetchFieldSample(baseIndex, ix0, iy0, iz0), fetchFieldSample(baseIndex, ix1, iy0, iz0), tx);
-  float c10 = mix(fetchFieldSample(baseIndex, ix0, iy1, iz0), fetchFieldSample(baseIndex, ix1, iy1, iz0), tx);
-  float c01 = mix(fetchFieldSample(baseIndex, ix0, iy0, iz1), fetchFieldSample(baseIndex, ix1, iy0, iz1), tx);
-  float c11 = mix(fetchFieldSample(baseIndex, ix0, iy1, iz1), fetchFieldSample(baseIndex, ix1, iy1, iz1), tx);
-  float c0 = mix(c00, c10, ty);
-  float c1 = mix(c01, c11, ty);
-  return mix(c0, c1, tz);
+float evaluateFieldAnalytic(vec3 worldPos) {
+  return F_crust(worldPos);
 }
 
-float evaluateField(uint baseIndex, vec3 p, const BrickHeader h) {
-  return sampleBrickField(baseIndex, p, h);
+vec3 evaluateNormalAnalytic(vec3 worldPos) {
+  return gradF(worldPos);
 }
 
-vec3 evaluateNormal(uint baseIndex, vec3 p, const BrickHeader h, float voxelSize) {
-  float eps = max(voxelSize * REFINE_EPS, 1e-4);
-  float fx1 = evaluateField(baseIndex, p + vec3(eps, 0.0, 0.0), h);
-  float fx0 = evaluateField(baseIndex, p - vec3(eps, 0.0, 0.0), h);
-  float fy1 = evaluateField(baseIndex, p + vec3(0.0, eps, 0.0), h);
-  float fy0 = evaluateField(baseIndex, p - vec3(0.0, eps, 0.0), h);
-  float fz1 = evaluateField(baseIndex, p + vec3(0.0, 0.0, eps), h);
-  float fz0 = evaluateField(baseIndex, p - vec3(0.0, 0.0, eps), h);
-  vec3 n = vec3(fx1 - fx0, fy1 - fy0, fz1 - fz0);
-  return (length(n) > 0.0) ? normalize(n) : vec3(0.0, 1.0, 0.0);
+vec3 blockNormalForDir(vec3 dir) {
+  vec3 absDir = abs(dir);
+  if (absDir.x >= absDir.y && absDir.x >= absDir.z) {
+    return vec3(dir.x > 0.0 ? -1.0 : 1.0, 0.0, 0.0);
+  }
+  if (absDir.y >= absDir.x && absDir.y >= absDir.z) {
+    return vec3(0.0, dir.y > 0.0 ? -1.0 : 1.0, 0.0);
+  }
+  return vec3(0.0, 0.0, dir.z > 0.0 ? -1.0 : 1.0);
 }
 
-bool refineSurface(uint baseIndex,
-                   vec3 origin,
+bool refineSurface(vec3 origin,
                    vec3 dir,
                    float ta,
                    float tb,
-                   const BrickHeader h,
                    out float tOut) {
   vec3 originWorld = origin + g.renderOrigin;
-  float fa = evaluateField(baseIndex, originWorld + dir * ta, h);
-  float fb = evaluateField(baseIndex, originWorld + dir * tb, h);
+  float fa = evaluateFieldAnalytic(originWorld + dir * ta);
+  float fb = evaluateFieldAnalytic(originWorld + dir * tb);
   tOut = ta;
   if (fa * fb > 0.0) {
     return false; // no sign change along this segment
@@ -292,7 +242,7 @@ bool refineSurface(uint baseIndex,
   float tMid = ta;
   for (int i = 0; i < REFINE_MAX_ITERS; ++i) {
     tMid = 0.5 * (a + b);
-    float fm = evaluateField(baseIndex, originWorld + dir * tMid, h);
+    float fm = evaluateFieldAnalytic(originWorld + dir * tMid);
     if (fm == 0.0) break;
     bool same = (fm * fa) > 0.0;
     if (same) {
@@ -347,6 +297,16 @@ bool fetchMaterialId(uint linearIndex, BrickHeader h, out uint materialId) {
     materialId = (word >> shift) & 0xFFu;
     return true;
   }
+}
+
+bool fetchMaterialAtWorld(vec3 hitWorld, const BrickHeader h, out uint materialId) {
+  vec3 brickOriginWorld = vec3(h.bx, h.by, h.bz) * g.brickSize;
+  vec3 local = (hitWorld - brickOriginWorld) / g.voxelSize;
+  ivec3 voxel = clamp(ivec3(floor(local)), ivec3(0), ivec3(VOXEL_BRICK_SIZE - 1));
+  uint linear = uint(voxel.x) +
+                uint(voxel.y) * uint(VOXEL_BRICK_SIZE) +
+                uint(voxel.z) * uint(VOXEL_BRICK_SIZE * VOXEL_BRICK_SIZE);
+  return fetchMaterialId(linear, h, materialId);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -474,138 +434,84 @@ void recordMacroDiag(ivec3 startCoords,
 // Macro skipping
 // -------------------------------------------------------------------------------------------------
 
-bool traverseBrickMicro(const RayPayload ray,
-                        float tEnter,
-                        float tExit,
-                        const BrickHeader h,
-                        out float tHit,
-                        out vec3 hitNormal,
-                        out uint materialId) {
+bool sphereTraceBrick(const RayPayload ray,
+                      float tEnter,
+                      float tExit,
+                      const BrickHeader h,
+                      out float tHit,
+                      out vec3 hitNormal,
+                      out uint materialId) {
   float t0 = max(tEnter, ray.tMin);
   float t1 = min(tExit, ray.tMax);
   if (t0 > t1) return false;
 
-  vec3 renderOrigin = g.renderOrigin;
-  vec3 originWorld = ray.origin + renderOrigin;
-  vec3 brickOriginWorld = vec3(h.bx, h.by, h.bz) * g.brickSize;
+  vec3 originWorld = ray.origin + g.renderOrigin;
   vec3 dir = ray.direction;
   if (length(dir) == 0.0) return false;
 
-  vec3 p0World = originWorld + dir * t0;
-  vec3 local = (p0World - brickOriginWorld) / g.voxelSize;
+  float epsilon = g.voxelSize * SPHERE_TRACE_EPS_VOX;
+  float minStep = g.voxelSize * SPHERE_TRACE_MIN_STEP_VOX;
+  float maxStep = g.brickSize * SPHERE_TRACE_MAX_STEP_BRICK;
+  bool forceBlockNormal = ((g.flags & FLAG_FORCE_BLOCK_NORMALS) != 0u);
 
-  ivec3 voxel = clamp(ivec3(floor(local)), ivec3(0), ivec3(VOXEL_BRICK_SIZE - 1));
-  ivec3 step = ivec3(
-    (dir.x > 0.0) ? 1 : ((dir.x < 0.0) ? -1 : 0),
-    (dir.y > 0.0) ? 1 : ((dir.y < 0.0) ? -1 : 0),
-    (dir.z > 0.0) ? 1 : ((dir.z < 0.0) ? -1 : 0)
-  );
+  float tCurrent = t0;
+  float prevT = t0;
+  float prevDist = evaluateFieldAnalytic(originWorld + dir * tCurrent);
+  float dist = prevDist;
 
-  vec3 invDir = vec3(
-    safeReciprocal(dir.x),
-    safeReciprocal(dir.y),
-    safeReciprocal(dir.z)
-  );
-  vec3 absInv = abs(invDir);
-  vec3 tDelta = vec3(g.voxelSize) * absInv;
-
-  vec3 nextBoundary;
-  nextBoundary.x = (step.x > 0) ? ((float(voxel.x) + 1.0) - local.x) : (local.x - float(voxel.x));
-  nextBoundary.y = (step.y > 0) ? ((float(voxel.y) + 1.0) - local.y) : (local.y - float(voxel.y));
-  nextBoundary.z = (step.z > 0) ? ((float(voxel.z) + 1.0) - local.z) : (local.z - float(voxel.z));
-  nextBoundary = max(nextBoundary, vec3(0.0));
-
-  vec3 tMax = vec3(
-    (step.x == 0) ? INF_T : (t0 + nextBoundary.x * absInv.x * g.voxelSize),
-    (step.y == 0) ? INF_T : (t0 + nextBoundary.y * absInv.y * g.voxelSize),
-    (step.z == 0) ? INF_T : (t0 + nextBoundary.z * absInv.z * g.voxelSize)
-  );
-
-  float tCellEnter = t0;
-  uint baseWord = h.occOffset >> 3u;
-  uint fieldBase = 0u;
-  bool fieldReady = brickFieldBase(h, fieldBase);
-  bool blockNormalsFlag = ((g.flags & FLAG_FORCE_BLOCK_NORMALS) != 0u) || !fieldReady;
-
-  for (int iter = 0; iter < MICRO_MAX_STEPS && tCellEnter <= t1; ++iter) {
-    atomicAdd(TraverseStats.microSteps, 1u);
-    uint linear = uint(voxel.x) +
-                  uint(voxel.y) * uint(VOXEL_BRICK_SIZE) +
-                  uint(voxel.z) * uint(VOXEL_BRICK_SIZE * VOXEL_BRICK_SIZE);
-    uint word = baseWord + (linear >> 6u);
-    uint bit  = linear & 63u;
-    bool occupied = ((OCC.occWords[word] >> bit) & 1ul) != 0ul;
-
-    float tCellExit = min(tMax.x, min(tMax.y, tMax.z));
-    if (occupied) {
-      bool forceBlock = blockNormalsFlag;
-      float tCandidate = tCellEnter;
-      vec3 normal = vec3(0.0);
-      bool surfaceFound = true;
-      if (forceBlock) {
-        vec3 absDir = abs(dir);
-        if (absDir.x >= absDir.y && absDir.x >= absDir.z) {
-          normal = vec3(dir.x > 0.0 ? -1.0 : 1.0, 0.0, 0.0);
-        } else if (absDir.y >= absDir.x && absDir.y >= absDir.z) {
-          normal = vec3(0.0, dir.y > 0.0 ? -1.0 : 1.0, 0.0);
-        } else {
-          normal = vec3(0.0, 0.0, dir.z > 0.0 ? -1.0 : 1.0);
-        }
+  for (int iter = 0; iter < SPHERE_TRACE_MAX_STEPS && tCurrent <= t1; ++iter) {
+    atomicAdd(TraverseStats.sphereSteps, 1u);
+    if (dist <= epsilon) {
+      vec3 hitWorld = originWorld + dir * tCurrent;
+      if (forceBlockNormal) {
+        hitNormal = blockNormalForDir(dir);
       } else {
-        float tExitClamped = min(tCellExit, t1);
-        float tRefined = tCellEnter;
-        surfaceFound = refineSurface(fieldBase,
-                                     ray.origin,
-                                     dir,
-                                     tCellEnter,
-                                     tExitClamped,
-                                     h,
-                                     tRefined);
-        if (surfaceFound) {
-          tCandidate = tRefined;
-          vec3 hitWorld = originWorld + dir * tCandidate;
-          normal = evaluateNormal(fieldBase, hitWorld, h, g.voxelSize);
-        }
+        vec3 grad = evaluateNormalAnalytic(hitWorld);
+        hitNormal = (length(grad) > 0.0) ? normalize(grad) : normalize(dir);
       }
-      if (!forceBlock && !surfaceFound) {
-        occupied = false;
-      } else {
-        tHit = tCandidate;
-        hitNormal = normal;
-        uint matValue;
-        if (fetchMaterialId(linear, h, matValue)) {
-          materialId = matValue;
-        } else {
-          materialId = fallbackMaterialId();
-        }
-        return true;
+      tHit = tCurrent;
+      if (!fetchMaterialAtWorld(hitWorld, h, materialId)) {
+        materialId = fallbackMaterialId();
       }
+      return true;
     }
 
-    if (tCellExit > t1) break;
-
-    if (tMax.x <= tMax.y && tMax.x <= tMax.z) {
-      tCellEnter = tMax.x;
-      if (step.x == 0) break;
-      tMax.x += tDelta.x;
-      voxel.x += step.x;
-    } else if (tMax.y <= tMax.z) {
-      tCellEnter = tMax.y;
-      if (step.y == 0) break;
-      tMax.y += tDelta.y;
-      voxel.y += step.y;
-    } else {
-      tCellEnter = tMax.z;
-      if (step.z == 0) break;
-      tMax.z += tDelta.z;
-      voxel.z += step.z;
-    }
-
-    if (any(lessThan(voxel, ivec3(0))) || any(greaterThan(voxel, ivec3(VOXEL_BRICK_SIZE - 1)))) {
+    float stepLen = dist * SPHERE_TRACE_SAFETY;
+    stepLen = clamp(stepLen, minStep, maxStep);
+    if (!(stepLen > 0.0) || isnan(stepLen) || isinf(stepLen)) {
       break;
     }
+
+    prevT = tCurrent;
+    prevDist = dist;
+    tCurrent = min(tCurrent + stepLen, t1 + epsilon);
+    if (tCurrent > t1) break;
+
+    dist = evaluateFieldAnalytic(originWorld + dir * tCurrent);
   }
 
+  float tFallback;
+  bool refined = (prevDist * dist) < 0.0 && refineSurface(ray.origin,
+                                                         dir,
+                                                         min(prevT, t1),
+                                                         min(tCurrent, t1),
+                                                         tFallback);
+  if (refined) {
+    vec3 hitWorld = originWorld + dir * tFallback;
+    if (forceBlockNormal) {
+      hitNormal = blockNormalForDir(dir);
+    } else {
+      vec3 grad = evaluateNormalAnalytic(hitWorld);
+      hitNormal = (length(grad) > 0.0) ? normalize(grad) : normalize(dir);
+    }
+    tHit = tFallback;
+    if (!fetchMaterialAtWorld(hitWorld, h, materialId)) {
+      materialId = fallbackMaterialId();
+    }
+    return true;
+  }
+
+  atomicAdd(TraverseStats.sphereMisses, 1u);
   return false;
 }
 
@@ -787,7 +693,7 @@ void processRay(const RayPayload rayIn) {
         float tHit;
         vec3 normal;
         uint material;
-        if (traverseBrickMicro(ray, tCursor, min(tBrickExit, tMax), h, tHit, normal, material)) {
+        if (sphereTraceBrick(ray, tCursor, min(tBrickExit, tMax), h, tHit, normal, material)) {
           atomicAdd(TraverseStats.hitsTotal, 1u);
           enqueueHit(ray, tHit, normal, material);
           return;

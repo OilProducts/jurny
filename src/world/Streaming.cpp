@@ -153,7 +153,6 @@ void Streaming::expandFrontier(uint64_t frameIndex) {
             continue;
         }
         RegionRecord& record = it->second;
-        record.frontierQueued = false;
         updateRecordMetrics(record, cell);
         record.lastTouchedFrame = frameIndex;
 

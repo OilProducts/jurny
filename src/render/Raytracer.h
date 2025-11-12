@@ -40,11 +40,12 @@ struct GlobalsUBOData {
     uint32_t macroHashCapacity, macroDimBricks;
     float macroSize;
     uint32_t historyValid;
-    float noiseContinentFreq, noiseContinentAmp, noiseDetailFreq, noiseDetailAmp;
-    float noiseWarpFreq, noiseWarpAmp, noiseCaveFreq, noiseCaveAmp;
-    float noiseCaveThreshold, noiseMinHeight, noiseMaxHeight, noiseDetailWarp;
-    float noiseSlopeSampleDist, noiseBaseHeightOffset, noisePad2, noisePad3;
-    uint32_t noiseSeed, noiseContinentOctaves, noiseDetailOctaves, noiseCaveOctaves;
+    float noiseMacroFreq, noiseMacroAmp, noiseMacroRidgeWeight, noiseMacroSharpness;
+    float noiseDetailFreq, noiseDetailAmp, noiseDetailRidgeWeight, noiseDetailSharpness;
+    float noiseBandFreq, noiseBandAmp, noiseBandSharpness, noiseBaseHeightOffset;
+    float noiseCavityFreq, noiseCavityAmp, noiseCavityThreshold, noiseCavityContrast;
+    float noiseMinHeight, noiseMaxHeight, noisePad2, noisePad3;
+    uint32_t noiseSeed, noisePadU0, noisePadU1, noisePadU2;
 };
 static_assert(sizeof(GlobalsUBOData) % 16 == 0, "GlobalsUBOData must align to 16 bytes");
 
@@ -127,7 +128,6 @@ private:
     void uploadOccupancyRange(platform::VulkanContext& vk, uint32_t first, uint32_t count);
     void uploadMaterialRange(platform::VulkanContext& vk, uint32_t first, uint32_t count);
     void uploadPaletteRange(platform::VulkanContext& vk, uint32_t first, uint32_t count);
-    void uploadFieldRange(platform::VulkanContext& vk, uint32_t first, uint32_t count);
     void updateBrickHeader(uint32_t index);
     void fixupBrickHeader(uint32_t index);
     bool createProfilingResources(platform::VulkanContext& vk);
@@ -161,16 +161,15 @@ private:
     BufferResource mkBuf_{};
     BufferResource mvBuf_{};
     BufferResource paletteBuf_{};
-    BufferResource fieldBuf_{};
     BufferResource matIdxBuf_{};
     BufferResource materialTableBuf_{};
     struct TraversalStatsHost {
         uint32_t macroVisited;
         uint32_t macroSkipped;
         uint32_t brickSteps;
-        uint32_t microSteps;
+        uint32_t sphereSteps;
         uint32_t hitsTotal;
-        uint32_t pad0;
+        uint32_t sphereMisses;
         uint32_t pad1;
         uint32_t pad2;
     } statsHost_{};
@@ -203,7 +202,6 @@ private:
         glm::ivec3 coord{0};
         uint16_t paletteCount = 0;
         uint16_t flags = 0;
-        bool hasField = false;
     };
 
     struct RegionResident {
@@ -227,7 +225,6 @@ private:
     std::vector<uint64_t> occWordsHost_;
     std::vector<uint32_t> matWordsHost_;
     std::vector<uint32_t> paletteHost_;
-    std::vector<float>    fieldHost_;
     std::vector<uint64_t> hashKeysHost_;
     std::vector<uint32_t> hashValsHost_;
 
@@ -236,8 +233,6 @@ private:
     static constexpr uint32_t kOccWordsPerBrick = 8;
     static constexpr uint32_t kMaterialWordsPerBrick = 128;
     static constexpr uint32_t kPaletteEntriesPerBrick = 16;
-    static constexpr uint32_t kFieldValuesPerBrick =
-        static_cast<uint32_t>(world::FieldSamplesPerBrick(VOXEL_BRICK_SIZE));
 };
 
 }
