@@ -21,6 +21,7 @@
 #include <iomanip>
 #include <thread>
 #include <glm/glm.hpp>
+#include <glm/common.hpp>
 #include <glm/geometric.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <spdlog/spdlog.h>
@@ -69,6 +70,17 @@ struct CameraPose {
     glm::dvec3 position = glm::dvec3(0.0);
     glm::vec3 forward = glm::vec3(0.0f, 0.0f, 1.0f);
     glm::vec3 up = glm::vec3(0.0f, 0.0f, 1.0f);
+};
+
+struct LookTargetInfo {
+    bool valid = false;
+    glm::vec3 hitPos = glm::vec3(0.0f);
+    float distance = 0.0f;
+    float altitude = 0.0f;
+    float latitudeDeg = 0.0f;
+    float longitudeDeg = 0.0f;
+    glm::ivec3 regionCoord = glm::ivec3(0);
+    glm::ivec3 brickCoord = glm::ivec3(0);
 };
 
 const glm::vec3 kWorldUpF(0.0f, 0.0f, 1.0f);
@@ -133,11 +145,16 @@ private:
     void updateViewProjection(const glm::vec3& camPosF, glm::mat4& V, glm::mat4& P, glm::mat4& invV, glm::mat4& invP);
     uint32_t fillGlobalsData(const glm::mat4& V, const glm::mat4& P, const glm::mat4& invV, const glm::mat4& invP,
                              const glm::vec3& camPosF, render::GlobalsUBOData& data);
-    std::vector<std::string> buildOverlayLines(float dt);
     void recordFrameGraphPasses(uint32_t imageIndex);
     bool submitFrame(FrameSync& frame, uint32_t imageIndex, VkCommandBuffer cb, bool logFrame, uint32_t currentFrameIdx);
     bool buildFrame(FrameSync& frame, uint32_t imageIndex, float dt);
     std::pair<glm::dvec3, glm::dvec3> sampleSurface(const glm::dvec3& guess) const;
+    std::vector<std::string> buildOverlayLines(float dt, const LookTargetInfo& lookInfo);
+    std::pair<glm::vec3, glm::vec3> computeViewRay(float px, float py, const glm::mat4& invV, const glm::mat4& invP) const;
+    LookTargetInfo evaluateLookTarget(const glm::mat4& invV,
+                                      const glm::mat4& invP,
+                                      const render::GlobalsUBOData& globals) const;
+    render::CrosshairParams computeCrosshairParams() const;
 
 private:
     platform::VulkanContext vk_;
@@ -166,6 +183,7 @@ private:
     size_t debugFrameSerial_ = 0u;
     CameraState camera_;
     std::chrono::steady_clock::time_point lastTime_{};
+    LookTargetInfo lookInfo_{};
 };
 
 } // namespace
@@ -881,7 +899,7 @@ uint32_t Runtime::fillGlobalsData(const glm::mat4& V,
     return currentFrameIdx;
 }
 
-std::vector<std::string> Runtime::buildOverlayLines(float dt) {
+std::vector<std::string> Runtime::buildOverlayLines(float dt, const LookTargetInfo& lookInfo) {
     constexpr size_t kOverlayMaxCols = 128;
     std::vector<std::string> overlayLines;
     overlayLines.reserve(6);
@@ -950,7 +968,116 @@ std::vector<std::string> Runtime::buildOverlayLines(float dt) {
         clampLine(ss.str());
     }
 
+    if (lookInfo.valid) {
+        {
+            std::ostringstream ss;
+            ss << std::fixed << std::setprecision(1)
+               << "LOOK XYZ " << lookInfo.hitPos.x
+               << " " << lookInfo.hitPos.y
+               << " " << lookInfo.hitPos.z
+               << " DIST " << lookInfo.distance;
+            clampLine(ss.str());
+        }
+        {
+            std::ostringstream ss;
+            ss << std::fixed << std::setprecision(2)
+               << "LOOK LAT " << lookInfo.latitudeDeg
+               << " LON " << lookInfo.longitudeDeg
+               << " ALT " << lookInfo.altitude;
+            clampLine(ss.str());
+        }
+        {
+            std::ostringstream ss;
+            ss << "REG " << lookInfo.regionCoord.x << ',' << lookInfo.regionCoord.y << ',' << lookInfo.regionCoord.z
+               << " BRK " << lookInfo.brickCoord.x << ',' << lookInfo.brickCoord.y << ',' << lookInfo.brickCoord.z;
+            clampLine(ss.str());
+        }
+    } else {
+        clampLine("LOOK SKY (NO HIT)");
+    }
+
     return overlayLines;
+}
+
+std::pair<glm::vec3, glm::vec3> Runtime::computeViewRay(float px, float py, const glm::mat4& invV, const glm::mat4& invP) const {
+    glm::vec3 ro(0.0f);
+    glm::vec3 rd(0.0f);
+    float width = static_cast<float>(std::max<uint32_t>(swap_.extent().width, 1u));
+    float height = static_cast<float>(std::max<uint32_t>(swap_.extent().height, 1u));
+
+    glm::vec2 uv = (glm::vec2(px + 0.5f, py + 0.5f)) / glm::vec2(width, height);
+    glm::vec2 ndc = glm::vec2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+    glm::vec4 pView = invP * glm::vec4(ndc, 1.0f, 1.0f);
+    float w = std::max(pView.w, 1e-6f);
+    pView /= w;
+    ro = glm::vec3(invV * glm::vec4(0, 0, 0, 1));
+    glm::vec3 dirView = glm::normalize(glm::vec3(pView));
+    rd = glm::vec3(invV * glm::vec4(dirView, 0));
+    rd = glm::normalize(rd);
+    return {ro, rd};
+}
+
+LookTargetInfo Runtime::evaluateLookTarget(const glm::mat4& invV,
+                                           const glm::mat4& invP,
+                                           const render::GlobalsUBOData& globals) const {
+    LookTargetInfo info;
+    if (swap_.extent().width == 0 || swap_.extent().height == 0) {
+        return info;
+    }
+
+    float px = static_cast<float>(swap_.extent().width) * 0.5f;
+    float py = static_cast<float>(swap_.extent().height) * 0.5f;
+    auto [ro, rd] = computeViewRay(px, py, invV, invP);
+
+    float tEnter = 0.0f;
+    float tExit = 0.0f;
+    if (!math::IntersectSphereShell(ro, rd, globals.Rin, globals.Rout, tEnter, tExit)) {
+        return info;
+    }
+
+    float tHit = (tEnter > 0.0f) ? tEnter : tExit;
+    if (tHit <= 0.0f) {
+        return info;
+    }
+
+    glm::vec3 hit = ro + rd * tHit;
+    float radius = glm::length(hit);
+    info.valid = true;
+    info.hitPos = hit;
+    info.distance = tHit;
+    info.altitude = radius - planetRadius_;
+    if (radius > 1e-4f) {
+        info.latitudeDeg = glm::degrees(std::asin(glm::clamp(hit.z / radius, -1.0f, 1.0f)));
+        info.longitudeDeg = glm::degrees(std::atan2(hit.y, hit.x));
+    }
+
+    if (brickStore_) {
+        float brickSize = brickStore_->brickSize();
+        if (brickSize > 0.0f) {
+            info.brickCoord = glm::ivec3(glm::floor(hit / brickSize));
+        }
+        int regionDim = std::max(streaming_.regionDimBricks(), 1);
+        float regionSize = brickSize * static_cast<float>(regionDim);
+        if (regionSize > 0.0f) {
+            info.regionCoord = glm::ivec3(glm::floor(hit / regionSize));
+        }
+    }
+    return info;
+}
+
+render::CrosshairParams Runtime::computeCrosshairParams() const {
+    render::CrosshairParams params;
+    if (swap_.extent().width == 0 || swap_.extent().height == 0) {
+        params.enabled = false;
+        return params;
+    }
+    params.enabled = true;
+    params.centerX = static_cast<int>(swap_.extent().width / 2);
+    params.centerY = static_cast<int>(swap_.extent().height / 2);
+    int minDim = static_cast<int>(std::min(swap_.extent().width, swap_.extent().height));
+    params.halfLength = std::max(10, minDim / 40);
+    params.thickness = std::max(1, minDim / 400);
+    return params;
 }
 
 void Runtime::recordFrameGraphPasses(uint32_t imageIndex) {
@@ -991,6 +1118,10 @@ void Runtime::recordFrameGraphPasses(uint32_t imageIndex) {
 
     frameGraph_.addPass("OverlayHUD", [&, imageIndex](VkCommandBuffer cmd) {
         ray_.recordOverlay(cmd, imageIndex);
+    });
+
+    frameGraph_.addPass("Crosshair", [&, imageIndex](VkCommandBuffer cmd) {
+        ray_.recordCrosshair(cmd, imageIndex);
     });
 
     frameGraph_.addPass("TransitionToPresent", [&, imageIndex](VkCommandBuffer cmd) {
@@ -1090,7 +1221,10 @@ bool Runtime::buildFrame(FrameSync& frame, uint32_t imageIndex, float dt) {
     render::GlobalsUBOData data{};
     uint32_t currentFrameIdx = fillGlobalsData(V, P, invV, invP, camPosF, data);
 
-    auto overlayLines = buildOverlayLines(dt);
+    lookInfo_ = evaluateLookTarget(invV, invP, data);
+    ray_.setCrosshair(computeCrosshairParams());
+
+    auto overlayLines = buildOverlayLines(dt, lookInfo_);
     ray_.updateOverlayHUD(vk_, overlayLines);
     if (logFrame) {
         auto timings = ray_.gpuTimingsMs();

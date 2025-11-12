@@ -1,0 +1,42 @@
+#version 460
+
+// Simple compute shader that draws a crosshair in screen space.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 28, rgba8) uniform image2D targetImage;
+
+layout(push_constant) uniform CrosshairPushConstants {
+  ivec2 base;       // top-left pixel covered by this dispatch box
+  ivec2 extent;     // width/height of the dispatch region
+  ivec2 center;     // screen-space center in pixels
+  int halfLength;   // half-length of crosshair arms (pixels)
+  int thickness;    // half-thickness of the bars (pixels)
+} pc;
+
+void main() {
+  ivec2 local = ivec2(gl_GlobalInvocationID.xy);
+  if (local.x >= pc.extent.x || local.y >= pc.extent.y) {
+    return;
+  }
+
+  ivec2 pix = pc.base + local;
+  ivec2 dims = imageSize(targetImage);
+  if (pix.x < 0 || pix.y < 0 || pix.x >= dims.x || pix.y >= dims.y) {
+    return;
+  }
+
+  int dx = abs(pix.x - pc.center.x);
+  int dy = abs(pix.y - pc.center.y);
+  bool onVertical = (dx <= pc.thickness) && (dy <= pc.halfLength);
+  bool onHorizontal = (dy <= pc.thickness) && (dx <= pc.halfLength);
+  if (!(onVertical || onHorizontal)) {
+    return;
+  }
+
+  vec4 dst = imageLoad(targetImage, pix);
+  vec3 color = vec3(1.0, 0.95, 0.45);
+  float alpha = 0.9;
+  dst.rgb = mix(dst.rgb, color, alpha);
+  imageStore(targetImage, pix, dst);
+}

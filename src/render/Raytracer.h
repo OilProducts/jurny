@@ -48,6 +48,14 @@ struct GlobalsUBOData {
 };
 static_assert(sizeof(GlobalsUBOData) % 16 == 0, "GlobalsUBOData must align to 16 bytes");
 
+struct CrosshairParams {
+    bool enabled = false;
+    int centerX = 0;
+    int centerY = 0;
+    int halfLength = 12;
+    int thickness = 2;
+};
+
 class Raytracer {
 public:
     Raytracer();
@@ -56,10 +64,12 @@ public:
     void updateGlobals(platform::VulkanContext& vk, const GlobalsUBOData& data);
     void record(platform::VulkanContext& vk, platform::Swapchain& swap, VkCommandBuffer cb, uint32_t swapIndex);
     void recordOverlay(VkCommandBuffer cb, uint32_t swapIndex);
+    void recordCrosshair(VkCommandBuffer cb, uint32_t swapIndex);
     void readDebug(platform::VulkanContext& vk, uint32_t frameIdx);
     void shutdown(platform::VulkanContext& vk);
 
     void setAssetRegistry(const core::AssetRegistry* assets) { assets_ = assets; }
+    void setCrosshair(const CrosshairParams& params) { crosshairParams_ = params; }
 
     const world::BrickStore* worldStore() const { return brickStore_.get(); }
     bool addRegion(platform::VulkanContext& vk, const glm::ivec3& regionCoord, world::CpuWorld&& cpu);
@@ -134,6 +144,7 @@ private:
     VkPipeline            pipeComposite_{};
     VkPipeline            pipeAtrous_{};
     VkPipeline            pipeOverlay_{};
+    VkPipeline            pipeCrosshair_{};
     VkDescriptorPool      descPool_{};
     std::vector<VkDescriptorSet> sets_;
 
@@ -185,6 +196,7 @@ private:
     bool denoiseEnabled_ = false;
     Tonemap tonemap_;
     Overlays overlays_;
+    CrosshairParams crosshairParams_{};
 
     struct BrickRecord {
         uint64_t key = 0;
@@ -225,9 +237,7 @@ private:
     static constexpr uint32_t kMaterialWordsPerBrick = 128;
     static constexpr uint32_t kPaletteEntriesPerBrick = 16;
     static constexpr uint32_t kFieldValuesPerBrick =
-        (VOXEL_BRICK_SIZE + 1 + 2 * world::kFieldApron) *
-        (VOXEL_BRICK_SIZE + 1 + 2 * world::kFieldApron) *
-        (VOXEL_BRICK_SIZE + 1 + 2 * world::kFieldApron);
+        static_cast<uint32_t>(world::FieldSamplesPerBrick(VOXEL_BRICK_SIZE));
 };
 
 }

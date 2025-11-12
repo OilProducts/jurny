@@ -75,6 +75,17 @@ struct AtrousPushConstants {
     float padding;
 };
 
+struct CrosshairPushConstants {
+    int32_t baseX;
+    int32_t baseY;
+    int32_t extentX;
+    int32_t extentY;
+    int32_t centerX;
+    int32_t centerY;
+    int32_t halfLength;
+    int32_t thickness;
+};
+
 static constexpr uint32_t kTimestampCount = 8;
 static constexpr uint32_t kTimestampPairs = 4;
 
@@ -499,7 +510,8 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     VkShaderModule smTrav  = loadShader("traverse_bricks.comp.spv");
     VkShaderModule smComp  = loadShader("composite.comp.spv");
     VkShaderModule smOverlay = loadShader("overlay.comp.spv");
-    if (!smGen || !smShade || !smTemporal || !smAtrous || !smTrav || !smComp || !smOverlay) return false;
+    VkShaderModule smCrosshair = loadShader("crosshair.comp.spv");
+    if (!smGen || !smShade || !smTemporal || !smAtrous || !smTrav || !smComp || !smOverlay || !smCrosshair) return false;
     VkComputePipelineCreateInfo cpci{};
     cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     VkPipelineShaderStageCreateInfo ss{};
@@ -516,6 +528,8 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeComposite_) != VK_SUCCESS) return false;
     ss.module = smOverlay; cpci.stage = ss;
     if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeOverlay_) != VK_SUCCESS) return false;
+    ss.module = smCrosshair; cpci.stage = ss;
+    if (vkCreateComputePipelines(vk.device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeCrosshair_) != VK_SUCCESS) return false;
     vkDestroyShaderModule(vk.device(), smGen, nullptr);
     vkDestroyShaderModule(vk.device(), smShade, nullptr);
     vkDestroyShaderModule(vk.device(), smTemporal, nullptr);
@@ -523,6 +537,7 @@ bool Raytracer::createPipelines(platform::VulkanContext& vk) {
     vkDestroyShaderModule(vk.device(), smTrav, nullptr);
     vkDestroyShaderModule(vk.device(), smComp, nullptr);
     vkDestroyShaderModule(vk.device(), smOverlay, nullptr);
+    vkDestroyShaderModule(vk.device(), smCrosshair, nullptr);
     return true;
 }
 
@@ -534,6 +549,7 @@ void Raytracer::destroyPipelines(platform::VulkanContext& vk) {
     if (pipeTraverse_) { vkDestroyPipeline(vk.device(), pipeTraverse_, nullptr); pipeTraverse_ = VK_NULL_HANDLE; }
     if (pipeGenerate_) { vkDestroyPipeline(vk.device(), pipeGenerate_, nullptr); pipeGenerate_ = VK_NULL_HANDLE; }
     if (pipeOverlay_) { vkDestroyPipeline(vk.device(), pipeOverlay_, nullptr); pipeOverlay_ = VK_NULL_HANDLE; }
+    if (pipeCrosshair_) { vkDestroyPipeline(vk.device(), pipeCrosshair_, nullptr); pipeCrosshair_ = VK_NULL_HANDLE; }
     if (pipeLayout_) { vkDestroyPipelineLayout(vk.device(), pipeLayout_, nullptr); pipeLayout_ = VK_NULL_HANDLE; }
     if (setLayout_) { vkDestroyDescriptorSetLayout(vk.device(), setLayout_, nullptr); setLayout_ = VK_NULL_HANDLE; }
 }
@@ -675,10 +691,10 @@ bool Raytracer::createWorld(platform::VulkanContext& vk) {
     tuning.continentsPerCircumference = 3.2f;
     tuning.continentAmplitude         = 110.0f;
     tuning.continentOctaves           = 5;
-    tuning.detailWavelength           = 55.0f;
-    tuning.detailAmplitude            = 16.0f;
-    tuning.detailOctaves              = 3;
-    tuning.detailWarpMultiplier       = 1.8f;
+    tuning.detailWavelength           = 140.0f;
+    tuning.detailAmplitude            = 6.0f;
+    tuning.detailOctaves              = 2;
+    tuning.detailWarpMultiplier       = 1.3f;
     tuning.baseHeightOffset           = 14.0f;
     tuning.warpWavelength             = 240.0f;
     tuning.warpAmplitude              = 24.0f;
@@ -1762,6 +1778,68 @@ void Raytracer::recordOverlay(VkCommandBuffer cb, uint32_t swapIndex) {
     }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeOverlay_);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_, 0, 1, &sets_[swapIndex], 0, nullptr);
+    vkCmdDispatch(cb, groupsX, groupsY, 1);
+}
+
+void Raytracer::recordCrosshair(VkCommandBuffer cb, uint32_t swapIndex) {
+    if (!crosshairParams_.enabled || pipeCrosshair_ == VK_NULL_HANDLE) {
+        return;
+    }
+    if (swapIndex >= sets_.size() || extent_.width == 0 || extent_.height == 0) {
+        return;
+    }
+
+    int width = static_cast<int>(extent_.width);
+    int height = static_cast<int>(extent_.height);
+    int centerX = std::clamp(crosshairParams_.centerX, 0, std::max(width - 1, 0));
+    int centerY = std::clamp(crosshairParams_.centerY, 0, std::max(height - 1, 0));
+    int minDim = std::max(1, std::min(width, height));
+    int halfLength = std::clamp(crosshairParams_.halfLength, 1, minDim);
+    int thickness = std::clamp(crosshairParams_.thickness, 1, halfLength);
+
+    int padding = thickness;
+    int minX = std::max(0, centerX - halfLength - padding);
+    int maxX = std::min(width - 1, centerX + halfLength + padding);
+    int minY = std::max(0, centerY - halfLength - padding);
+    int maxY = std::min(height - 1, centerY + halfLength + padding);
+
+    int extentX = maxX - minX + 1;
+    int extentY = maxY - minY + 1;
+    if (extentX <= 0 || extentY <= 0) {
+        return;
+    }
+
+    uint32_t groupsX = (static_cast<uint32_t>(extentX) + 7u) / 8u;
+    uint32_t groupsY = (static_cast<uint32_t>(extentY) + 7u) / 8u;
+    if (groupsX == 0u || groupsY == 0u) {
+        return;
+    }
+
+    VkMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+    VkDependencyInfo dep{};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cb, &dep);
+
+    CrosshairPushConstants pc{};
+    pc.baseX = minX;
+    pc.baseY = minY;
+    pc.extentX = extentX;
+    pc.extentY = extentY;
+    pc.centerX = centerX;
+    pc.centerY = centerY;
+    pc.halfLength = halfLength;
+    pc.thickness = thickness;
+
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeCrosshair_);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_, 0, 1, &sets_[swapIndex], 0, nullptr);
+    vkCmdPushConstants(cb, pipeLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CrosshairPushConstants), &pc);
     vkCmdDispatch(cb, groupsX, groupsY, 1);
 }
 
