@@ -463,7 +463,7 @@ bool sphereTraceBrick(const RayPayload ray,
 
   for (int iter = 0; iter < SPHERE_TRACE_MAX_STEPS && tCurrent <= t1; ++iter) {
     atomicAdd(TraverseStats.sphereSteps, 1u);
-    if (dist <= epsilon) {
+    if (abs(dist) <= epsilon) {
       vec3 hitWorld = originWorld + dir * tCurrent;
       if (forceBlockNormal) {
         hitNormal = blockNormalForDir(dir);
@@ -491,7 +491,7 @@ bool sphereTraceBrick(const RayPayload ray,
     tCurrent = clamped ? t1 : nextT;
     dist = evaluateFieldAnalytic(originWorld + dir * tCurrent);
     if (clamped) {
-      if (dist <= epsilon) {
+      if (abs(dist) <= epsilon) {
         continue;
       }
       break;
@@ -688,8 +688,10 @@ void processRay(const RayPayload rayIn) {
       }
 
       recordMacroDiag(diagStart, diagStartPresent, diagSteps, diagEnd, diagEndPresent, diagReason);
-      if (useMacroSkip && skipped && diagEndPresent == 1u) {
-        atomicAdd(TraverseStats.macroVisited, 1u);
+      if (skipped) {
+        if (useMacroSkip && diagEndPresent == 1u) {
+          atomicAdd(TraverseStats.macroVisited, 1u);
+        }
         continue;
       }
     }
