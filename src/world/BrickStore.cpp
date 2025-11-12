@@ -343,18 +343,22 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
     }
 
     const int fieldApron = kFieldApron;
-    const int samplesPerAxis = brickDim + 1 + 2 * fieldApron;
+    const int fieldResolution = kFieldResolution;
+    const int samplesPerAxis =
+        brickDim * fieldResolution + 1 +
+        2 * fieldApron * fieldResolution;
     const size_t samplesPerBrick = static_cast<size_t>(samplesPerAxis) *
                                    static_cast<size_t>(samplesPerAxis) *
                                    static_cast<size_t>(samplesPerAxis);
     std::vector<float> fieldSamplesLocal(samplesPerBrick);
     const glm::vec3 fieldOrigin = brickOrigin - glm::vec3(fieldApron) * voxelSize;
+    const float sampleStep = voxelSize / static_cast<float>(fieldResolution);
 
     size_t tsdfIndex = 0;
     for (int iz = 0; iz < samplesPerAxis; ++iz) {
         for (int iy = 0; iy < samplesPerAxis; ++iy) {
             for (int ix = 0; ix < samplesPerAxis; ++ix, ++tsdfIndex) {
-                glm::vec3 vertexPos = fieldOrigin + glm::vec3(ix, iy, iz) * voxelSize;
+                glm::vec3 vertexPos = fieldOrigin + glm::vec3(ix, iy, iz) * sampleStep;
                 float f = sampleField(vertexPos);
                 minFieldSample = std::min(minFieldSample, f);
                 maxFieldSample = std::max(maxFieldSample, f);
@@ -403,13 +407,18 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
     std::vector<float> centerFieldSamples(voxelsPerBrick, 0.0f);
     bool any = false;
     const glm::vec3 voxelSteps = glm::vec3(voxelSize);
+    const float samplesPerVoxel = static_cast<float>(fieldResolution);
+    const int sampleApronOffset = fieldApron * fieldResolution;
 
     for (int vz = 0; vz < brickDim; ++vz) {
+        const int vzSampleBase = sampleApronOffset + vz * fieldResolution;
         for (int vy = 0; vy < brickDim; ++vy) {
+            const int vySampleBase = sampleApronOffset + vy * fieldResolution;
             for (int vx = 0; vx < brickDim; ++vx) {
-                float relX = static_cast<float>(fieldApron + vx) + 0.5f;
-                float relY = static_cast<float>(fieldApron + vy) + 0.5f;
-                float relZ = static_cast<float>(fieldApron + vz) + 0.5f;
+                const int vxSampleBase = sampleApronOffset + vx * fieldResolution;
+                float relX = static_cast<float>(vxSampleBase) + 0.5f * samplesPerVoxel;
+                float relY = static_cast<float>(vySampleBase) + 0.5f * samplesPerVoxel;
+                float relZ = static_cast<float>(vzSampleBase) + 0.5f * samplesPerVoxel;
                 float voxelField = sampleTrilinear(relX, relY, relZ);
                 minFieldSample = std::min(minFieldSample, voxelField);
                 maxFieldSample = std::max(maxFieldSample, voxelField);
@@ -420,9 +429,9 @@ bool BrickStore::computeBrickData(const glm::ivec3& bc,
                 bool occupied = (voxelField < 0.0f);
                 if (!occupied) {
                     for (int corner = 0; corner < 8; ++corner) {
-                        int cx = fieldApron + vx + ((corner & 1) ? 1 : 0);
-                        int cy = fieldApron + vy + ((corner & 2) ? 1 : 0);
-                        int cz = fieldApron + vz + ((corner & 4) ? 1 : 0);
+                        int cx = vxSampleBase + ((corner & 1) ? fieldResolution : 0);
+                        int cy = vySampleBase + ((corner & 2) ? fieldResolution : 0);
+                        int cz = vzSampleBase + ((corner & 4) ? fieldResolution : 0);
                         float cornerField = sampleGrid(cx, cy, cz);
                         minFieldSample = std::min(minFieldSample, cornerField);
                         maxFieldSample = std::max(maxFieldSample, cornerField);
@@ -564,9 +573,8 @@ CpuWorld BrickStore::buildCpuWorld(const std::vector<glm::ivec3>& brickCoords,
     world.materialIndices.reserve(brickCount * maxMaterialWords);
     world.palettes.reserve(brickCoords.size() * 16);
     if (kCacheFieldSamples) {
-        const size_t fieldSamplesPerBrick = static_cast<size_t>(brickDim_ + 1) *
-                                            static_cast<size_t>(brickDim_ + 1) *
-                                            static_cast<size_t>(brickDim_ + 1);
+        const size_t fieldSamplesPerBrick =
+            static_cast<size_t>(FieldSamplesPerBrick(brickDim_));
         world.fieldSamples.reserve(brickCount * fieldSamplesPerBrick);
     }
 

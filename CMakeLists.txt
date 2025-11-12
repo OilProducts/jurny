@@ -77,6 +77,7 @@ add_subdirectory(src)
 if(BUILD_TOOLS)
   add_subdirectory(tools/shaderc_build)
   add_subdirectory(tools/pack_assets)
+  add_subdirectory(tools/debug_dump)
 endif()
 
 set(VOXEL_ASSET_DATA_DIR "${CMAKE_SOURCE_DIR}/data")

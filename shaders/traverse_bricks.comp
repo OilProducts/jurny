@@ -117,8 +117,10 @@ layout(set = 0, binding = 26, std430) readonly buffer FieldSamplesBuf {
   float fieldSamples[];
 };
 
-const uint FIELD_APRON = 1u;
-const uint FIELD_DIM   = uint(VOXEL_BRICK_SIZE) + 1u + 2u * FIELD_APRON;
+const uint FIELD_RES   = 1u;
+const uint FIELD_APRON_VOXELS = 1u;
+const uint FIELD_APRON = FIELD_APRON_VOXELS * FIELD_RES;
+const uint FIELD_DIM   = uint(VOXEL_BRICK_SIZE) * FIELD_RES + 1u + 2u * FIELD_APRON;
 const uint FIELD_PLANE = FIELD_DIM * FIELD_DIM;
 const uint FIELD_COUNT_PER_BRICK = FIELD_DIM * FIELD_PLANE;
 
@@ -228,7 +230,8 @@ bool brickHasOccupancy(const BrickHeader h) {
 
 float sampleBrickField(uint baseIndex, vec3 worldPos, const BrickHeader h) {
   vec3 brickOriginWorld = vec3(h.bx, h.by, h.bz) * g.brickSize;
-  vec3 local = (worldPos - brickOriginWorld) / g.voxelSize + vec3(float(FIELD_APRON));
+  vec3 local = (worldPos - brickOriginWorld) / g.voxelSize * float(FIELD_RES) +
+               vec3(float(FIELD_APRON));
 
   float fx = clamp(local.x, 0.0, float(FIELD_DIM - 1u));
   float fy = clamp(local.y, 0.0, float(FIELD_DIM - 1u));

@@ -5,7 +5,18 @@
 // BrickFormats — packed GPU layouts and flags.
 namespace world {
 constexpr uint32_t kInvalidOffset = 0xFFFFFFFFu;
-constexpr int      kFieldApron    = 1;
+constexpr int      kFieldApron    = 1; // apron expressed in voxels
+constexpr int      kFieldResolution = 1; // samples per voxel edge
+
+constexpr int FieldSamplesPerAxis(int brickDim) {
+    return brickDim * kFieldResolution + 1 +
+           2 * kFieldApron * kFieldResolution;
+}
+
+constexpr int FieldSamplesPerBrick(int brickDim) {
+    const int axis = FieldSamplesPerAxis(brickDim);
+    return axis * axis * axis;
+}
 
 enum BrickFlags : uint16_t {
     kBrickUses4Bit = 1u << 0
