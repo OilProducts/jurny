@@ -74,6 +74,7 @@ void Streaming::clearQueues() {
     buildMsAvg_ = 0.0;
     solidRatioLast_ = 0.0;
     regionCtx_ = {};
+    frontierSerial_ = 1;
 }
 
 void Streaming::updateRegionContext(const glm::vec3& cameraPos) {
@@ -106,6 +107,7 @@ void Streaming::updateRegionContext(const glm::vec3& cameraPos) {
 void Streaming::seedFrontier(const glm::ivec3& cameraCell) {
     if (!hasCameraCell_ || cameraCell != lastFrontierOrigin_) {
         frontier_.clear();
+        ++frontierSerial_;
         pushFrontierCell(cameraCell);
         lastFrontierOrigin_ = cameraCell;
     }
@@ -115,11 +117,14 @@ void Streaming::pushFrontierCell(const glm::ivec3& cell) {
     const uint64_t key = packRegionCoord(cell);
     auto [it, inserted] = regionRecords_.emplace(key, RegionRecord{});
     RegionRecord& record = it->second;
-    if (record.frontierVisited) {
+    if (record.frontierVisitSerial != frontierSerial_) {
+        record.frontierVisitSerial = frontierSerial_;
+        record.frontierQueued = false;
+    }
+    if (record.frontierQueued) {
         return;
     }
     record.frontierQueued = true;
-    record.frontierVisited = true;
     frontier_.push_back(cell);
 }
 

@@ -128,7 +128,7 @@ private:
         float maxRadius = 0.0f;
         float distanceToCamera = 0.0f;
         bool frontierQueued = false;
-        bool frontierVisited = false;
+        uint32_t frontierVisitSerial = 0;
     };
 
 private:
@@ -172,6 +172,7 @@ private:
     glm::ivec3 currentCameraCell_{0};
     bool hasCameraCell_ = false;
     std::vector<glm::ivec3> evictedRegions_;
+    uint32_t frontierSerial_ = 1;
 
     std::mutex completedMutex_;
     std::vector<CompletedRegion> completedRegions_;
