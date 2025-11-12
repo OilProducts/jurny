@@ -882,7 +882,7 @@ uint32_t Runtime::fillGlobalsData(const glm::mat4& V,
 }
 
 std::vector<std::string> Runtime::buildOverlayLines(float dt) {
-    constexpr size_t kOverlayMaxCols = 96;
+    constexpr size_t kOverlayMaxCols = 128;
     std::vector<std::string> overlayLines;
     overlayLines.reserve(6);
     float fps = (dt > 1e-4f) ? (1.0f / dt) : 0.0f;
