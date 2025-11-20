@@ -7,7 +7,7 @@
 namespace world {
 
 namespace {
-constexpr float kMoisturePersistence = 0.55f;
+constexpr float kDefaultMoisturePersistence = 0.55f;
 constexpr glm::vec3 kMoistureOffset(23.1f, 91.7f, 44.4f);
 } // namespace
 
@@ -36,13 +36,16 @@ WorldGen::BiomeSample WorldGen::biomeSample(const glm::vec3& p) const {
 
     const int moistOct = std::max(params_.moistureOctaves, 1);
     const float baseFreq = params_.moistureFrequency;
+    const float persistence = (params_.moisturePersistence > 0.0f)
+        ? params_.moisturePersistence
+        : kDefaultMoisturePersistence;
     float moisture = 0.0f;
     if (baseFreq > 0.0f && moistOct > 0) {
         moisture = math::FractalBrownianMotion(
             warped * baseFreq + kMoistureOffset,
             baseFreq,
             moistOct,
-            kMoisturePersistence,
+            persistence,
             seed_ + 877u);
     }
     sample.moisture = glm::clamp(moisture * 0.5f + 0.5f, 0.0f, 1.0f);

@@ -32,22 +32,25 @@ void printUsage(const char* exe) {
 
 math::NoiseTuning buildNoiseTuning() {
     math::NoiseTuning tuning{};
-    tuning.continentsPerCircumference = 3.2f;
-    tuning.continentAmplitude = 110.0f;
-    tuning.continentOctaves = 5;
-    tuning.detailWavelength = 140.0f;
-    tuning.detailAmplitude = 6.0f;
-    tuning.detailOctaves = 2;
-    tuning.detailWarpMultiplier = 1.3f;
+    tuning.macroWavelength = 2600.0f;
+    tuning.macroAmplitude = 110.0f;
+    tuning.macroRidgeWeight = 0.4f;
+    tuning.macroSharpness = 1.4f;
+    tuning.detailWavelength = 180.0f;
+    tuning.detailAmplitude = 8.0f;
+    tuning.detailRidgeWeight = 0.3f;
+    tuning.detailSharpness = 1.1f;
+    tuning.bandCount = 3.0f;
+    tuning.bandAmplitude = 18.0f;
+    tuning.bandSharpness = 1.0f;
     tuning.baseHeightOffset = 14.0f;
-    tuning.warpWavelength = 240.0f;
-    tuning.warpAmplitude = 24.0f;
-    tuning.slopeSampleDistance = 100.0f;
-    tuning.caveWavelength = 36.0f;
+    tuning.caveWavelength = 42.0f;
     tuning.caveAmplitude = 5.0f;
-    tuning.caveThreshold = 0.35f;
+    tuning.caveThreshold = 0.32f;
+    tuning.caveContrast = 2.5f;
     tuning.moistureWavelength = 80.0f;
     tuning.moistureOctaves = 4;
+    tuning.moisturePersistence = 0.55f;
     return tuning;
 }
 
@@ -122,10 +125,7 @@ int main(int argc, char** argv) {
     if (targetIndex) {
         occBase = cpu.occWords.data() + (header.occOffset / sizeof(uint64_t));
     }
-    const float* fieldBase = nullptr;
-    if (targetIndex && header.tsdfOffset != world::kInvalidOffset && !cpu.fieldSamples.empty()) {
-        fieldBase = cpu.fieldSamples.data() + (header.tsdfOffset / sizeof(float));
-    }
+    const float* fieldBase = nullptr; // TSDF cache removed in analytic pipeline
 
     const glm::vec3 brickOrigin = glm::vec3(header.bx, header.by, header.bz) * store.brickSize();
     const float voxelSize = store.voxelSize();

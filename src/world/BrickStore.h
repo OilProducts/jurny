@@ -24,7 +24,6 @@ struct CpuWorld {
     std::vector<uint64_t>    occWords;   // occupancy words per brick (brickDim-dependent)
     std::vector<uint32_t>    materialIndices; // packed material data (4-bit or 8-bit)
     std::vector<uint32_t>    palettes;        // packed per-brick palettes (uint32 per entry)
-    std::vector<float>       fieldSamples;    // cached signed-distance samples ((brickDim+1)^3 floats per brick)
     std::vector<MaterialGpu> materialTable;
     std::vector<uint64_t>    hashKeys;   // packed (bx,by,bz)
     std::vector<uint32_t>    hashVals;   // index into headers
@@ -55,7 +54,6 @@ private:
     struct BrickPayload {
         std::vector<uint64_t> occ;
         std::vector<uint16_t> materials;
-        std::vector<float>    field;
     };
 
     static uint64_t packKey(int bx, int by, int bz);
@@ -67,8 +65,7 @@ private:
                           int brickDim,
                           float brickSize,
                           std::vector<uint64_t>& outOcc,
-                          std::vector<uint16_t>& outMaterials,
-                          std::vector<float>& outField) const;
+                          std::vector<uint16_t>& outMaterials) const;
     bool acquireBrick(const glm::ivec3& bc,
                       std::shared_ptr<const BrickPayload>& payload,
                       std::atomic<bool>* cancel) const;

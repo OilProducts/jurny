@@ -5,18 +5,18 @@
 > **Reminder:** the existing 8×8×8 “brick” chunking stays. We only change what data each brick stores (analytic params + primitive lists) and how traversal evaluates the signed field.
 
 ## 1. Simplify Base Terrain SDF (Faster Per-Ray Evaluation)
-- [ ] Replace FBM-heavy `math::F_crust` / `shaders/spherical.glsl` with lightweight layers:
+- [x] Replace FBM-heavy `math::F_crust` / `shaders/spherical.glsl` with lightweight layers:
   - Radial shell + macro heightfield (few hash-based noises or small LUTs).
   - Mid-frequency detail via small 3D textures or simple analytic bumps.
   - Caves/overhangs from tileable textures or sparse analytic features.
-- [ ] Expose parameters (frequencies, amplitudes) to keep ALU budget predictable.
-- [ ] Update `WorldGen` and BrickStore sampling to use the new function so CPU/GPU stay in sync.
+- [x] Expose parameters (frequencies, amplitudes) to keep ALU budget predictable.
+- [x] Update `WorldGen` and BrickStore sampling to use the new function so CPU/GPU stay in sync.
 - [ ] Profile per-hit cost; add optional clipmap cache if needed.
 
 ## 2. Drop TSDF Data For Static Bricks (Path To Removal)
-- [ ] Static bricks store only occupancy/material; leave `tsdfOffset = kInvalidOffset`.
-- [ ] In traversal/shaders, treat `tsdfOffset == Invalid` as “call analytic SDF directly”.
-- [ ] Stop allocating/uploading `FieldSamplesBuf`; remove CPU `fieldSamples` for those bricks.
+- [x] Static bricks store only occupancy/material; leave `tsdfOffset = kInvalidOffset`.
+- [x] In traversal/shaders, treat `tsdfOffset == Invalid` as “call analytic SDF directly”.
+- [x] Stop allocating/uploading `FieldSamplesBuf`; remove CPU `fieldSamples` for those bricks.
 - [ ] Verify visuals/perf; once stable, delete the TSDF interpolation code entirely.
 
 ## 3. Represent Player Edits As Analytic Primitives (Per Brick)

@@ -1,9 +1,6 @@
 // spherical.glsl — planet signed field F(p), gradF, and shell/sphere intersection.
 // Keep in sync with world/WorldGen.cpp for crustField.
 
-const float PERSISTENCE_CONTINENT = 0.55;
-const float PERSISTENCE_DETAIL    = 0.5;
-const float PERSISTENCE_CAVE      = 0.5;
 uint pcgHash32(uint v) {
     v = v * 747796405u + 2891336453u;
     uint word = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
@@ -55,57 +52,60 @@ float valueNoise(vec3 p, uint seed) {
     return mix(nxy0, nxy1, u.z);
 }
 
-float fbm(vec3 p, float baseFrequency, int octaves, float persistence, uint seed) {
-    if (baseFrequency <= 0.0 || octaves <= 0) {
-        return 0.0;
-    }
-    float amplitude = 1.0;
-    float frequency = baseFrequency;
-    float sum = 0.0;
-    float norm = 0.0;
-    for (int i = 0; i < octaves; ++i) {
-        uint octaveSeed = seed + uint(i) * 97u;
-        sum += amplitude * valueNoise(p * frequency, octaveSeed);
-        norm += amplitude;
-        frequency *= 2.0;
-        amplitude *= persistence;
-    }
-    if (norm <= 0.0) return 0.0;
-    float result = sum / norm;
-    return result * 2.0 - 1.0;
+float signedValueNoise(vec3 p, uint seed) {
+    return valueNoise(p, seed) * 2.0 - 1.0;
 }
 
-void enu(vec3 p, out vec3 east, out vec3 north, out vec3 up) {
-    up = normalize(p);
-    if (dot(up, up) <= 0.0) {
-        up = vec3(0.0, 0.0, 1.0);
-    }
-    vec3 z = vec3(0.0, 0.0, 1.0);
-    east = normalize(cross(z, up));
-    if (dot(east, east) < 1e-6) {
-        east = vec3(1.0, 0.0, 0.0);
-    }
-    north = cross(up, east);
+float ridgeSignal(float v, float sharpness) {
+    float ridge = 1.0 - abs(v);
+    ridge = clamp(ridge, 0.0, 1.0);
+    return (sharpness > 0.0) ? (pow(ridge, sharpness) * 2.0 - 1.0) : (ridge * 2.0 - 1.0);
 }
 
-float smoothClamp(float value, float lo, float hi, float transition) {
-    if (transition <= 0.0 || hi <= lo) {
-        return clamp(value, lo, hi);
-    }
-    float tLo = smoothstep(lo - transition, lo + transition, value);
-    float vLo = mix(lo, value, tLo);
-    float tHi = smoothstep(hi - transition, hi + transition, value);
-    return mix(vLo, hi, tHi);
+float macroLayer(vec3 surfacePoint, vec3 dir) {
+    if (g.noiseMacroAmp <= 0.0 || g.noiseMacroFreq <= 0.0) return 0.0;
+    vec3 domain = surfacePoint * g.noiseMacroFreq;
+    float base = signedValueNoise(domain, g.noiseSeed);
+    float ridgeSrc = signedValueNoise(domain + vec3(19.1, 7.7, 13.3), g.noiseSeed + 17u);
+    float ridge = ridgeSignal(ridgeSrc, max(g.noiseMacroSharpness, 0.5));
+    float jitter = signedValueNoise(domain * 0.5 + vec3(31.7, 23.1, 11.9), g.noiseSeed + 31u);
+    float macro = mix(base, ridge, clamp(g.noiseMacroRidgeWeight, 0.0, 1.0));
+    macro = mix(macro, jitter, 0.15) + abs(dir.z) * 0.05;
+    return g.noiseMacroAmp * macro;
 }
 
-vec3 domainWarp(vec3 posMeters) {
-    if (g.noiseWarpAmp <= 0.0 || g.noiseWarpFreq <= 0.0) return posMeters;
-    int detailOct = max(int(g.noiseDetailOctaves), 1);
-    float fx = fbm(posMeters + vec3(31.7, 17.3, 13.1), g.noiseWarpFreq, detailOct, PERSISTENCE_DETAIL, g.noiseSeed + 233u);
-    float fy = fbm(posMeters + vec3(11.1, 53.2, 27.8), g.noiseWarpFreq, detailOct, PERSISTENCE_DETAIL, g.noiseSeed + 389u);
-    float fz = fbm(posMeters + vec3(91.7, 45.3, 67.1), g.noiseWarpFreq, detailOct, PERSISTENCE_DETAIL, g.noiseSeed + 521u);
-    vec3 warp = vec3(fx, fy, fz);
-    return posMeters + warp * g.noiseWarpAmp;
+float detailLayer(vec3 surfacePoint) {
+    if (g.noiseDetailAmp <= 0.0 || g.noiseDetailFreq <= 0.0) return 0.0;
+    vec3 domain = surfacePoint * g.noiseDetailFreq;
+    float base = signedValueNoise(domain + vec3(3.1, 7.3, 11.9), g.noiseSeed + 101u);
+    float ridgeSrc = signedValueNoise(domain * 1.7 + vec3(17.0, 5.0, 9.0), g.noiseSeed + 131u);
+    float ridge = ridgeSignal(ridgeSrc, max(g.noiseDetailSharpness, 0.5));
+    float trig = sin(dot(domain, vec3(0.8, 1.1, 0.5)) + 1.3) *
+                 cos(dot(domain, vec3(1.5, 0.4, 1.7)) - 0.6);
+    trig = clamp(trig, -1.0, 1.0);
+    float detail = mix(base, ridge, clamp(g.noiseDetailRidgeWeight, 0.0, 1.0));
+    detail = mix(detail, trig, 0.25);
+    return g.noiseDetailAmp * detail;
+}
+
+float latitudeBands(vec3 dir) {
+    if (g.noiseBandAmp <= 0.0 || g.noiseBandFreq <= 0.0) return 0.0;
+    float lat = dir.z * 0.5 + 0.5;
+    float s = sin(lat * g.noiseBandFreq * (2.0 * 3.14159265));
+    float falloff = exp(-g.noiseBandSharpness * (1.0 - abs(dir.z)));
+    return g.noiseBandAmp * s * falloff;
+}
+
+float cavesContribution(vec3 p) {
+    if (g.noiseCavityAmp <= 0.0 || g.noiseCavityFreq <= 0.0) return 0.0;
+    vec3 domain = p * g.noiseCavityFreq;
+    float base = signedValueNoise(domain, g.noiseSeed + 997u);
+    float pocket = signedValueNoise(domain + vec3(13.0, 29.0, 17.0), g.noiseSeed + 1019u);
+    float signal = mix(base, pocket, 0.5) * 0.5 + 0.5;
+    float contrast = max(g.noiseCavityContrast, 0.01);
+    float mask = clamp((signal - clamp(g.noiseCavityThreshold, 0.0, 1.0)) * contrast, 0.0, 1.0);
+    mask *= mask;
+    return -g.noiseCavityAmp * mask;
 }
 
 float F_crust(in vec3 p) {
@@ -114,50 +114,16 @@ float F_crust(in vec3 p) {
     vec3 dir = p / r;
     float baseRadius = g.planetRadius;
     vec3 surface = dir * baseRadius;
-    vec3 warped = domainWarp(surface);
-    int contOct = max(int(g.noiseContinentOctaves), 1);
-    int detailOct = max(int(g.noiseDetailOctaves), 1);
-    float continents = fbm(warped, g.noiseContinentFreq, contOct, PERSISTENCE_CONTINENT, g.noiseSeed);
-    float detail = fbm(warped * g.noiseDetailWarp, g.noiseDetailFreq, detailOct, PERSISTENCE_DETAIL, g.noiseSeed + 613u);
 
-    float continentHeight = g.noiseContinentAmp * continents;
+    float height = g.noiseBaseHeightOffset;
+    height += macroLayer(surface, dir);
+    height += detailLayer(surface);
+    height += latitudeBands(dir);
+    height = clamp(height, g.noiseMinHeight, g.noiseMaxHeight);
 
-    float slopeMask = 0.0;
-    if (g.noiseContinentAmp > 0.0 && g.noiseContinentFreq > 0.0) {
-        vec3 east, north, up;
-        enu(dir, east, north, up);
-        float gradStep = max(g.noiseSlopeSampleDist, 1e-3);
-        int slopeOct = contOct;
-        float continentsEast = fbm(warped + east * gradStep, g.noiseContinentFreq, slopeOct, PERSISTENCE_CONTINENT, g.noiseSeed);
-        float continentsNorth = fbm(warped + north * gradStep, g.noiseContinentFreq, slopeOct, PERSISTENCE_CONTINENT, g.noiseSeed);
-        float slope = length(vec2(continentsEast - continents, continentsNorth - continents)) / gradStep;
-        slopeMask = smoothstep(0.3, 1.2, slope);
-    }
-
-    float detailMask = 1.0 - smoothstep(0.55, 0.95, continents * 0.5 + 0.5);
-    float detailStrength = mix(1.0, 0.25, slopeMask);
-    float detailContribution = g.noiseDetailAmp * detailMask * detailStrength * detail;
-    float height = g.noiseBaseHeightOffset + continentHeight + detailContribution;
-    if (slopeMask > 0.0) {
-        float slopeFlatten = mix(0.0, g.noiseContinentAmp * 0.3, slopeMask);
-        height = mix(height, height - slopeFlatten, slopeMask);
-    }
-
-    float minHeight = g.noiseMinHeight;
-    float maxHeight = g.noiseMaxHeight;
-    float trench = -minHeight;
-    float plateau = max(12.0, max(trench * 0.35, maxHeight * 0.4));
-    height = smoothClamp(height, minHeight, maxHeight, plateau);
-
-    float surfaceRadius = g.planetRadius + height;
-    float field = r - surfaceRadius;
-    if (field < 0.0 && g.noiseCaveAmp > 0.0 && g.noiseCaveFreq > 0.0) {
-        int caveOct = max(int(g.noiseCaveOctaves), 1);
-        float cave = fbm(p, g.noiseCaveFreq, caveOct, PERSISTENCE_CAVE, g.noiseSeed + 997u);
-        float cavity = cave - g.noiseCaveThreshold;
-        if (cavity > 0.0) {
-            field += -g.noiseCaveAmp * cavity;
-        }
+    float field = r - (baseRadius + height);
+    if (field < 0.0) {
+        field += cavesContribution(p);
     }
     return field;
 }

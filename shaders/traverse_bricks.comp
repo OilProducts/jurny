@@ -478,18 +478,43 @@ bool sphereTraceBrick(const RayPayload ray,
       return true;
     }
 
-    float stepLen = dist * SPHERE_TRACE_SAFETY;
-    stepLen = clamp(stepLen, minStep, maxStep);
-    if (!(stepLen > 0.0) || isnan(stepLen) || isinf(stepLen)) {
+    float rawStep = dist * SPHERE_TRACE_SAFETY;
+    float stepMagnitude = clamp(abs(rawStep), minStep, maxStep);
+    if (!(stepMagnitude > 0.0) || isnan(stepMagnitude) || isinf(stepMagnitude)) {
       break;
+    }
+
+    float stepLen = stepMagnitude;
+    float nextT = tCurrent + stepLen;
+    bool clamped = false;
+    if (nextT >= t1) {
+      nextT = t1;
+      clamped = true;
+    }
+
+    float nextDist = evaluateFieldAnalytic(originWorld + dir * nextT);
+    if ((dist > 0.0 && nextDist < 0.0) || (dist < 0.0 && nextDist > 0.0)) {
+      float tFallback;
+      if (refineSurface(ray.origin, dir, min(tCurrent, nextT), max(tCurrent, nextT), tFallback)) {
+        vec3 hitWorld = originWorld + dir * tFallback;
+        if (forceBlockNormal) {
+          hitNormal = blockNormalForDir(dir);
+        } else {
+          vec3 grad = evaluateNormalAnalytic(hitWorld);
+          hitNormal = (length(grad) > 0.0) ? normalize(grad) : normalize(dir);
+        }
+        tHit = tFallback;
+        if (!fetchMaterialAtWorld(hitWorld, h, materialId)) {
+          materialId = fallbackMaterialId();
+        }
+        return true;
+      }
     }
 
     prevT = tCurrent;
     prevDist = dist;
-    float nextT = tCurrent + stepLen;
-    bool clamped = nextT >= t1;
-    tCurrent = clamped ? t1 : nextT;
-    dist = evaluateFieldAnalytic(originWorld + dir * tCurrent);
+    tCurrent = nextT;
+    dist = nextDist;
     if (clamped) {
       if (abs(dist) <= epsilon) {
         continue;
@@ -501,8 +526,8 @@ bool sphereTraceBrick(const RayPayload ray,
   float tFallback;
   bool refined = (prevDist * dist) < 0.0 && refineSurface(ray.origin,
                                                          dir,
-                                                         min(prevT, t1),
-                                                         min(tCurrent, t1),
+                                                         min(prevT, tCurrent),
+                                                         max(prevT, tCurrent),
                                                          tFallback);
   if (refined) {
     vec3 hitWorld = originWorld + dir * tFallback;
@@ -579,13 +604,13 @@ void processRay(const RayPayload rayIn) {
   int macroDim = int(g.macroDimBricks);
   bool useMacroSkip = ((g.flags & FLAG_ENABLE_MACRO) != 0u) && (g.macroHashCapacity > 0u) && (macroDim > 0) && (macroSize > 0.0);
   ivec3 macroCoords = ivec3(0);
-  if (useMacroSkip) {
-    macroCoords = ivec3(
-      floorDiv(brickCoords.x, macroDim),
-      floorDiv(brickCoords.y, macroDim),
-      floorDiv(brickCoords.z, macroDim)
-    );
-  }
+//  if (useMacroSkip) {
+//    macroCoords = ivec3(
+//      floorDiv(brickCoords.x, macroDim),
+//      floorDiv(brickCoords.y, macroDim),
+//      floorDiv(brickCoords.z, macroDim)
+//    );
+//  }
 
   vec3 invDir = vec3(
     safeReciprocal(dir.x),
@@ -596,6 +621,13 @@ void processRay(const RayPayload rayIn) {
   vec3 tDelta = vec3(g.brickSize) * absInvDir;
 
   for (int step = 0; step < BRICK_MAX_STEPS && tCursor < tMax; ++step) {
+    if (useMacroSkip) {
+      macroCoords = ivec3(
+      floorDiv(brickCoords.x, macroDim),
+      floorDiv(brickCoords.y, macroDim),
+      floorDiv(brickCoords.z, macroDim)
+      );
+    }
     vec3 cellMinWorld = vec3(brickCoords) * g.brickSize;
     vec3 cellMaxWorld = cellMinWorld + vec3(g.brickSize);
     vec3 samplePosWorld = rayOriginWorld + dir * (tCursor + BRICK_NUDGE * g.brickSize);

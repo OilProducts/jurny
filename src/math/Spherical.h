@@ -8,45 +8,58 @@ namespace math {
 struct PlanetParams { double R{}, T{}, sea{}, Hmax{}; };
 
 struct NoiseParams {
-    float continentFrequency = 0.04f;   // cycles per meter
-    float continentAmplitude = 12.0f;   // meters
-    int   continentOctaves   = 5;
-    float detailFrequency    = 0.12f;   // cycles per meter
-    float detailAmplitude    = 3.0f;    // meters
-    int   detailOctaves      = 3;
-    float detailWarpMultiplier = 2.0f;  // scales the detail domain
-    float baseHeightOffset   = 0.0f;    // meters added after noise
-    float warpFrequency      = 0.18f;   // cycles per meter
-    float warpAmplitude      = 0.6f;    // meters
-    float slopeSampleDistance = 20.0f;  // meters along surface for slope mask
-    float caveFrequency      = 0.35f;   // cycles per meter (world space)
-    float caveAmplitude      = 4.0f;    // meters
-    float caveThreshold      = 0.25f;
-    float moistureFrequency  = 0.5f;    // cycles per meter
-    int   moistureOctaves    = 3;
+    float macroFrequency = 0.0015f;   // cycles per meter on the surface
+    float macroAmplitude = 120.0f;    // meters
+    float macroRidgeWeight = 0.35f;   // mix between base and ridged macro noise
+    float macroSharpness = 1.3f;      // ridged exponent
+
+    float detailFrequency = 0.04f;    // cycles per meter
+    float detailAmplitude = 10.0f;    // meters
+    float detailRidgeWeight = 0.25f;  // mix between base/detail ridges
+    float detailSharpness = 1.0f;     // ridged exponent
+
+    float bandFrequency = 3.0f;       // stripes per hemisphere
+    float bandAmplitude = 24.0f;      // meters contributed by latitude bands
+    float bandSharpness = 1.4f;       // falloff from equator
+    float baseHeightOffset = 0.0f;    // meters added after layering
+
+    float cavityFrequency = 0.25f;    // cycles per meter in 3D space
+    float cavityAmplitude = 5.0f;     // meters carved when mask triggers
+    float cavityThreshold = 0.35f;    // [0,1] threshold for cavities
+    float cavityContrast = 2.0f;      // steeper falloff -> sharper caves
+
+    float moistureFrequency = 0.002f; // cycles per meter for biome sampling
+    int   moistureOctaves   = 3;
+    float moisturePersistence = 0.5f;
+    float padding = 0.0f;             // reserved / alignment
 
     static NoiseParams disabled();
 };
 
-inline constexpr int kNoiseCaveOctaves = 4;
-
 struct NoiseTuning {
-    float continentsPerCircumference = 4.0f; // approximate count around equator
-    float continentAmplitude = 120.0f;       // meters
-    int   continentOctaves   = 6;
-    float detailWavelength   = 32.0f;        // meters
-    float detailAmplitude    = 18.0f;        // meters
-    int   detailOctaves      = 4;
-    float detailWarpMultiplier = 2.5f;
-    float baseHeightOffset   = 0.0f;         // meters
-    float warpWavelength     = 140.0f;       // meters
-    float warpAmplitude      = 45.0f;        // meters
-    float slopeSampleDistance = 48.0f;       // meters
-    float caveWavelength     = 18.0f;        // meters
-    float caveAmplitude      = 6.0f;         // meters
-    float caveThreshold      = 0.35f;
-    float moistureWavelength = 900.0f;       // meters
+    float macroWavelength   = 2500.0f; // meters per macro cycle
+    float macroAmplitude    = 120.0f;  // meters
+    float macroRidgeWeight  = 0.35f;   // [0,1]
+    float macroSharpness    = 1.3f;    // >=1 for sharper ridges
+
+    float detailWavelength  = 180.0f;  // meters per detail cycle
+    float detailAmplitude   = 10.0f;   // meters
+    float detailRidgeWeight = 0.25f;
+    float detailSharpness   = 1.0f;
+
+    float bandCount         = 3.0f;    // stripes between pole->pole
+    float bandAmplitude     = 24.0f;   // meters
+    float bandSharpness     = 1.4f;    // falloff from equator
+    float baseHeightOffset  = 0.0f;    // meters
+
+    float caveWavelength    = 32.0f;   // meters per cavity repetition
+    float caveAmplitude     = 5.0f;    // meters carved
+    float caveThreshold     = 0.35f;   // [0,1]
+    float caveContrast      = 2.0f;    // slope of activation curve
+
+    float moistureWavelength = 900.0f; // meters per biome noise cycle
     int   moistureOctaves    = 4;
+    float moisturePersistence = 0.55f;
 };
 
 NoiseParams BuildNoiseParams(const NoiseTuning& tuning, const PlanetParams& planet);
